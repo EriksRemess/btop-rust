@@ -1,0 +1,11 @@
+btop-rust
+Copyright 2026 Ēriks Remess
+
+This product is a Rust port of and contains material derived from btop++:
+
+    btop++
+    Copyright 2021 Aristocratos (jakob@qvantnet.com)
+    https://github.com/aristocratos/btop
+
+btop++ is licensed under the Apache License, Version 2.0. Additional
+attribution notices for bundled themes are retained in the theme files.

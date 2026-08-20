@@ -25,3 +25,8 @@ Remove the installed files with `make uninstall`.
 
 Use `PREFIX` and `DESTDIR` for another installation root. `cargo install --path
 .` remains available when only the `btoprs` executable is wanted.
+
+## License
+
+Licensed under the [Apache License 2.0](LICENSE). This port is based on btop++;
+see [NOTICE](NOTICE) for upstream attribution.
