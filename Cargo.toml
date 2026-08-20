@@ -1,0 +1,17 @@
+[package]
+name = "btop"
+version = "1.4.7+d5e5619"
+edition = "2024"
+license = "Apache-2.0"
+description = "A Rust port of btop++"
+
+[[bin]]
+name = "btoprs"
+path = "src/main.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+
+[dependencies]

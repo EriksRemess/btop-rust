@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="90" height="90" version="1.1" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <pattern id="red-stripes" width="341" height="90" patternUnits="userSpaceOnUse">
+      <rect width="341" height="16" fill="#f00"/>
+      <rect y="16" width="341" height="16" fill="#d70000"/>
+      <rect y="32" width="341" height="16" fill="#af0000"/>
+      <rect y="48" width="341" height="16" fill="#870000"/>
+      <rect y="64" width="341" height="16" fill="#5f0000"/>
+    </pattern>
+    <pattern id="gray-stripes" width="341" height="90" patternUnits="userSpaceOnUse">
+      <rect width="341" height="16" fill="#585858"/>
+      <rect y="16" width="341" height="16" fill="#4e4e4e"/>
+      <rect y="32" width="341" height="16" fill="#444"/>
+      <rect y="48" width="341" height="16" fill="#3a3a3a"/>
+      <rect y="64" width="341" height="16" fill="#303030"/>
+      <rect y="80" width="341" height="10" fill="#262626"/>
+    </pattern>
+  </defs>
+  <g transform="translate(18)">
+    <path d="M2 7v83h45V74h7V55h-7V42h7V23h-7V7zm17 19h18v13H19zm0 32h18v13H19z" fill="#080808"/>
+    <path d="M2 7v83h45V74h7V55h-7V42h7V23h-7V7zm1 1h43v16h7v17h-7v15h7v17h-7v16H3zm15 17h20v15H18zm1 1v13h18V26zm-1 31h20v15H18zm1 1v13h18V58zM4 9v79h41V72h7V57h-7V40h7V25h-7V9zm1 1h39v16h7v13h-7v19h7v13h-7v16H5zm11 13h24v19H16zm1 1v17h22V24zm-1 31h24v19H16zm1 1v17h22V56z" fill="url(#gray-stripes)"/>
+    <path d="M0 0v80h42V64h7V48h-7V32h7V16h-7V0zm14 16h21v16H14zm0 32h21v16H14z" fill="url(#red-stripes)"/>
+  </g>
+</svg>
