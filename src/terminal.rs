@@ -16,6 +16,7 @@ const VTIME: usize = 5;
 const VMIN: usize = 6;
 const TIOCGWINSZ: c_ulong = 0x5413;
 const POLLIN: c_short = 0x0001;
+const ESCAPE_SEQUENCE_TIMEOUT: Duration = Duration::from_millis(25);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -192,12 +193,18 @@ impl Terminal {
         if let Some(key) = take_key(&mut self.pending) {
             return Ok(Some(key));
         }
+        let waiting_for_sequence = !self.pending.is_empty();
         let mut fd = PollFd {
             fd: STDIN,
             events: POLLIN,
             revents: 0,
         };
-        let millis = timeout.as_millis().min(c_int::MAX as u128) as c_int;
+        let poll_timeout = if waiting_for_sequence {
+            timeout.min(ESCAPE_SEQUENCE_TIMEOUT)
+        } else {
+            timeout
+        };
+        let millis = poll_timeout.as_millis().min(c_int::MAX as u128) as c_int;
         let ready = unsafe { poll(&mut fd, 1, millis) };
         if ready < 0 {
             if io::Error::last_os_error().raw_os_error() == Some(4) {
@@ -209,14 +216,24 @@ impl Terminal {
             ));
         }
         if ready == 0 {
-            return Ok(None);
+            return Ok(if waiting_for_sequence {
+                take_key_after_sequence_timeout(&mut self.pending)
+            } else {
+                None
+            });
         }
-        let mut bytes = [0u8; 32];
-        let count = io::stdin().read(&mut bytes).map_err(|e| e.to_string())?;
-        if count == 0 {
-            return Ok(None);
+        // A terminal writes mouse reports as escape sequences. Drain everything
+        // currently available, as btop does, so a busy wheel cannot leave a
+        // report split at an arbitrary fixed-size read boundary.
+        let mut stdin = io::stdin().lock();
+        let mut bytes = [0u8; 1024];
+        loop {
+            let count = stdin.read(&mut bytes).map_err(|e| e.to_string())?;
+            if count == 0 {
+                break;
+            }
+            self.pending.extend_from_slice(&bytes[..count]);
         }
-        self.pending.extend_from_slice(&bytes[..count]);
         Ok(take_key(&mut self.pending))
     }
 
@@ -250,6 +267,40 @@ impl Drop for Terminal {
 }
 
 fn take_key(bytes: &mut Vec<u8>) -> Option<Key> {
+    let mut key = take_key_inner(bytes, false)?;
+    if is_mouse_wheel(key) {
+        // btop drains a whole input burst before interpreting it, which turns a
+        // run of wheel reports into one scroll action. Do the same without
+        // discarding a keyboard or click event queued immediately afterwards.
+        while let Some((next, consumed)) = parse_sgr_mouse(bytes) {
+            if !is_mouse_wheel(next) {
+                break;
+            }
+            bytes.drain(..consumed);
+            key = next;
+        }
+    }
+    Some(key)
+}
+
+fn take_key_after_sequence_timeout(bytes: &mut Vec<u8>) -> Option<Key> {
+    take_key_inner(bytes, true)
+}
+
+fn take_key_inner(bytes: &mut Vec<u8>, sequence_timed_out: bool) -> Option<Key> {
+    if escape_sequence_is_incomplete(bytes) {
+        if !sequence_timed_out {
+            return None;
+        }
+        if bytes.as_slice() == [0x1b] {
+            bytes.clear();
+            return Some(Key::Escape);
+        }
+        // Never reinterpret a truncated terminal control sequence as Escape:
+        // Escape opens the main menu, which made burst mouse input flicker it.
+        bytes.clear();
+        return Some(Key::Unknown);
+    }
     let (key, consumed) = match bytes.as_slice() {
         [] => return None,
         [3, ..] => (Key::CtrlC, 1),
@@ -258,7 +309,6 @@ fn take_key(bytes: &mut Vec<u8>) -> Option<Key> {
         [b'\r' | b'\n', ..] => (Key::Enter, 1),
         [127 | 8, ..] => (Key::Backspace, 1),
         [b'\t', ..] => (Key::Tab, 1),
-        [0x1b] => (Key::Escape, 1),
         [0x1b, b'[', b'A', ..] | [0x1b, b'O', b'A', ..] => (Key::Up, 3),
         [0x1b, b'[', b'B', ..] | [0x1b, b'O', b'B', ..] => (Key::Down, 3),
         [0x1b, b'[', b'C', ..] | [0x1b, b'O', b'C', ..] => (Key::Right, 3),
@@ -287,29 +337,11 @@ fn take_key(bytes: &mut Vec<u8>) -> Option<Key> {
         [0x1b, b'[', b'2', b'1', b'~', ..] => (Key::Function(10), 5),
         [0x1b, b'[', b'2', b'3', b'~', ..] => (Key::Function(11), 5),
         [0x1b, b'[', b'2', b'4', b'~', ..] => (Key::Function(12), 5),
-        [0x1b, b'[', b'<', rest @ ..] => {
-            let end = rest.iter().position(|byte| matches!(byte, b'M' | b'm'))?;
-            let pressed = rest[end] == b'M';
-            let fields = std::str::from_utf8(&rest[..end])
-                .ok()
-                .map(|text| {
-                    text.split(';')
-                        .filter_map(|field| field.parse::<u16>().ok())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            let key = if fields.len() == 3 {
-                Key::Mouse {
-                    button: fields[0],
-                    x: fields[1].saturating_sub(1),
-                    y: fields[2].saturating_sub(1),
-                    pressed,
-                }
-            } else {
-                Key::Unknown
-            };
-            (key, end + 4)
-        }
+        [0x1b, b'[', b'<', ..] => parse_sgr_mouse(bytes)?,
+        [0x1b, b'[', ..] | [0x1b, b'O', ..] => (
+            Key::Unknown,
+            escape_sequence_length(bytes).unwrap_or(bytes.len()),
+        ),
         [0x1b, ..] => (Key::Escape, 1),
         [byte, ..] if byte.is_ascii() && !byte.is_ascii_control() => (Key::Char(*byte as char), 1),
         [byte, ..] if *byte >= 0x80 => {
@@ -324,6 +356,66 @@ fn take_key(bytes: &mut Vec<u8>) -> Option<Key> {
     };
     bytes.drain(..consumed);
     Some(key)
+}
+
+fn parse_sgr_mouse(bytes: &[u8]) -> Option<(Key, usize)> {
+    let [0x1b, b'[', b'<', rest @ ..] = bytes else {
+        return None;
+    };
+    let end = rest.iter().position(|byte| matches!(byte, b'M' | b'm'))?;
+    let pressed = rest[end] == b'M';
+    let fields = std::str::from_utf8(&rest[..end])
+        .ok()
+        .map(|text| {
+            text.split(';')
+                .filter_map(|field| field.parse::<u16>().ok())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let key = if fields.len() == 3 {
+        Key::Mouse {
+            button: fields[0],
+            x: fields[1].saturating_sub(1),
+            y: fields[2].saturating_sub(1),
+            pressed,
+        }
+    } else {
+        Key::Unknown
+    };
+    Some((key, end + 4))
+}
+
+fn is_mouse_wheel(key: Key) -> bool {
+    matches!(
+        key,
+        Key::Mouse {
+            button: 64 | 65,
+            ..
+        }
+    )
+}
+
+fn escape_sequence_is_incomplete(bytes: &[u8]) -> bool {
+    match bytes {
+        [0x1b] => true,
+        [0x1b, b'[', ..] | [0x1b, b'O', ..] => escape_sequence_length(bytes).is_none(),
+        _ => false,
+    }
+}
+
+fn escape_sequence_length(bytes: &[u8]) -> Option<usize> {
+    match bytes {
+        [0x1b, b'[', b'<', rest @ ..] => rest
+            .iter()
+            .position(|byte| matches!(byte, b'M' | b'm'))
+            .map(|end| end + 4),
+        [0x1b, b'[', rest @ ..] => rest
+            .iter()
+            .position(|byte| (0x40..=0x7e).contains(byte))
+            .map(|end| end + 3),
+        [0x1b, b'O', rest @ ..] => rest.first().map(|_| 3),
+        _ => None,
+    }
 }
 
 fn utf8_sequence_width(first: u8) -> usize {
@@ -363,6 +455,101 @@ mod tests {
             })
         );
         assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn buffers_every_partial_sgr_mouse_report_instead_of_emitting_escape() {
+        let report = b"\x1b[<65;123;47M";
+        for split in 1..report.len() {
+            let mut bytes = report[..split].to_vec();
+            assert_eq!(
+                take_key(&mut bytes),
+                None,
+                "split at byte {split} must remain buffered"
+            );
+            bytes.extend_from_slice(&report[split..]);
+            assert_eq!(
+                take_key(&mut bytes),
+                Some(Key::Mouse {
+                    button: 65,
+                    x: 122,
+                    y: 46,
+                    pressed: true,
+                })
+            );
+            assert!(bytes.is_empty());
+        }
+    }
+
+    #[test]
+    fn burst_mouse_reports_split_at_the_old_read_boundary_are_coalesced() {
+        let burst = b"\x1b[<65;90;40M\x1b[<65;90;40M\x1b[<64;90;40M";
+        let mut bytes = burst[..32].to_vec();
+        let mut parsed = Vec::new();
+        while let Some(key) = take_key(&mut bytes) {
+            parsed.push(key);
+        }
+        assert!(!parsed.contains(&Key::Escape));
+        assert!(!bytes.is_empty(), "the split report stays buffered");
+
+        bytes.extend_from_slice(&burst[32..]);
+        while let Some(key) = take_key(&mut bytes) {
+            parsed.push(key);
+        }
+        assert_eq!(
+            parsed,
+            vec![
+                Key::Mouse {
+                    button: 65,
+                    x: 89,
+                    y: 39,
+                    pressed: true,
+                },
+                Key::Mouse {
+                    button: 64,
+                    x: 89,
+                    y: 39,
+                    pressed: true,
+                },
+            ]
+        );
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn a_large_wheel_burst_cannot_starve_a_following_key() {
+        let mut bytes = b"\x1b[<65;90;40M".repeat(500);
+        bytes.push(b'q');
+        assert_eq!(
+            take_key(&mut bytes),
+            Some(Key::Mouse {
+                button: 65,
+                x: 89,
+                y: 39,
+                pressed: true,
+            })
+        );
+        assert_eq!(take_key(&mut bytes), Some(Key::Char('q')));
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn only_a_lone_escape_becomes_escape_after_the_sequence_timeout() {
+        let mut escape = vec![0x1b];
+        assert_eq!(take_key(&mut escape), None);
+        assert_eq!(
+            take_key_after_sequence_timeout(&mut escape),
+            Some(Key::Escape)
+        );
+        assert!(escape.is_empty());
+
+        let mut truncated_mouse = b"\x1b[<65;90".to_vec();
+        assert_eq!(take_key(&mut truncated_mouse), None);
+        assert_eq!(
+            take_key_after_sequence_timeout(&mut truncated_mouse),
+            Some(Key::Unknown)
+        );
+        assert!(truncated_mouse.is_empty());
     }
 
     #[test]

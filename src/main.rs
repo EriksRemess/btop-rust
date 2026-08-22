@@ -27,6 +27,44 @@ const SIGNAL_REDRAW: u32 = 1 << 2;
 const SIGNAL_RELOAD: u32 = 1 << 3;
 static PENDING_SIGNALS: AtomicU32 = AtomicU32::new(0);
 
+struct CollectionClock {
+    interval: Duration,
+    deadline: Instant,
+}
+
+impl CollectionClock {
+    fn new(now: Instant, update_ms: u64) -> Self {
+        Self {
+            interval: Duration::from_millis(update_ms),
+            deadline: now,
+        }
+    }
+
+    fn sync_interval(&mut self, now: Instant, update_ms: u64) {
+        let interval = Duration::from_millis(update_ms);
+        if self.interval != interval {
+            self.interval = interval;
+            self.deadline = now + interval;
+        }
+    }
+
+    fn collection_due(&self, now: Instant) -> bool {
+        now >= self.deadline
+    }
+
+    fn collection_finished(&mut self, now: Instant) {
+        self.deadline = now + self.interval;
+    }
+
+    fn input_deadline(&self, now: Instant) -> Instant {
+        if self.deadline > now {
+            self.deadline
+        } else {
+            now + self.interval
+        }
+    }
+}
+
 extern "C" fn signal_handler(signal: i32) {
     let flag = match signal {
         2 => SIGNAL_QUIT,
@@ -101,6 +139,7 @@ fn run() -> Result<u8, String> {
     let mut collector = Collector::new(&config)?;
     let mut renderer = Renderer::new();
     let mut app = AppState::new(config);
+    let mut collection_clock = CollectionClock::new(Instant::now(), app.config.update_ms);
 
     let exit_code = 'main: loop {
         logger::set_level(
@@ -111,11 +150,13 @@ fn run() -> Result<u8, String> {
             SignalOutcome::Quit => break 'main 0,
             SignalOutcome::Redraw | SignalOutcome::None => {}
         }
-        let frame_started = Instant::now();
+        let now = Instant::now();
+        collection_clock.sync_interval(now, app.config.update_ms);
         let size = terminal.size()?;
-        if app.should_collect() {
+        if app.should_collect() && collection_clock.collection_due(now) {
             let sample = collector.collect(&app.config, app.detailed_pid())?;
             app.update(sample);
+            collection_clock.collection_finished(Instant::now());
         }
         let needed = render::minimum_size(&app.config, &app.sample.gpus);
         if size.cols < needed.cols || size.rows < needed.rows {
@@ -124,7 +165,7 @@ fn run() -> Result<u8, String> {
             terminal.draw(&renderer.render(size, &mut app))?;
         }
 
-        let deadline = frame_started + Duration::from_millis(app.config.update_ms);
+        let deadline = collection_clock.input_deadline(Instant::now());
         loop {
             let now = Instant::now();
             if now >= deadline {
@@ -260,7 +301,8 @@ fn suspend_process() -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::locale_is_utf8;
+    use super::{CollectionClock, locale_is_utf8};
+    use std::time::{Duration, Instant};
 
     #[test]
     fn recognizes_the_utf8_locale_spellings_used_by_btop() {
@@ -268,5 +310,33 @@ mod tests {
         assert!(locale_is_utf8("C.utf8"));
         assert!(!locale_is_utf8("C"));
         assert!(!locale_is_utf8("en_US.ISO-8859-1"));
+    }
+
+    #[test]
+    fn input_redraws_do_not_advance_the_collection_clock() {
+        let started = Instant::now();
+        let mut clock = CollectionClock::new(started, 1_000);
+        assert!(clock.collection_due(started));
+
+        clock.collection_finished(started);
+        for elapsed_ms in [1, 10, 100, 250, 500, 999] {
+            assert!(
+                !clock.collection_due(started + Duration::from_millis(elapsed_ms)),
+                "an input redraw at {elapsed_ms}ms must not collect a new sample"
+            );
+        }
+        assert!(clock.collection_due(started + Duration::from_millis(1_000)));
+    }
+
+    #[test]
+    fn changing_update_ms_restarts_the_collection_interval() {
+        let started = Instant::now();
+        let mut clock = CollectionClock::new(started, 1_000);
+        clock.collection_finished(started);
+
+        let changed = started + Duration::from_millis(400);
+        clock.sync_interval(changed, 2_000);
+        assert!(!clock.collection_due(changed + Duration::from_millis(1_999)));
+        assert!(clock.collection_due(changed + Duration::from_millis(2_000)));
     }
 }

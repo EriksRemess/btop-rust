@@ -165,7 +165,7 @@ Linux runtime.
 - [x] Add btop-equivalent installation assets and targets: documentation,
   themes, desktop entry, PNG/SVG icons and man page. The installed executable
   remains `btoprs`.
-- [ ] The gate covers 91 regular unit/fixture/menu/mouse tests plus one ignored
+- [ ] The gate covers 97 regular unit/fixture/menu/mouse tests plus one ignored
   live-NVML hardware test, exact
   help/default-config output, Clippy, release build and a staged install. PTY
   SIGINT/UTF-8 runs and a 120x40 side-by-side framebuffer comparison were run
