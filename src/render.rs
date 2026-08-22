@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::Instant;
 
 use crate::collect::{NetworkSample, ProcessSample, Sample, temperature_sensor_names};
 use crate::config::{Config, GraphSymbol, ProcessSort};
@@ -131,6 +132,8 @@ pub struct AppState {
     pub available_history: VecDeque<f64>,
     pub cached_history: VecDeque<f64>,
     pub free_history: VecDeque<f64>,
+    swap_used_history: VecDeque<f64>,
+    swap_free_history: VecDeque<f64>,
     disk_histories: HashMap<String, DiskHistory>,
     pub download_history: VecDeque<f64>,
     pub upload_history: VecDeque<f64>,
@@ -164,6 +167,8 @@ pub struct AppState {
     filter_editing: bool,
     filter_buffer: String,
     detailed_pid: Option<u32>,
+    detailed_process: Option<ProcessSample>,
+    last_selected_process: Option<usize>,
     followed_pid: Option<u32>,
     visible_pids: Vec<u32>,
     collapsed_processes: HashSet<u32>,
@@ -183,6 +188,8 @@ pub struct AppState {
     memory_area: Option<Rect>,
     network_area: Option<Rect>,
     process_area: Option<Rect>,
+    debug: bool,
+    draw_times_us: [u64; 6],
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -345,6 +352,8 @@ impl AppState {
             available_history: VecDeque::new(),
             cached_history: VecDeque::new(),
             free_history: VecDeque::new(),
+            swap_used_history: VecDeque::new(),
+            swap_free_history: VecDeque::new(),
             disk_histories: HashMap::new(),
             download_history: VecDeque::new(),
             upload_history: VecDeque::new(),
@@ -377,6 +386,8 @@ impl AppState {
             overlay: Overlay::None,
             filter_editing: false,
             detailed_pid: None,
+            detailed_process: None,
+            last_selected_process: None,
             followed_pid: None,
             visible_pids: Vec::new(),
             collapsed_processes: HashSet::new(),
@@ -396,6 +407,8 @@ impl AppState {
             memory_area: None,
             network_area: None,
             process_area: None,
+            debug: false,
+            draw_times_us: [0; 6],
         }
     }
 
@@ -452,6 +465,23 @@ impl AppState {
             &mut self.free_history,
             ratio(sample.memory.free, sample.memory.total).round(),
         );
+        if sample.memory.swap_total > 0 {
+            push(
+                &mut self.swap_used_history,
+                ratio(sample.memory.swap_used, sample.memory.swap_total).round(),
+            );
+            push(
+                &mut self.swap_free_history,
+                ratio(
+                    sample
+                        .memory
+                        .swap_total
+                        .saturating_sub(sample.memory.swap_used),
+                    sample.memory.swap_total,
+                )
+                .round(),
+            );
+        }
         let mounted: HashSet<&str> = sample
             .memory
             .disks
@@ -541,6 +571,24 @@ impl AppState {
             self.detailed_cpu_history.clear();
             self.detailed_memory_history.clear();
         }
+        match self.detailed_pid {
+            Some(pid) => {
+                if let Some(process) = sample.processes.iter().find(|process| process.pid == pid) {
+                    self.detailed_process = Some(process.clone());
+                } else if let Some(process) = self
+                    .detailed_process
+                    .as_mut()
+                    .filter(|process| process.pid == pid)
+                {
+                    // btop retains the last detail entry and freezes elapsed
+                    // runtime when the selected process disappears.
+                    process.state = 'X';
+                } else {
+                    self.detailed_process = None;
+                }
+            }
+            None => self.detailed_process = None,
+        }
         if let Some(pid) = self.detailed_pid
             && let Some(process) = sample.processes.iter().find(|process| process.pid == pid)
         {
@@ -561,6 +609,10 @@ impl AppState {
             sample.network.uploaded = sample.network.uploaded.saturating_sub(*upload_offset);
         }
         self.sample = sample;
+    }
+
+    pub fn set_debug(&mut self, enabled: bool) {
+        self.debug = enabled;
     }
 
     fn update_network_scale(&mut self, network: &NetworkSample) {
@@ -1024,9 +1076,9 @@ impl AppState {
             Key::Char('k') if self.config.vim_keys => self.select_up(1),
             Key::Down => self.select_down(1),
             Key::Char('j') if self.config.vim_keys => self.select_down(1),
-            Key::PageUp => self.select_up(10),
-            Key::PageDown => self.select_down(10),
-            Key::Home => {
+            Key::PageUp => self.page_up(),
+            Key::PageDown => self.page_down(),
+            Key::Home | Key::Char('g') if key == Key::Home || self.config.vim_keys => {
                 if !self.config.pause_processes {
                     self.followed_pid = None;
                 }
@@ -1034,7 +1086,7 @@ impl AppState {
                 self.process_offset = 0;
                 self.process_selected = true;
             }
-            Key::End => {
+            Key::End | Key::Char('G') if key == Key::End || self.config.vim_keys => {
                 if !self.config.pause_processes {
                     self.followed_pid = None;
                 }
@@ -1322,6 +1374,7 @@ impl AppState {
         }
     }
     fn select_up(&mut self, amount: usize) {
+        self.restore_followed_selection();
         if !self.config.pause_processes {
             self.followed_pid = None;
         }
@@ -1333,6 +1386,7 @@ impl AppState {
         }
     }
     fn select_down(&mut self, amount: usize) {
+        self.restore_followed_selection();
         if !self.config.pause_processes {
             self.followed_pid = None;
         }
@@ -1341,6 +1395,99 @@ impl AppState {
         } else {
             self.selected_process = amount.saturating_sub(1);
             self.process_selected = true;
+        }
+    }
+
+    fn restore_followed_selection(&mut self) {
+        if !self.process_selected
+            && let Some(pid) = self.followed_pid
+            && let Some(index) = self
+                .visible_pids
+                .iter()
+                .position(|candidate| *candidate == pid)
+        {
+            self.selected_process = index;
+            self.process_selected = true;
+        }
+    }
+
+    fn process_page_rows(&self) -> usize {
+        self.process_scrollbar
+            .map(|scrollbar| scrollbar.visible)
+            .or_else(|| {
+                self.process_area.map(|area| {
+                    area.h.saturating_sub(
+                        4 + usize::from(area.h >= 14 && self.detailed_pid.is_some()) * 8,
+                    )
+                })
+            })
+            .unwrap_or(10)
+            .max(1)
+    }
+
+    fn page_up(&mut self) {
+        self.restore_followed_selection();
+        if !self.config.pause_processes {
+            self.followed_pid = None;
+        }
+        if self.process_selected && self.process_offset == 0 {
+            self.process_selected = false;
+            return;
+        }
+        if self.process_selected {
+            let row = self.selected_process.saturating_sub(self.process_offset);
+            self.process_offset = self.process_offset.saturating_sub(self.process_page_rows());
+            self.selected_process = self.process_offset.saturating_add(row);
+        }
+    }
+
+    fn page_down(&mut self) {
+        self.restore_followed_selection();
+        if !self.config.pause_processes {
+            self.followed_pid = None;
+        }
+        let rows = self.process_page_rows();
+        let maximum = self.visible_pids.len().saturating_sub(rows);
+        if self.process_selected {
+            let row = self.selected_process.saturating_sub(self.process_offset);
+            if self.process_offset >= maximum {
+                self.selected_process = self.visible_pids.len().saturating_sub(1);
+            } else {
+                self.process_offset = self.process_offset.saturating_add(rows).min(maximum);
+                self.selected_process = self
+                    .process_offset
+                    .saturating_add(row)
+                    .min(self.visible_pids.len().saturating_sub(1));
+            }
+        } else if !self.visible_pids.is_empty() {
+            self.selected_process = self.process_offset;
+            self.process_selected = true;
+        }
+    }
+
+    fn scroll_processes(&mut self, down: bool, amount: usize) {
+        if !self.config.pause_processes {
+            self.followed_pid = None;
+        }
+        let maximum = self
+            .visible_pids
+            .len()
+            .saturating_sub(self.process_page_rows());
+        let previous = self.process_offset;
+        self.process_offset = if down {
+            self.process_offset.saturating_add(amount).min(maximum)
+        } else {
+            self.process_offset.saturating_sub(amount)
+        };
+        if self.process_selected {
+            let moved = self.process_offset.abs_diff(previous);
+            self.selected_process = if down {
+                self.selected_process
+                    .saturating_add(moved)
+                    .min(self.visible_pids.len().saturating_sub(1))
+            } else {
+                self.selected_process.saturating_sub(moved)
+            };
         }
     }
     fn cycle_interface(&mut self, forward: bool) {
@@ -1565,7 +1712,9 @@ impl AppState {
                     self.followed_pid = None;
                 }
             } else {
+                self.last_selected_process = Some(self.selected_process);
                 self.detailed_pid = Some(pid);
+                self.process_selected = false;
                 if self
                     .config
                     .bool_value("proc_follow_detailed")
@@ -1575,14 +1724,22 @@ impl AppState {
                 }
             }
         } else if self.detailed_pid.is_some() {
+            let followed_detail = self.followed_pid == self.detailed_pid;
+            if !followed_detail && let Some(selected) = self.last_selected_process.take() {
+                self.selected_process = selected;
+                self.process_selected = true;
+            }
+            if followed_detail {
+                self.followed_pid = None;
+            }
             self.detailed_pid = None;
         }
     }
 
     fn handle_mouse(&mut self, button: u16, x: usize, y: usize, pressed: bool) -> bool {
-        let Some(size) = self.last_size else {
+        if self.last_size.is_none() {
             return false;
-        };
+        }
         if !pressed {
             self.dragging_process_scrollbar = false;
             return false;
@@ -1598,9 +1755,9 @@ impl AppState {
             && (scrollbar.up_y..=scrollbar.down_y).contains(&y)
         {
             if y == scrollbar.up_y {
-                self.select_up(scrollbar.visible);
+                self.page_up();
             } else if y == scrollbar.down_y {
-                self.select_down(scrollbar.visible);
+                self.page_down();
             } else {
                 self.dragging_process_scrollbar = y == scrollbar.thumb_y;
                 self.select_from_process_scrollbar(y);
@@ -1609,11 +1766,7 @@ impl AppState {
             return false;
         }
         if matches!(button, 64 | 65) && self.process_area.is_some_and(|area| area.contains(x, y)) {
-            if button == 64 {
-                self.select_up(3);
-            } else {
-                self.select_down(3);
-            }
+            self.scroll_processes(button == 65, 3);
             self.needs_redraw = true;
             return false;
         }
@@ -1676,21 +1829,7 @@ impl AppState {
                         self.process_selected = true;
                         self.toggle_process_collapsed(hitbox.pid);
                     } else if self.process_selected && self.selected_process == hitbox.index {
-                        if self.detailed_pid == Some(hitbox.pid) {
-                            self.detailed_pid = None;
-                            if self.followed_pid == Some(hitbox.pid) {
-                                self.followed_pid = None;
-                            }
-                        } else {
-                            self.detailed_pid = Some(hitbox.pid);
-                            if self
-                                .config
-                                .bool_value("proc_follow_detailed")
-                                .unwrap_or(false)
-                            {
-                                self.followed_pid = Some(hitbox.pid);
-                            }
-                        }
+                        self.toggle_process_details();
                     } else {
                         self.selected_process = hitbox.index;
                         self.process_selected = true;
@@ -1702,161 +1841,8 @@ impl AppState {
                 return false;
             }
         }
-        let width = size.cols as usize;
-        let height = size.rows as usize;
-        let shown_gpus = shown_gpu_panels(&self.config, &self.sample.gpus);
-        let inline_gpus = inline_gpu_panels(&self.config, &self.sample.gpus, &shown_gpus);
-        let lower_visible = self.config.shown[1] || self.config.shown[2] || self.config.shown[3];
-        let cpu_percent = if shown_gpus.is_empty() {
-            32
-        } else {
-            32 / (shown_gpus.len() + 1) + 5
-        };
-        let cpu_h = if self.config.shown[0] {
-            (height * cpu_percent)
-                .div_ceil(100)
-                .saturating_add(inline_gpus.len())
-                .clamp(8, height.saturating_sub(12))
-        } else {
-            0
-        };
-        let mut lower_y = cpu_h;
-        for (position, &index) in shown_gpus.iter().enumerate() {
-            let remaining = height.saturating_sub(lower_y);
-            let gpu_h = gpu_panel_height(
-                &self.sample.gpus[index],
-                cpu_h,
-                lower_visible,
-                remaining,
-                shown_gpus.len() - position,
-                height,
-                shown_gpus.len(),
-            );
-            if lower_y + gpu_h > height {
-                break;
-            }
-            lower_y += gpu_h;
-        }
-        let left_visible = self.config.shown[1] || self.config.shown[2];
-        let proc_visible = self.config.shown[3];
-        let left_w = if left_visible && proc_visible {
-            (width * 45 / 100).max(36).min(width.saturating_sub(44))
-        } else if left_visible {
-            width
-        } else {
-            0
-        };
-        if button == 64 && proc_visible && x >= left_w {
-            self.select_up(3);
-            self.needs_redraw = true;
-            return false;
-        }
-        if button == 65 && proc_visible && x >= left_w {
-            self.select_down(3);
-            self.needs_redraw = true;
-            return false;
-        }
         if button != 0 {
             return false;
-        }
-        if y == 0 && self.config.shown[0] {
-            if let Some(hitbox) = self
-                .cpu_control_hitboxes
-                .iter()
-                .copied()
-                .find(|hitbox| hitbox.y == y && (hitbox.start..hitbox.end).contains(&x))
-            {
-                self.activate_cpu_control(hitbox.action);
-            }
-            self.needs_redraw = true;
-            return false;
-        }
-        let mem_h = memory_panel_height(
-            height,
-            cpu_h,
-            lower_y.saturating_sub(cpu_h),
-            self.config.shown[0],
-            self.config.shown[1],
-            self.config.shown[2],
-            !shown_gpus.is_empty(),
-        );
-        if self.config.shown[1] && y == lower_y && x < left_w {
-            if let Some(hitbox) = self
-                .memory_control_hitboxes
-                .iter()
-                .copied()
-                .find(|hitbox| hitbox.y == y && (hitbox.start..hitbox.end).contains(&x))
-            {
-                self.activate_memory_control(hitbox.action);
-            }
-            self.needs_redraw = true;
-            return false;
-        }
-        if self.config.shown[2] && y == lower_y + mem_h && x < left_w {
-            if let Some(hitbox) = self
-                .network_hitboxes
-                .iter()
-                .copied()
-                .find(|hitbox| hitbox.y == y && (hitbox.start..hitbox.end).contains(&x))
-            {
-                self.activate_network_control(hitbox.action);
-            }
-            self.needs_redraw = true;
-            return false;
-        }
-        if proc_visible && x >= left_w {
-            if y == lower_y {
-                if let Some(hitbox) = self
-                    .process_control_hitboxes
-                    .iter()
-                    .copied()
-                    .find(|hitbox| hitbox.y == y && (hitbox.start..hitbox.end).contains(&x))
-                {
-                    self.activate_process_control(hitbox.action);
-                }
-                self.needs_redraw = true;
-                return false;
-            }
-            if y + 1 == height {
-                if let Some(hitbox) = self
-                    .process_control_hitboxes
-                    .iter()
-                    .copied()
-                    .find(|hitbox| hitbox.y == y && (hitbox.start..hitbox.end).contains(&x))
-                {
-                    self.activate_process_control(hitbox.action);
-                }
-                self.needs_redraw = true;
-                return false;
-            }
-            if let Some(hitbox) = self
-                .process_hitboxes
-                .iter()
-                .copied()
-                .find(|hitbox| hitbox.y == y)
-            {
-                if !self.config.pause_processes {
-                    self.followed_pid = None;
-                }
-                let clicked_toggle = hitbox
-                    .toggle_x
-                    .is_some_and(|(start, end)| (start..end).contains(&x));
-                if clicked_toggle {
-                    self.selected_process = hitbox.index;
-                    self.process_selected = true;
-                    self.toggle_process_collapsed(hitbox.pid);
-                } else if self.process_selected && self.selected_process == hitbox.index {
-                    if self.detailed_pid == Some(hitbox.pid) {
-                        self.detailed_pid = None;
-                    } else {
-                        self.detailed_pid = Some(hitbox.pid);
-                    }
-                } else {
-                    self.selected_process = hitbox.index;
-                    self.process_selected = true;
-                }
-                self.needs_redraw = true;
-            }
         }
         if self.process_selected && !self.process_area.is_some_and(|area| area.contains(x, y)) {
             self.process_selected = false;
@@ -1909,6 +1895,8 @@ impl Renderer {
     }
 
     pub fn render(&mut self, size: Size, app: &mut AppState) -> String {
+        let render_started = Instant::now();
+        app.draw_times_us = [0; 6];
         app.last_size = Some(size);
         if self.theme_name != app.config.color_theme || self.themes_dir != app.config.themes_dir {
             self.palette =
@@ -1952,9 +1940,13 @@ impl Renderer {
                 }
             } else {
                 let gpu_divisor = shown_gpus.len() + 1;
-                let percentage_numerator = 32 + 5 * gpu_divisor;
-                (height * percentage_numerator)
-                    .div_ceil(100 * gpu_divisor)
+                // Draw::calcSizes performs the division in the integer
+                // percentage expression before applying ceil(). This differs
+                // from treating 32 / divisor as a fraction once three or more
+                // dedicated GPU panels are visible.
+                let percentage = 32 / gpu_divisor + 5 * usize::from(!shown_gpus.is_empty());
+                (height * percentage)
+                    .div_ceil(100)
                     .saturating_add(inline_gpus.len())
                     .max(8)
                     .min(height)
@@ -1972,7 +1964,9 @@ impl Renderer {
             canvas.graph_symbol = panel_graph_symbol(&app.config, "graph_symbol_cpu");
             let area = Rect::new(0, cpu_y, width, cpu_h);
             app.cpu_area = Some(area);
+            let started = Instant::now();
             draw_cpu(&mut canvas, area, app);
+            app.draw_times_us[0] = elapsed_us(started);
         }
 
         let mut gpu_y = if cpu_bottom { 0 } else { cpu_h };
@@ -1992,7 +1986,9 @@ impl Renderer {
                 break;
             }
             canvas.graph_symbol = panel_graph_symbol(&app.config, "graph_symbol_gpu");
+            let started = Instant::now();
             draw_gpu(&mut canvas, Rect::new(0, gpu_y, width, gpu_h), app, index);
+            app.draw_times_us[4] = app.draw_times_us[4].saturating_add(elapsed_us(started));
             gpu_y += gpu_h;
         }
         let lower_y = gpu_y;
@@ -2040,20 +2036,30 @@ impl Renderer {
                 canvas.graph_symbol = panel_graph_symbol(&app.config, "graph_symbol_mem");
                 let area = Rect::new(left_x, mem_y, left_w, mem_h);
                 app.memory_area = Some(area);
+                let started = Instant::now();
                 draw_memory(&mut canvas, area, app);
+                app.draw_times_us[1] = elapsed_us(started);
             }
             if app.config.shown[2] {
                 canvas.graph_symbol = panel_graph_symbol(&app.config, "graph_symbol_net");
                 let area = Rect::new(left_x, net_y, left_w, net_h);
                 app.network_area = Some(area);
+                let started = Instant::now();
                 draw_network(&mut canvas, area, app);
+                app.draw_times_us[2] = elapsed_us(started);
             }
         }
         if proc_visible {
             canvas.graph_symbol = panel_graph_symbol(&app.config, "graph_symbol_proc");
             let area = Rect::new(proc_x, lower_y, proc_w, lower_h);
             app.process_area = Some(area);
+            let started = Instant::now();
             draw_processes(&mut canvas, area, app);
+            app.draw_times_us[3] = elapsed_us(started);
+        }
+        app.draw_times_us[5] = elapsed_us(render_started);
+        if app.debug && app.overlay == Overlay::None {
+            draw_debug_times(&mut canvas, app);
         }
         if app.overlay != Overlay::None {
             canvas.dim();
@@ -2079,6 +2085,45 @@ impl Renderer {
             Overlay::None => {}
         }
         canvas.finish()
+    }
+}
+
+fn elapsed_us(started: Instant) -> u64 {
+    started.elapsed().as_micros().min(u64::MAX as u128) as u64
+}
+
+fn draw_debug_times(canvas: &mut Canvas, app: &AppState) {
+    if canvas.width < 36 || canvas.height < 11 {
+        return;
+    }
+    let area = Rect::new(1, 1, 33, 9);
+    canvas.panel(area, "", theme::PROC_BOX, None);
+    canvas.text_bold(
+        area.x + 2,
+        area.y,
+        "box       collect         draw",
+        theme::TITLE,
+    );
+    for (row, (name, index)) in [
+        ("cpu", 0),
+        ("mem", 1),
+        ("net", 2),
+        ("proc", 3),
+        ("gpu", 4),
+        ("total", 5),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let text = format!(
+            "{name:<5} {:>12} {:>12}",
+            app.sample.collection_times_us[index], app.draw_times_us[index]
+        );
+        if name == "total" {
+            canvas.text_bold(area.x + 1, area.y + row + 2, &text, theme::MAIN);
+        } else {
+            canvas.text(area.x + 1, area.y + row + 2, &text, theme::MAIN);
+        }
     }
 }
 
@@ -2166,8 +2211,8 @@ fn draw_cpu(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
     let inline_gpus = inline_gpu_panels(&app.config, &app.sample.gpus, &dedicated_gpus);
     let show_temps = app.config.check_temperature && cpu.temperature.is_some();
     let core_count = cpu.cores.len().max(1);
-    let available_rows = area.h.saturating_sub(6 + inline_gpus.len()).max(1);
-    let mut columns = core_count.div_ceil(available_rows).max(1);
+    let available_rows = area.h.saturating_sub(5 + inline_gpus.len()).max(1);
+    let mut columns = core_count.saturating_add(1).div_ceil(available_rows).max(2);
     let right_space = area.w.saturating_sub(area.w / 3);
     let column_size;
     if columns * (21 + 12 * usize::from(show_temps)) < right_space {
@@ -2859,15 +2904,20 @@ fn gpu_panel_height(
     terminal_height: usize,
     total_gpus: usize,
 ) -> usize {
-    let base = if cpu_height > 0 && lower_visible {
+    let mut base = if cpu_height > 0 && lower_visible {
         cpu_height
     } else if cpu_height == 0 && !lower_visible {
         remaining_height.div_ceil(remaining_gpus.max(1))
     } else if cpu_height == 0 {
-        (terminal_height * 32).div_ceil(100 * total_gpus.max(1))
+        (terminal_height * 32)
+            .div_ceil(100 * total_gpus.max(1))
+            .max(8)
     } else {
         8
     };
+    if cpu_height > 0 && base + cpu_height == terminal_height.saturating_sub(1) {
+        base += 1;
+    }
     base.max(gpu_height_offset(gpu) + 4)
 }
 
@@ -3245,6 +3295,41 @@ fn draw_gpu(canvas: &mut Canvas, area: Rect, app: &AppState, index: usize) {
     }
 }
 
+fn draw_inline_swap_header(
+    canvas: &mut Canvas,
+    area: Rect,
+    divider: usize,
+    mut cy: usize,
+    graph_height: usize,
+    total: u64,
+    base_10: bool,
+) -> Option<usize> {
+    if cy > area.h.saturating_sub(5) {
+        return None;
+    }
+    if area.h.saturating_sub(cy) > 6 {
+        if graph_height > 0 {
+            let y = area.y + 1 + cy;
+            canvas.put(area.x, y, '├', theme::MEM_BOX);
+            for x in area.x + 1..divider {
+                canvas.put(x, y, '─', theme::BOX);
+            }
+            canvas.put(divider, y, '┤', theme::MEM_BOX);
+        }
+        cy += 1;
+    }
+    let y = area.y + 1 + cy;
+    canvas.text_bold(area.x + 2, y, "Swap:", theme::TITLE);
+    let human = units::bytes_spaced(total, base_10);
+    canvas.text_preserve_spaces_bold(
+        divider.saturating_sub(human.len() + 1),
+        y,
+        &human,
+        theme::TITLE,
+    );
+    Some(cy + 1)
+}
+
 fn draw_memory(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
     app.memory_control_hitboxes.clear();
     if area.h < 3 || area.w < 3 {
@@ -3263,12 +3348,32 @@ fn draw_memory(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
     let divider = area.x + mem_width;
     let disks_width = area.w.saturating_sub(mem_width + 2);
     let use_graphs = app.config.mem_graphs;
+    let has_inline_swap = mem.swap_total > 0
+        && app.config.bool_value("show_swap").unwrap_or(true)
+        && !app.config.bool_value("swap_disk").unwrap_or(true);
+    let item_height = if has_inline_swap { 6 } else { 4 };
+    let mem_size = if area.h.saturating_sub(if has_inline_swap { 3 } else { 2 }) > 2 * item_height {
+        3
+    } else if mem_width > 25 {
+        2
+    } else {
+        1
+    };
     let graph_height = if use_graphs {
-        (((area.h.saturating_sub(1 + 8)) as f64 / 4.0).round() as usize).max(1)
+        let reserved = if has_inline_swap { 2 } else { 1 };
+        let groups = if mem_size == 3 { 2 } else { 1 };
+        let available = area.h.saturating_sub(reserved + groups * item_height);
+        ((available as f64 / item_height as f64).round() as usize).max(1)
     } else {
         0
     };
-    let graph_width = mem_width.saturating_sub(1);
+    let mut graph_width = mem_width.saturating_sub(if mem_size > 2 { 7 } else { 17 });
+    if mem_size == 1 {
+        graph_width += 6;
+    }
+    if graph_height > 1 {
+        graph_width += 6;
+    }
 
     canvas.panel(area, "²mem", theme::MEM_BOX, None);
     let disks_x = if show_disks {
@@ -3314,38 +3419,76 @@ fn draw_memory(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
         theme::TITLE,
     );
 
-    let entries = [
-        ("Used", mem.used, &app.mem_history, theme::Style::Used(100)),
+    let mut entries = vec![
+        (
+            "Used",
+            mem.used,
+            mem.total,
+            &app.mem_history,
+            theme::Style::Used(100),
+            false,
+        ),
         (
             "Available",
             mem.available,
+            mem.total,
             &app.available_history,
             theme::Style::Available(100),
+            false,
         ),
         (
             "Cached",
             mem.cached,
+            mem.total,
             &app.cached_history,
             theme::Style::Cached(100),
+            false,
         ),
-        ("Free", mem.free, &app.free_history, theme::Style::Free(100)),
+        (
+            "Free",
+            mem.free,
+            mem.total,
+            &app.free_history,
+            theme::Style::Free(100),
+            false,
+        ),
     ];
-    let has_inline_swap = mem.swap_total > 0
-        && app.config.bool_value("show_swap").unwrap_or(true)
-        && !app.config.bool_value("swap_disk").unwrap_or(true);
-    let item_height = if has_inline_swap { 6 } else { 4 };
-    let mem_size = if area.h.saturating_sub(if has_inline_swap { 3 } else { 2 }) > 2 * item_height {
-        3
-    } else if mem_width > 25 {
-        2
-    } else {
-        1
-    };
+    if has_inline_swap {
+        entries.push((
+            "Used",
+            mem.swap_used,
+            mem.swap_total,
+            &app.swap_used_history,
+            theme::Style::Used(100),
+            true,
+        ));
+        entries.push((
+            "Free",
+            mem.swap_total.saturating_sub(mem.swap_used),
+            mem.swap_total,
+            &app.swap_free_history,
+            theme::Style::Free(100),
+            false,
+        ));
+    }
     let compact = mem_size < 3;
     let mut cy = 1usize;
     if compact {
-        let meter_width = (mem_width.saturating_sub(18) + if mem_size == 1 { 6 } else { 0 }).max(1);
-        for (title, value, history, style) in entries {
+        for (title, value, basis, history, style, swap_start) in entries {
+            if swap_start {
+                let Some(next) = draw_inline_swap_header(
+                    canvas,
+                    area,
+                    divider,
+                    cy,
+                    graph_height,
+                    mem.swap_total,
+                    app.config.base_10_sizes,
+                ) else {
+                    break;
+                };
+                cy = next;
+            }
             if cy + 1 >= area.h - 1 {
                 break;
             }
@@ -3363,24 +3506,18 @@ fn draw_memory(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
                 ),
                 theme::MAIN,
             );
-            let graph_x = area.x + 2 + if mem_size > 1 { 6 } else { 2 };
+            let graph_x =
+                area.x + 2 + if mem_size > 1 { 5 } else { 1 } + usize::from(graph_height < 2);
             if use_graphs {
                 draw_graph(
                     canvas,
-                    Rect::new(graph_x, y, meter_width, 1),
+                    Rect::new(graph_x, y, graph_width, graph_height),
                     history,
                     100.0,
                     style,
                 );
             } else {
-                meter(
-                    canvas,
-                    graph_x,
-                    y,
-                    meter_width,
-                    ratio(value, mem.total),
-                    style,
-                );
+                meter(canvas, graph_x, y, graph_width, ratio(value, basis), style);
             }
             let human = units::bytes_spaced(value, app.config.base_10_sizes);
             canvas.text(
@@ -3393,7 +3530,7 @@ fn draw_memory(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
                 ),
                 theme::TITLE,
             );
-            cy += 1;
+            cy += graph_height.max(1);
         }
         if cy < area.h - 2 {
             let y = area.y + 1 + cy;
@@ -3404,7 +3541,21 @@ fn draw_memory(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
             canvas.put(divider, y, '┤', theme::MEM_BOX);
         }
     } else {
-        for (title, value, history, style) in entries {
+        for (title, value, basis, history, style, swap_start) in entries {
+            if swap_start {
+                let Some(next) = draw_inline_swap_header(
+                    canvas,
+                    area,
+                    divider,
+                    cy,
+                    graph_height,
+                    mem.swap_total,
+                    app.config.base_10_sizes,
+                ) else {
+                    break;
+                };
+                cy = next;
+            }
             if cy + 1 >= area.h - 1 {
                 break;
             }
@@ -3428,10 +3579,11 @@ fn draw_memory(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
                 usize::from(y + 1 < area.bottom())
             };
             if draw_height > 0 {
+                let graph_x = area.x + 1 + usize::from(graph_height < 2);
                 if use_graphs {
                     draw_graph(
                         canvas,
-                        Rect::new(area.x + 1, y + 1, graph_width, draw_height),
+                        Rect::new(graph_x, y + 1, graph_width, draw_height),
                         history,
                         100.0,
                         style,
@@ -3439,17 +3591,22 @@ fn draw_memory(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
                 } else {
                     meter(
                         canvas,
-                        area.x + 7,
+                        graph_x,
                         y + 1,
-                        graph_width.saturating_sub(7),
-                        ratio(value, mem.total),
+                        graph_width,
+                        ratio(value, basis),
                         style,
                     );
                 }
+                let percent_x = if graph_height >= 2 {
+                    area.x + 2
+                } else {
+                    graph_x + graph_width
+                };
                 canvas.text(
-                    area.x + 2,
+                    percent_x,
                     y + 1,
-                    &format!("{:>3.0}%", ratio(value, mem.total)),
+                    &format!("{:>3.0}%", ratio(value, basis)),
                     theme::MAIN,
                 );
             }
@@ -3464,19 +3621,6 @@ fn draw_memory(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
             canvas.put(divider, separator_y, '┤', theme::MEM_BOX);
         }
     }
-    if has_inline_swap && cy + 1 < area.h - 1 {
-        canvas.text(
-            area.x + 2,
-            area.y + 1 + cy,
-            &format!(
-                "Swap: {:>3.0}% {}",
-                ratio(mem.swap_used, mem.swap_total),
-                units::bytes_spaced(mem.swap_used, app.config.base_10_sizes)
-            ),
-            theme::MAIN,
-        );
-    }
-
     if show_disks {
         let io_mode = app.config.bool_value("io_mode").unwrap_or(false);
         let show_io_stat = app.config.bool_value("show_io_stat").unwrap_or(true);
@@ -3538,10 +3682,13 @@ fn draw_disks_capacity(
         disks.insert(0, &swap);
     }
     let disk_ios = disks.iter().filter(|disk| disk.io_supported).count();
-    let roomy_gap = disks.len() * 4 + usize::from(show_io_stat) * disk_ios < area.h;
+    let io_rows = usize::from(show_io_stat) * disk_ios;
+    let show_free = disks.len() * 3 + io_rows <= area.h.saturating_sub(1);
+    let roomy_gap = disks.len() * 4 + io_rows <= area.h.saturating_sub(1);
     for disk in disks {
         let io_row = usize::from(show_io_stat && disk.io_supported);
-        if cy + 3 + io_row > area.h - 1 {
+        let disk_rows = 2 + io_row + usize::from(show_free) + usize::from(roomy_gap);
+        if cy + disk_rows > area.h - 1 {
             break;
         }
         let y = area.y + 1 + cy;
@@ -3625,28 +3772,30 @@ fn draw_disks_capacity(
             theme::MAIN,
         );
         row += 1;
-        canvas.text(
-            divider + 2,
-            row,
-            &format!("Free:{free:>3.0}% "),
-            theme::MAIN,
-        );
-        meter(
-            canvas,
-            divider + 12,
-            row,
-            meter_width,
-            free,
-            theme::Style::Free(100),
-        );
-        let free_human = units::bytes_spaced(disk.free, app.config.base_10_sizes);
-        canvas.text(
-            area.x + area.w.saturating_sub(free_human.len() + 2),
-            row,
-            &free_human,
-            theme::MAIN,
-        );
-        cy += 3 + io_row + usize::from(roomy_gap);
+        if show_free {
+            canvas.text(
+                divider + 2,
+                row,
+                &format!("Free:{free:>3.0}% "),
+                theme::MAIN,
+            );
+            meter(
+                canvas,
+                divider + 12,
+                row,
+                meter_width,
+                free,
+                theme::Style::Free(100),
+            );
+            let free_human = units::bytes_spaced(disk.free, app.config.base_10_sizes);
+            canvas.text(
+                area.x + area.w.saturating_sub(free_human.len() + 2),
+                row,
+                &free_human,
+                theme::MAIN,
+            );
+        }
+        cy += disk_rows;
     }
     if cy < area.h - 2 {
         draw_disk_divider(canvas, area, divider, area.y + 1 + cy);
@@ -4061,68 +4210,66 @@ fn draw_network(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
             Some(value) if value.eq_ignore_ascii_case("false") => false,
             _ => app.config.base_10_sizes,
         };
-        if stats_height >= 6 {
-            let top_y = stats_y + 1;
-            let bottom_y = stats_y + stats_height - stats_height / 2;
-            if swap {
-                draw_network_stat(
-                    canvas,
-                    stats_x,
-                    top_y,
-                    stats_width,
-                    stats_height,
-                    '▲',
-                    &upload_speed,
-                    net.upload_per_second,
-                    app.upload_top,
-                    net.uploaded,
-                    base_10_bitrate,
-                    app.config.base_10_sizes,
-                );
-                draw_network_stat(
-                    canvas,
-                    stats_x,
-                    bottom_y,
-                    stats_width,
-                    stats_height,
-                    '▼',
-                    &download_speed,
-                    net.download_per_second,
-                    app.download_top,
-                    net.downloaded,
-                    base_10_bitrate,
-                    app.config.base_10_sizes,
-                );
-            } else {
-                draw_network_stat(
-                    canvas,
-                    stats_x,
-                    top_y,
-                    stats_width,
-                    stats_height,
-                    '▼',
-                    &download_speed,
-                    net.download_per_second,
-                    app.download_top,
-                    net.downloaded,
-                    base_10_bitrate,
-                    app.config.base_10_sizes,
-                );
-                draw_network_stat(
-                    canvas,
-                    stats_x,
-                    bottom_y,
-                    stats_width,
-                    stats_height,
-                    '▲',
-                    &upload_speed,
-                    net.upload_per_second,
-                    app.upload_top,
-                    net.uploaded,
-                    base_10_bitrate,
-                    app.config.base_10_sizes,
-                );
-            }
+        let top_y = stats_y + 1;
+        let bottom_y = stats_y + stats_height - stats_height / 2;
+        if swap {
+            draw_network_stat(
+                canvas,
+                stats_x,
+                top_y,
+                stats_width,
+                stats_height,
+                '▲',
+                &upload_speed,
+                net.upload_per_second,
+                app.upload_top,
+                net.uploaded,
+                base_10_bitrate,
+                app.config.base_10_sizes,
+            );
+            draw_network_stat(
+                canvas,
+                stats_x,
+                bottom_y,
+                stats_width,
+                stats_height,
+                '▼',
+                &download_speed,
+                net.download_per_second,
+                app.download_top,
+                net.downloaded,
+                base_10_bitrate,
+                app.config.base_10_sizes,
+            );
+        } else {
+            draw_network_stat(
+                canvas,
+                stats_x,
+                top_y,
+                stats_width,
+                stats_height,
+                '▼',
+                &download_speed,
+                net.download_per_second,
+                app.download_top,
+                net.downloaded,
+                base_10_bitrate,
+                app.config.base_10_sizes,
+            );
+            draw_network_stat(
+                canvas,
+                stats_x,
+                bottom_y,
+                stats_width,
+                stats_height,
+                '▲',
+                &upload_speed,
+                net.upload_per_second,
+                app.upload_top,
+                net.uploaded,
+                base_10_bitrate,
+                app.config.base_10_sizes,
+            );
         }
     }
 }
@@ -4153,25 +4300,29 @@ fn draw_network_stat(
     };
     canvas.text(x + 1, y, &speed_line, theme::MAIN);
     if stats_height >= 8 {
+        let width = if stats_width >= 20 { 18 } else { 10 };
         canvas.text(
             x + 1,
             y + 1,
             &format!(
-                "{arrow} Top: {:>18}",
-                format!("({})", units::bits_per_second(top, base_10_bitrate))
+                "{arrow} Top: {:>width$}",
+                format!("({})", units::bits_per_second(top, base_10_bitrate)),
             ),
             theme::MAIN,
         );
     }
-    canvas.text(
-        x + 1,
-        y + 1 + usize::from(stats_height >= 8),
-        &format!(
-            "{arrow} Total: {:>16}",
-            units::bytes_spaced(total, base_10_sizes)
-        ),
-        theme::MAIN,
-    );
+    if stats_height >= 6 {
+        let width = if stats_width >= 20 { 16 } else { 8 };
+        canvas.text(
+            x + 1,
+            y + 1 + usize::from(stats_height >= 8),
+            &format!(
+                "{arrow} Total: {:>width$}",
+                units::bytes_spaced(total, base_10_sizes)
+            ),
+            theme::MAIN,
+        );
+    }
 }
 
 fn configured_network_max(config: &Config, name: &str) -> f64 {
@@ -4488,11 +4639,7 @@ fn draw_process_details(
         .clamp(1, 3);
     for row in 0..command_lines {
         let start = row * command_width;
-        let text = command
-            .chars()
-            .skip(start)
-            .take(command_width)
-            .collect::<String>();
+        let text = units::column_slice(&command, start, command_width);
         canvas.text(
             details_x + 3,
             area.y + 5 + if command_lines == 1 { 1 } else { row },
@@ -4770,26 +4917,38 @@ fn draw_processes(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
     if area.h >= 14
         && let Some(pid) = app.detailed_pid
     {
-        if let Some(process) = app
+        let process = app
             .sample
             .processes
             .iter()
             .find(|process| process.pid == pid)
             .cloned()
-        {
+            .or_else(|| {
+                app.detailed_process
+                    .as_ref()
+                    .filter(|process| process.pid == pid)
+                    .cloned()
+            });
+        if let Some(process) = process {
+            app.detailed_process = Some(process.clone());
             draw_process_details(canvas, area, app, &process);
             header_y = area.y + 9;
         } else {
             app.detailed_pid = None;
+            app.detailed_process = None;
         }
     }
     let rows = area.bottom().saturating_sub(header_y + 2);
     app.selected_process = app.selected_process.min(listed.len() - 1);
-    if app.selected_process < app.process_offset {
-        app.process_offset = app.selected_process;
-    }
-    if app.selected_process >= app.process_offset + rows {
-        app.process_offset = app.selected_process + 1 - rows;
+    if app.process_selected {
+        if app.selected_process < app.process_offset {
+            app.process_offset = app.selected_process;
+        }
+        if app.selected_process >= app.process_offset + rows {
+            app.process_offset = app.selected_process + 1 - rows;
+        }
+    } else {
+        app.process_offset = app.process_offset.min(listed.len().saturating_sub(rows));
     }
     let user_w = if area.w < 75 { 5 } else { 10 };
     let thread_w = if area.w < 75 { 0 } else { 4 };
@@ -8170,6 +8329,49 @@ mod tests {
             .collect()
     }
 
+    fn frame_fingerprint(frame: &str) -> u64 {
+        frame.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+    }
+
+    #[test]
+    fn deterministic_full_frames_cover_reference_terminal_layouts() {
+        let cases = [
+            (Size { cols: 80, rows: 24 }, "cpu"),
+            (
+                Size {
+                    cols: 120,
+                    rows: 40,
+                },
+                "cpu mem net proc",
+            ),
+            (
+                Size {
+                    cols: 160,
+                    rows: 50,
+                },
+                "mem net proc",
+            ),
+        ];
+        let actual = cases.map(|(size, boxes)| {
+            let mut app = app();
+            app.config.clock_format.clear();
+            app.config.set_value("shown_boxes", boxes);
+            let mut renderer = Renderer::new();
+            let frame = renderer.render(size, &mut app);
+            frame_fingerprint(&frame)
+        });
+        assert_eq!(
+            actual,
+            [
+                2_770_106_502_089_868_106,
+                18_097_391_836_841_027_499,
+                14_449_041_907_813_186_248,
+            ]
+        );
+    }
+
     #[test]
     fn options_arrows_change_boolean_and_choice_values() {
         let mut app = app();
@@ -8200,6 +8402,26 @@ mod tests {
     }
 
     #[test]
+    fn debug_mode_draws_per_box_collection_and_render_timings() {
+        let mut app = app();
+        app.set_debug(true);
+        app.sample.collection_times_us = [11, 22, 33, 44, 55, 165];
+        let mut renderer = Renderer::new();
+        let frame = renderer.render(
+            Size {
+                cols: 120,
+                rows: 40,
+            },
+            &mut app,
+        );
+
+        assert!(frame.contains("box       collect         draw"));
+        assert!(frame.contains("cpu             11"));
+        assert!(frame.contains("gpu             55"));
+        assert!(frame.contains("total          165"));
+    }
+
+    #[test]
     fn process_arrows_work_without_vim_and_vim_kill_uses_uppercase_k() {
         let mut app = app();
         app.handle_key(Key::Down);
@@ -8220,6 +8442,90 @@ mod tests {
                 signal: 9
             }
         );
+    }
+
+    #[test]
+    fn process_paging_wheel_and_detail_follow_use_rendered_rows() {
+        let mut app = app();
+        app.visible_pids = (1..=40).collect();
+        app.process_area = Some(Rect::new(50, 10, 70, 20));
+        app.process_scrollbar = Some(ProcessScrollbar {
+            x: 118,
+            up_y: 11,
+            down_y: 28,
+            track_top: 12,
+            track_bottom: 28,
+            thumb_y: 12,
+            visible: 10,
+            total: 40,
+        });
+        app.process_selected = true;
+        app.selected_process = 5;
+
+        app.handle_key(Key::PageUp);
+        assert!(!app.process_selected);
+        app.handle_key(Key::PageDown);
+        assert!(app.process_selected);
+        assert_eq!(app.selected_process, 0);
+
+        app.process_offset = 5;
+        app.selected_process = 7;
+        app.handle_key(Key::PageDown);
+        assert_eq!(app.process_offset, 15);
+        assert_eq!(app.selected_process, 17);
+
+        app.handle_key(Key::Mouse {
+            button: 65,
+            x: 60,
+            y: 15,
+            pressed: true,
+        });
+        assert_eq!(app.process_offset, 18);
+        assert_eq!(app.selected_process, 20);
+
+        app.handle_key(Key::Enter);
+        assert_eq!(app.detailed_pid, Some(21));
+        assert_eq!(app.followed_pid, Some(21));
+        assert!(!app.process_selected);
+        app.handle_key(Key::Down);
+        assert!(app.process_selected);
+        assert_eq!(app.selected_process, 21);
+        assert_eq!(app.followed_pid, None);
+    }
+
+    #[test]
+    fn unselected_process_wheel_offset_survives_each_redraw() {
+        let mut app = app();
+        app.config.set_value("shown_boxes", "proc");
+        app.sample.processes = (1..=100)
+            .map(|pid| ProcessSample {
+                pid,
+                parent: 0,
+                name: format!("process-{pid}"),
+                ..ProcessSample::default()
+            })
+            .collect();
+        app.sample.process_count = app.sample.processes.len();
+        let size = Size {
+            cols: 100,
+            rows: 30,
+        };
+        let mut renderer = Renderer::new();
+        renderer.render(size, &mut app);
+        assert!(!app.process_selected);
+
+        for expected in [3, 6, 9, 12] {
+            app.handle_key(Key::Mouse {
+                button: 65,
+                x: 50,
+                y: 15,
+                pressed: true,
+            });
+            assert_eq!(app.process_offset, expected);
+            renderer.render(size, &mut app);
+            assert_eq!(app.process_offset, expected);
+            assert!(!app.process_selected);
+        }
     }
 
     #[test]
@@ -8334,6 +8640,28 @@ mod tests {
         assert_eq!(memory_panel_height(40, 13, 0, true, true, true, false), 15);
         assert_eq!(memory_panel_height(40, 9, 12, true, true, false, true), 19);
         assert_eq!(memory_panel_height(40, 9, 12, true, false, true, true), 0);
+    }
+
+    #[test]
+    fn multi_gpu_heights_use_calc_sizes_integer_order() {
+        let gpu = GpuSample::default();
+        assert_eq!(gpu_panel_height(&gpu, 0, true, 20, 2, 20, 2), 8);
+        assert_eq!(gpu_panel_height(&gpu, 9, true, 10, 1, 19, 1), 10);
+
+        let mut app = app();
+        app.config
+            .set_value("shown_boxes", "cpu gpu0 gpu1 gpu2 mem");
+        app.sample.gpus = vec![gpu.clone(), gpu.clone(), gpu];
+        app.gpu_histories = (0..3).map(|_| GpuHistory::default()).collect();
+        let mut renderer = Renderer::new();
+        renderer.render(
+            Size {
+                cols: 100,
+                rows: 100,
+            },
+            &mut app,
+        );
+        assert_eq!(app.cpu_area.map(|area| area.h), Some(13));
     }
 
     #[test]
@@ -8685,6 +9013,21 @@ mod tests {
     }
 
     #[test]
+    fn odd_core_cpu_geometry_uses_source_column_count() {
+        let mut app = app();
+        app.sample.cpu.cores = vec![0.0; 7];
+        app.sample.cpu.core_temperatures = vec![None; 7];
+        app.core_histories = (0..7).map(|_| VecDeque::new()).collect();
+        app.core_temperature_histories = (0..7).map(|_| VecDeque::new()).collect();
+        let mut canvas = Canvas::new(100, 9);
+
+        draw_cpu(&mut canvas, Rect::new(0, 0, 100, 9), &mut app);
+
+        assert_eq!(canvas.cells[100 + 58].ch, '╭');
+        assert_eq!(canvas.cells[7 * 100 + 58].ch, '╰');
+    }
+
+    #[test]
     fn selected_process_keeps_the_cpu_graph_background_glyphs() {
         let mut app = app();
         app.config.process_tree = false;
@@ -8883,6 +9226,30 @@ mod tests {
     }
 
     #[test]
+    fn dead_process_keeps_its_frozen_detail_entry() {
+        let mut app = app();
+        app.detailed_pid = Some(42);
+        app.update(Sample {
+            processes: vec![ProcessSample {
+                pid: 42,
+                name: "short-lived".into(),
+                state: 'R',
+                elapsed_seconds: 17,
+                cpu: 8.5,
+                ..ProcessSample::default()
+            }],
+            ..Sample::default()
+        });
+        app.update(Sample::default());
+
+        let detail = app.detailed_process.as_ref().unwrap();
+        assert_eq!(app.detailed_pid, Some(42));
+        assert_eq!(detail.state, 'X');
+        assert_eq!(detail.elapsed_seconds, 17);
+        assert_eq!(detail.cpu, 8.5);
+    }
+
+    #[test]
     fn signal_dialog_buttons_and_signal_rows_are_mouse_targets() {
         let mut app = app();
         let mut renderer = Renderer::new();
@@ -9044,6 +9411,36 @@ mod tests {
         assert!(output.contains("▲1.0M"));
         assert!(output.contains("▼2.0M"));
         assert!(output.contains("IO%"));
+    }
+
+    #[test]
+    fn inline_swap_has_the_same_section_and_percentage_basis_as_btop() {
+        let mut app = app();
+        app.config.show_disks = false;
+        app.config.set_value("show_swap", "true");
+        app.config.set_value("swap_disk", "false");
+        app.sample.memory.total = 64 * 1024 * 1024 * 1024;
+        app.sample.memory.used = 16 * 1024 * 1024 * 1024;
+        app.sample.memory.available = 48 * 1024 * 1024 * 1024;
+        app.sample.memory.free = 32 * 1024 * 1024 * 1024;
+        app.sample.memory.cached = 16 * 1024 * 1024 * 1024;
+        app.sample.memory.swap_total = 8 * 1024 * 1024 * 1024;
+        app.sample.memory.swap_used = 2 * 1024 * 1024 * 1024;
+        app.swap_used_history = VecDeque::from([25.0]);
+        app.swap_free_history = VecDeque::from([75.0]);
+        let mut canvas = Canvas::new(50, 30);
+
+        draw_memory(&mut canvas, Rect::new(0, 0, 50, 30), &mut app);
+
+        let output = canvas_text(&canvas);
+        assert!(output.contains("Swap:"));
+        assert!(output.contains("8.00 GiB"));
+        let swap_row = (0..30)
+            .find(|&y| canvas_row(&canvas, y).contains("Swap:"))
+            .expect("swap header");
+        assert!(canvas_row(&canvas, swap_row + 1).contains("Used:"));
+        assert!(canvas_row(&canvas, swap_row + 2).contains("25%"));
+        assert!(output[output.find("Swap:").unwrap()..].contains("Free:"));
     }
 
     #[test]
@@ -9414,6 +9811,39 @@ mod tests {
     }
 
     #[test]
+    fn repeated_tree_collapse_controls_match_source_transitions_while_paused() {
+        let process = |pid, parent| ProcessSample {
+            pid,
+            parent,
+            ..ProcessSample::default()
+        };
+        let mut app = app();
+        app.config.process_tree = true;
+        app.config.pause_processes = true;
+        app.sample.processes = vec![process(1, 0), process(2, 1), process(3, 2), process(4, 1)];
+        app.visible_pids = vec![1, 2, 3, 4];
+        app.process_selected = true;
+        app.selected_process = 1;
+
+        app.handle_key(Key::Char('-'));
+        app.handle_key(Key::Char('-'));
+        assert_eq!(app.collapsed_processes, HashSet::from([2]));
+        app.handle_key(Key::Char('+'));
+        app.handle_key(Key::Char('+'));
+        assert!(app.collapsed_processes.is_empty());
+
+        app.handle_key(Key::Char('C'));
+        assert_eq!(app.collapsed_processes, HashSet::from([3]));
+        app.handle_key(Key::Char('C'));
+        assert!(app.collapsed_processes.is_empty());
+
+        app.handle_key(Key::Char('E'));
+        assert_eq!(app.collapsed_processes, HashSet::from([2, 3, 4]));
+        app.handle_key(Key::Char('E'));
+        assert!(app.collapsed_processes.is_empty());
+    }
+
+    #[test]
     fn clicking_a_tree_marker_collapses_that_exact_process() {
         let process = |pid, parent, name: &str| ProcessSample {
             pid,
@@ -9557,6 +9987,13 @@ mod tests {
         ] {
             assert_eq!(canvas.cells[y * canvas.width + right_border].ch, '│');
         }
+
+        let mut minimum = Canvas::new(36, 6);
+        draw_network(&mut minimum, Rect::new(0, 0, 36, 6), &mut app);
+        assert!(canvas_row(&minimum, 2).contains('▼'));
+        assert!(canvas_row(&minimum, 3).contains('▲'));
+        assert_eq!(minimum.cells[2 * 36 + 34].ch, '│');
+        assert_eq!(minimum.cells[3 * 36 + 34].ch, '│');
     }
 
     #[test]

@@ -100,6 +100,7 @@ pub struct Sample {
     pub processes: Vec<ProcessSample>,
     pub process_count: usize,
     pub gpus: Vec<GpuSample>,
+    pub collection_times_us: [u64; 6],
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -158,15 +159,33 @@ impl Collector {
         config: &Config,
         detailed_pid: Option<u32>,
     ) -> Result<Sample, String> {
+        let collection_started = Instant::now();
         let elapsed = self.last_sample.elapsed().as_secs_f64().max(0.001);
         self.last_sample = Instant::now();
+        let mut collection_times_us = [0; 6];
+        let started = Instant::now();
         let (cpu, total_delta) = self.collect_cpu(config)?;
+        collection_times_us[0] = elapsed_us(started);
+        let started = Instant::now();
         let memory = collect_memory(config, &mut self.previous_disks, elapsed)?;
+        collection_times_us[1] = elapsed_us(started);
+        let started = Instant::now();
         let network = self.collect_network(config, elapsed)?;
-        let processes =
-            self.collect_processes(total_delta, cpu.cores.len().max(1), config, detailed_pid)?;
+        collection_times_us[2] = elapsed_us(started);
+        let started = Instant::now();
+        let processes = self.collect_processes(
+            total_delta,
+            cpu.cores.len().max(1),
+            memory.total,
+            config,
+            detailed_pid,
+        )?;
+        collection_times_us[3] = elapsed_us(started);
         let process_count = processes.len();
+        let started = Instant::now();
         let gpus = self.gpus.collect(config);
+        collection_times_us[4] = elapsed_us(started);
+        collection_times_us[5] = elapsed_us(collection_started);
         Ok(Sample {
             cpu,
             memory,
@@ -174,22 +193,22 @@ impl Collector {
             processes,
             process_count,
             gpus,
+            collection_times_us,
         })
     }
 
     fn collect_cpu(&mut self, config: &Config) -> Result<(CpuSample, u64), String> {
         let stat = fs::read_to_string("/proc/stat")
             .map_err(|e| format!("could not read /proc/stat: {e}"))?;
-        let current: Vec<CpuTicks> = stat
-            .lines()
-            .take_while(|line| line.starts_with("cpu"))
-            .filter_map(parse_cpu_ticks)
-            .collect();
+        let current = parse_cpu_stat(&stat)?;
         let percentages: Vec<f64> = current
             .iter()
             .enumerate()
             .map(|(index, now)| {
-                let old = self.previous_cpu.get(index).copied().unwrap_or(*now);
+                let Some(now) = now else {
+                    return 0.0;
+                };
+                let old = self.previous_cpu.get(index).copied().unwrap_or_default();
                 let total = now.total.saturating_sub(old.total);
                 let busy = now.busy.saturating_sub(old.busy);
                 if total == 0 {
@@ -201,8 +220,11 @@ impl Collector {
             .collect();
         let total_delta = current
             .first()
-            .zip(self.previous_cpu.first())
-            .map(|(a, b)| a.total.saturating_sub(b.total))
+            .and_then(Option::as_ref)
+            .map(|now| {
+                now.total
+                    .saturating_sub(self.previous_cpu.first().copied().unwrap_or_default().total)
+            })
             .unwrap_or(0);
         let core_count = percentages.len().saturating_sub(1);
         let field_names = [
@@ -219,8 +241,9 @@ impl Collector {
         ];
         let fields = current
             .first()
+            .and_then(Option::as_ref)
             .map(|now| {
-                let old = self.previous_cpu.first().copied().unwrap_or(*now);
+                let old = self.previous_cpu.first().copied().unwrap_or_default();
                 field_names
                     .into_iter()
                     .enumerate()
@@ -238,7 +261,13 @@ impl Collector {
                     .collect()
             })
             .unwrap_or_default();
-        self.previous_cpu = current;
+        self.previous_cpu = current
+            .into_iter()
+            .enumerate()
+            .map(|(index, current)| {
+                current.unwrap_or_else(|| self.previous_cpu.get(index).copied().unwrap_or_default())
+            })
+            .collect();
 
         let load = fs::read_to_string("/proc/loadavg")
             .ok()
@@ -384,7 +413,7 @@ impl Collector {
             upload_per_second,
             downloaded,
             uploaded,
-            ipv4: interface_ipv4(&selected),
+            ipv4: interface_ipv4(&selected).or_else(|| interface_hardware_address(&selected)),
             ipv6: interface_ipv6(&selected),
             connected: is_connected,
         })
@@ -394,6 +423,7 @@ impl Collector {
         &mut self,
         total_delta: u64,
         cores: usize,
+        total_memory: u64,
         config: &Config,
         detailed_pid: Option<u32>,
     ) -> Result<Vec<ProcessSample>, String> {
@@ -443,20 +473,22 @@ impl Collector {
                         .ok()
                 })
                 .unwrap_or(0);
+            let stat_memory = raw.rss_pages.saturating_mul(page_size());
             let memory = if detailed_pid == Some(pid)
                 && config.bool_value("proc_info_smaps").unwrap_or(false)
             {
-                read_smaps_rss(&entry.path().join("smaps"))
-                    .unwrap_or_else(|| raw.rss_pages.saturating_mul(page_size()))
+                read_smaps_rss(&entry.path().join("smaps")).unwrap_or(stat_memory)
+            } else if total_memory > 0 && stat_memory >= total_memory {
+                read_statm_rss(&entry.path().join("statm")).unwrap_or(stat_memory)
             } else {
-                raw.rss_pages.saturating_mul(page_size())
+                stat_memory
             };
             let command_bytes = fs::read(entry.path().join("cmdline")).unwrap_or_default();
-            let kernel_thread = command_bytes.is_empty();
+            let kernel_thread = pid == 2 || raw.parent == 2;
             let command = (!command_bytes.is_empty())
                 .then(|| {
-                    let bytes = command_bytes;
-                    String::from_utf8_lossy(&bytes)
+                    let bytes = &command_bytes[..command_bytes.len().min(1_000)];
+                    String::from_utf8_lossy(bytes)
                         .split('\0')
                         .filter(|v| !v.is_empty())
                         .collect::<Vec<_>>()
@@ -492,6 +524,10 @@ impl Collector {
     }
 }
 
+fn elapsed_us(started: Instant) -> u64 {
+    started.elapsed().as_micros().min(u64::MAX as u128) as u64
+}
+
 fn read_smaps_rss(path: &Path) -> Option<u64> {
     let text = fs::read_to_string(path).ok()?;
     let kibibytes = text
@@ -501,6 +537,16 @@ fn read_smaps_rss(path: &Path) -> Option<u64> {
         .filter_map(|value| value.parse::<u64>().ok())
         .sum::<u64>();
     (kibibytes > 0).then_some(kibibytes.saturating_mul(1024))
+}
+
+fn read_statm_rss(path: &Path) -> Option<u64> {
+    fs::read_to_string(path)
+        .ok()?
+        .split_whitespace()
+        .nth(1)?
+        .parse::<u64>()
+        .ok()
+        .map(|pages| pages.saturating_mul(page_size()))
 }
 
 fn read_process_io(pid: u32) -> (u64, u64) {
@@ -539,6 +585,36 @@ fn parse_cpu_ticks(line: &str) -> Option<CpuTicks> {
         total,
         fields: field_values,
     })
+}
+
+fn parse_cpu_stat(text: &str) -> Result<Vec<Option<CpuTicks>>, String> {
+    let mut aggregate = None;
+    let mut cores = Vec::new();
+    for line in text.lines().take_while(|line| line.starts_with("cpu")) {
+        let name = line.split_whitespace().next().unwrap_or_default();
+        let ticks = parse_cpu_ticks(line);
+        if name == "cpu" {
+            aggregate = ticks;
+            continue;
+        }
+        let Some(index) = name
+            .strip_prefix("cpu")
+            .and_then(|value| value.parse().ok())
+        else {
+            continue;
+        };
+        if cores.len() <= index {
+            cores.resize(index + 1, None);
+        }
+        cores[index] = ticks;
+    }
+    let Some(aggregate) = aggregate else {
+        return Err("Failed to parse /proc/stat".into());
+    };
+    let mut current = Vec::with_capacity(cores.len() + 1);
+    current.push(Some(aggregate));
+    current.extend(cores);
+    Ok(current)
 }
 
 struct RawProcess {
@@ -622,7 +698,9 @@ fn collect_disks(
     previous_disks: &mut HashMap<String, DiskCounters>,
     elapsed: f64,
 ) -> Vec<DiskSample> {
-    let mounts = fs::read_to_string("/proc/self/mounts").unwrap_or_default();
+    let mounts = fs::read_to_string("/etc/mtab")
+        .or_else(|_| fs::read_to_string("/proc/self/mounts"))
+        .unwrap_or_default();
     let use_fstab = config.bool_value("use_fstab").unwrap_or(false);
     let only_physical = config.bool_value("only_physical").unwrap_or(true) && !use_fstab;
     let free_priv = config.bool_value("disk_free_priv").unwrap_or(false);
@@ -698,13 +776,10 @@ fn collect_disks(
             });
         }
     }
-    disks.sort_by_key(|disk| {
-        if disk.mount == "/" {
-            String::new()
-        } else {
-            disk.mount.clone()
-        }
-    });
+    if let Some(root) = disks.iter().position(|disk| disk.mount == "/") {
+        let root = disks.remove(root);
+        disks.insert(0, root);
+    }
     disks
 }
 
@@ -863,7 +938,8 @@ fn physical_filesystems() -> HashSet<String> {
         .lines()
         .filter_map(|line| {
             let fields: Vec<_> = line.split_whitespace().collect();
-            (fields.len() == 1 && fields[0] != "squashfs").then(|| fields[0].to_string())
+            (fields.len() == 1 && !matches!(fields[0], "squashfs" | "nullfs"))
+                .then(|| fields[0].to_string())
         })
         .collect();
     filesystems.extend(["zfs", "wslfs", "drvfs"].map(str::to_string));
@@ -1069,31 +1145,33 @@ struct TemperatureSensor {
 
 fn hardware_temperature_sensors() -> Vec<TemperatureSensor> {
     let mut sensors = Vec::new();
-    let Ok(entries) = fs::read_dir("/sys/class/hwmon") else {
-        return sensors;
-    };
-    for entry in entries.flatten() {
-        let provider = fs::read_to_string(entry.path().join("name"))
-            .unwrap_or_else(|_| entry.file_name().to_string_lossy().into_owned())
+    for path in hardware_sensor_paths() {
+        let provider = fs::read_to_string(path.join("name"))
+            .unwrap_or_else(|_| {
+                path.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
+            })
             .trim()
             .to_string();
-        if provider == "nvme" {
+        if provider == "nvme" || path.to_string_lossy().contains("nvme") {
             continue;
         }
         for index in 1..128 {
-            let path = entry.path().join(format!("temp{index}_input"));
-            if !path.exists() {
+            let input = path.join(format!("temp{index}_input"));
+            if !input.exists() {
                 continue;
             }
-            let label = fs::read_to_string(entry.path().join(format!("temp{index}_label")))
+            let label = fs::read_to_string(path.join(format!("temp{index}_label")))
                 .unwrap_or_else(|_| format!("temp{index}"))
                 .trim()
                 .to_string();
             sensors.push(TemperatureSensor {
                 name: format!("{provider}/{label}"),
                 label,
-                path,
-                critical: read_number(entry.path().join(format!("temp{index}_crit")))
+                path: input,
+                critical: read_number(path.join(format!("temp{index}_crit")))
                     .map(|value| value / 1000.0)
                     .filter(|value| *value > 0.0)
                     .unwrap_or(95.0),
@@ -1103,10 +1181,90 @@ fn hardware_temperature_sensors() -> Vec<TemperatureSensor> {
     sensors
 }
 
+fn hardware_sensor_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let mut seen = HashSet::new();
+    if let Ok(entries) = fs::read_dir("/sys/class/hwmon") {
+        for entry in entries.flatten() {
+            let path = fs::canonicalize(entry.path()).unwrap_or_else(|_| entry.path());
+            if seen.contains(&path) || seen.contains(&path.join("device")) {
+                continue;
+            }
+            for candidate in [path.join("device"), path] {
+                let has_temperature = fs::read_dir(&candidate).is_ok_and(|entries| {
+                    entries.flatten().any(|entry| {
+                        let name = entry.file_name();
+                        let name = name.to_string_lossy();
+                        name.starts_with("temp") && name.ends_with("_input")
+                    })
+                });
+                if has_temperature && seen.insert(candidate.clone()) {
+                    paths.push(candidate);
+                }
+            }
+        }
+    }
+    if !paths
+        .iter()
+        .any(|path| path.to_string_lossy().contains("coretemp"))
+        && let Ok(entries) = fs::read_dir("/sys/devices/platform/coretemp.0/hwmon")
+    {
+        for entry in entries.flatten() {
+            let path = fs::canonicalize(entry.path()).unwrap_or_else(|_| entry.path());
+            if seen.insert(path.clone()) {
+                paths.push(path);
+            }
+        }
+    }
+    paths
+}
+
+fn thermal_temperature_sensors() -> Vec<TemperatureSensor> {
+    let mut sensors = Vec::new();
+    let Ok(entries) = fs::read_dir("/sys/class/thermal") else {
+        return sensors;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(index) = name.strip_prefix("thermal_zone") else {
+            continue;
+        };
+        let path = entry.path();
+        if !path.join("temp").exists() {
+            continue;
+        }
+        let label = fs::read_to_string(path.join("type"))
+            .unwrap_or_else(|_| format!("temp{index}"))
+            .trim()
+            .to_string();
+        sensors.push(TemperatureSensor {
+            name: format!("thermal{index}/{label}"),
+            label,
+            path: path.join("temp"),
+            critical: thermal_critical(&path),
+        });
+    }
+    sensors
+}
+
+fn is_primary_cpu_sensor(sensor: &TemperatureSensor) -> bool {
+    sensor.label.starts_with("Package id")
+        || sensor.label.starts_with("Tdie")
+        || sensor.label.starts_with("SoC Temperature")
+}
+
+fn available_temperature_sensors() -> Vec<TemperatureSensor> {
+    let mut sensors = hardware_temperature_sensors();
+    if !sensors.iter().any(is_primary_cpu_sensor) {
+        sensors.extend(thermal_temperature_sensors());
+    }
+    sensors
+}
+
 pub fn temperature_sensor_names() -> Vec<String> {
     let mut names = vec!["Auto".to_string()];
     names.extend(
-        hardware_temperature_sensors()
+        available_temperature_sensors()
             .into_iter()
             .map(|sensor| sensor.name),
     );
@@ -1125,17 +1283,11 @@ fn read_temperature(config: &Config) -> Option<f64> {
 }
 
 fn read_temperature_info(config: &Config) -> Option<(f64, f64)> {
-    let sensors = hardware_temperature_sensors();
+    let sensors = available_temperature_sensors();
     let configured = config.value("cpu_sensor").filter(|value| !value.is_empty());
     let sensor = configured
         .and_then(|configured| sensors.iter().find(|sensor| sensor.name == configured))
-        .or_else(|| {
-            sensors.iter().find(|sensor| {
-                sensor.label.starts_with("Package id")
-                    || sensor.label.starts_with("Tdie")
-                    || sensor.label.starts_with("SoC Temperature")
-            })
-        })
+        .or_else(|| sensors.iter().find(|sensor| is_primary_cpu_sensor(sensor)))
         .or_else(|| {
             sensors.iter().find(|sensor| {
                 let name = sensor.name.to_ascii_lowercase();
@@ -1205,13 +1357,8 @@ fn read_core_temperatures(core_count: usize, config: &Config) -> Vec<Option<f64>
     if temperatures.is_empty() {
         return vec![read_temperature(config); core_count];
     }
-    let physical = if core_count > 1 { core_count / 2 } else { 1 };
-    let mut mapping = (0..core_count)
-        .map(|logical| {
-            let physical_core = logical % physical;
-            physical_core * temperatures.len() / physical
-        })
-        .collect::<Vec<_>>();
+    let cpuinfo = fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
+    let mut mapping = cpu_core_sensor_mapping(&cpuinfo, core_count, temperatures.len());
     if let Some(custom) = config.value("cpu_core_map") {
         for pair in custom.split_whitespace() {
             let Some((core, sensor)) = pair.split_once(':') else {
@@ -1228,6 +1375,50 @@ fn read_core_temperatures(core_count: usize, config: &Config) -> Vec<Option<f64>
     mapping
         .into_iter()
         .map(|sensor| temperatures.get(sensor).copied().flatten())
+        .collect()
+}
+
+fn cpu_core_sensor_mapping(text: &str, core_count: usize, sensor_count: usize) -> Vec<usize> {
+    if sensor_count == 0 {
+        return vec![0; core_count];
+    }
+    let mut cpu = None;
+    let mut cpu_to_core = HashMap::new();
+    let mut maximum_core = 0;
+    for line in text.lines() {
+        let Some((label, value)) = line.split_once(':') else {
+            continue;
+        };
+        match label.trim() {
+            "processor" => cpu = value.trim().parse::<usize>().ok(),
+            "core id" => {
+                if let (Some(cpu), Ok(core)) = (cpu, value.trim().parse::<usize>()) {
+                    cpu_to_core.insert(cpu, core);
+                    maximum_core = maximum_core.max(core);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut mapping = HashMap::new();
+    for (cpu, core) in cpu_to_core {
+        mapping.insert(cpu, core * sensor_count / (maximum_core + 1));
+    }
+    if mapping.len() < core_count {
+        if core_count.is_multiple_of(2) && mapping.len() == core_count / 2 {
+            for cpu in 0..core_count / 2 {
+                let sensor = mapping.get(&cpu).copied().unwrap_or(cpu % sensor_count);
+                mapping.insert(core_count / 2 + cpu, sensor);
+            }
+        } else {
+            mapping.clear();
+            for cpu in 0..core_count {
+                mapping.insert(cpu, cpu * sensor_count / core_count.max(1));
+            }
+        }
+    }
+    (0..core_count)
+        .map(|cpu| mapping.get(&cpu).copied().unwrap_or(cpu % sensor_count))
         .collect()
 }
 
@@ -1287,6 +1478,14 @@ fn interface_ipv4(iface: &str) -> Option<String> {
     }
     unsafe { freeifaddrs(head) };
     result
+}
+
+fn interface_hardware_address(iface: &str) -> Option<String> {
+    let address = fs::read_to_string(format!("/sys/class/net/{iface}/address"))
+        .ok()?
+        .trim()
+        .to_string();
+    (!address.is_empty()).then_some(address)
 }
 
 fn interface_ipv6(iface: &str) -> Option<String> {
@@ -1568,6 +1767,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cpu_stat_preserves_missing_logical_cpu_slots() {
+        let parsed = parse_cpu_stat(
+            "cpu  100 2 30 400 5 6 7 8 9 10\ncpu0 40 1 10 200 2 3 4 5 6 7\ncpu2 60 1 20 200 3 3 3 3 3 3\nintr 1\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.len(), 4);
+        assert!(parsed[0].is_some());
+        assert!(parsed[1].is_some());
+        assert!(parsed[2].is_none());
+        assert!(parsed[3].is_some());
+        assert_eq!(parsed[0].unwrap().total, 558);
+        assert!(parse_cpu_stat("intr 1\n").is_err());
+    }
+
+    #[test]
     fn parses_process_names_with_spaces() {
         let stat = "42 (a process name) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 4 18 19 20 100";
         let parsed = parse_process_stat(42, stat).unwrap();
@@ -1660,6 +1874,19 @@ mod tests {
             calculate_frequency("range", &frequencies),
             "2.0 GHz - 4.0 GHz"
         );
+    }
+
+    #[test]
+    fn cpu_core_sensor_mapping_uses_physical_core_ids_and_smt_fallback() {
+        let cpuinfo = "processor : 0\ncore id : 0\n\
+                       processor : 1\ncore id : 2\n\
+                       processor : 2\ncore id : 4\n\
+                       processor : 3\ncore id : 6\n";
+        assert_eq!(
+            cpu_core_sensor_mapping(cpuinfo, 8, 2),
+            vec![0, 0, 1, 1, 0, 0, 1, 1]
+        );
+        assert_eq!(cpu_core_sensor_mapping("", 4, 2), vec![0, 0, 1, 1]);
     }
 
     #[test]

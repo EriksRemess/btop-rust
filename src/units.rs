@@ -125,6 +125,36 @@ pub fn display_width(text: &str) -> usize {
     text.chars().map(char_width).sum()
 }
 
+pub fn column_slice(text: &str, start: usize, width: usize) -> String {
+    let mut position = 0;
+    let mut used = 0;
+    let mut output = String::new();
+    for ch in text.chars() {
+        let ch_width = char_width(ch);
+        if ch_width == 0 {
+            if !output.is_empty() {
+                output.push(ch);
+            }
+            continue;
+        }
+        if position + ch_width <= start {
+            position += ch_width;
+            continue;
+        }
+        if position < start {
+            position += ch_width;
+            continue;
+        }
+        if used + ch_width > width {
+            break;
+        }
+        output.push(ch);
+        position += ch_width;
+        used += ch_width;
+    }
+    output
+}
+
 pub fn char_width(ch: char) -> usize {
     unsafe extern "C" {
         fn wcwidth(ch: i32) -> i32;
@@ -212,6 +242,9 @@ mod tests {
         assert_eq!(display_width("A界B"), 4);
         assert_eq!(truncate("A界B", 3), "A…");
         assert_eq!(display_width("e\u{301}"), 1);
+        assert_eq!(column_slice("ab界cd", 2, 2), "界");
+        assert_eq!(column_slice("ab界cd", 4, 2), "cd");
+        assert_eq!(column_slice("e\u{301}x", 0, 1), "e\u{301}");
     }
 
     #[test]

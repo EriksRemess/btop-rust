@@ -1027,10 +1027,32 @@ fn discover_intel_name() -> String {
         let device = entry.path().join("device");
         if read_trimmed(device.join("vendor")).as_deref() == Some("0x8086") {
             let id = read_trimmed(device.join("device")).unwrap_or_else(|| "0x0000".into());
+            if let Ok(device_id) = u16::from_str_radix(id.trim_start_matches("0x"), 16)
+                && let Some(name) = intel_device_name(device_id)
+            {
+                return name;
+            }
             return format!("Intel GPU (8086:{})", id.trim_start_matches("0x"));
         }
     }
     "Intel GPU".into()
+}
+
+fn intel_device_name(device_id: u16) -> Option<String> {
+    const DATABASE: &str = include_str!("../assets/intel-gpu-names.txt");
+    let needle = format!("{device_id:04x}");
+    let (_, codename, generation) = DATABASE.lines().find_map(|line| {
+        let mut fields = line.split('|');
+        let id = fields.next()?;
+        let codename = fields.next()?;
+        let generation = fields.next()?;
+        (id == needle).then_some((id, codename, generation))
+    })?;
+    let mut chars = codename.chars();
+    let codename = chars
+        .next()
+        .map(|first| first.to_ascii_uppercase().to_string() + chars.as_str())?;
+    Some(format!("Intel {codename} (Gen{generation})"))
 }
 
 #[repr(C)]
@@ -1115,6 +1137,23 @@ mod tests {
     #[test]
     fn parses_i915_perf_event_config() {
         assert_eq!(parse_perf_config("event=0x1a"), Some(0x1a));
+    }
+
+    #[test]
+    fn intel_names_match_the_complete_upstream_pci_database() {
+        assert_eq!(
+            intel_device_name(0x7121).as_deref(),
+            Some("Intel Solano (Gen1)")
+        );
+        assert_eq!(
+            intel_device_name(0x56a0).as_deref(),
+            Some("Intel Dg2 (Gen12)")
+        );
+        assert_eq!(
+            intel_device_name(0xe202).as_deref(),
+            Some("Intel Battlemage (Gen20)")
+        );
+        assert_eq!(intel_device_name(0xffff), None);
     }
 
     #[test]

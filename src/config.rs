@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use crate::cli::Cli;
@@ -88,6 +89,7 @@ pub struct Config {
     pub warnings: Vec<String>,
     values: HashMap<String, String>,
     source_path: Option<PathBuf>,
+    read_only: bool,
 }
 
 impl Default for Config {
@@ -130,6 +132,7 @@ impl Default for Config {
             warnings: Vec::new(),
             values: parse_file(Self::default_file()),
             source_path: default_path(),
+            read_only: false,
         }
     }
 }
@@ -143,10 +146,12 @@ impl Config {
         let text = match fs::read_to_string(&path) {
             Ok(text) => text,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Self {
-                    source_path: Some(path),
+                let mut config = Self {
+                    source_path: Some(path.clone()),
                     ..Self::default()
-                });
+                };
+                config.set_read_only_from(&path);
+                return Ok(config);
             }
             Err(error) => return Err(format!("could not read {}: {error}", path.display())),
         };
@@ -163,7 +168,8 @@ impl Config {
                 Err(warning) => config.warnings.push(warning),
             }
         }
-        config.source_path = Some(path);
+        config.source_path = Some(path.clone());
+        config.set_read_only_from(&path);
         let values = config.values.clone();
         config.update_ms = integer(&values, "update_ms")
             .unwrap_or(config.update_ms)
@@ -430,6 +436,9 @@ impl Config {
         {
             return Ok(());
         }
+        if self.read_only {
+            return Ok(());
+        }
         self.sync_values();
         let Some(path) = self.source_path.as_ref() else {
             return Ok(());
@@ -468,6 +477,22 @@ impl Config {
             .map_err(|error| format!("could not write {}: {error}", temporary.display()))?;
         fs::rename(&temporary, path)
             .map_err(|error| format!("could not replace {}: {error}", path.display()))
+    }
+
+    fn set_read_only_from(&mut self, path: &Path) {
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        let Ok(metadata) = fs::metadata(parent) else {
+            return;
+        };
+        if metadata.is_dir() && metadata.permissions().mode() & 0o200 == 0 {
+            self.read_only = true;
+            self.warnings.push(format!(
+                "`{}` is not writable; config changes are not persistent",
+                parent.display()
+            ));
+        }
     }
 
     fn sync_values(&mut self) {
@@ -743,6 +768,35 @@ mod tests {
         let saved = fs::read_to_string(&path).unwrap();
         assert!(saved.contains("update_ms = 2000"));
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn readable_config_in_read_only_directory_is_loaded_but_not_rewritten() {
+        let directory = std::env::temp_dir().join(format!(
+            "btop-rust-read-only-config-test-{}",
+            std::process::id()
+        ));
+        let path = directory.join("btop.conf");
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).unwrap();
+        fs::write(&path, "update_ms = 1700\nsave_config_on_exit = true\n").unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let mut config = Config::load(Some(&path)).unwrap();
+        assert_eq!(config.update_ms, 1700);
+        assert!(config.read_only);
+        assert!(config.warnings.iter().any(|warning| {
+            warning.contains("not writable") && warning.contains("not persistent")
+        }));
+        config.update_ms = 3100;
+        config.save().unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "update_ms = 1700\nsave_config_on_exit = true\n"
+        );
+
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

@@ -76,19 +76,68 @@ extern "C" fn signal_handler(signal: i32) {
     PENDING_SIGNALS.fetch_or(flag, Ordering::Relaxed);
 }
 
-fn install_signal_handlers() -> Result<(), String> {
+extern "C" fn crash_handler(signal_number: i32) {
+    // SAFETY: restore_after_crash uses only libc terminal/write calls and a
+    // terminal snapshot published before raw mode became active.
+    unsafe {
+        terminal::restore_after_crash();
+        set_signal_handler(signal_number, 0);
+        raise_signal(signal_number);
+    }
+}
+
+unsafe fn set_signal_handler(signal_number: i32, handler: usize) -> usize {
     unsafe extern "C" {
         fn signal(signal: i32, handler: usize) -> usize;
     }
+    unsafe { signal(signal_number, handler) }
+}
+
+unsafe fn raise_signal(signal_number: i32) -> i32 {
+    unsafe extern "C" {
+        fn raise(signal: i32) -> i32;
+    }
+    unsafe { raise(signal_number) }
+}
+
+fn install_signal_handlers() -> Result<(), String> {
     for signal_number in [2, 20, 18, 28, 10, 12] {
-        if unsafe { signal(signal_number, signal_handler as *const () as usize) } == usize::MAX {
+        if unsafe { set_signal_handler(signal_number, signal_handler as *const () as usize) }
+            == usize::MAX
+        {
             return Err(format!(
                 "could not install handler for signal {signal_number}: {}",
                 io::Error::last_os_error()
             ));
         }
     }
+    for signal_number in [11, 6, 5, 7, 4] {
+        if unsafe { set_signal_handler(signal_number, crash_handler as *const () as usize) }
+            == usize::MAX
+        {
+            return Err(format!(
+                "could not install crash handler for signal {signal_number}: {}",
+                io::Error::last_os_error()
+            ));
+        }
+    }
     Ok(())
+}
+
+fn current_tty() -> Option<String> {
+    unsafe extern "C" {
+        fn ttyname(fd: i32) -> *const std::os::raw::c_char;
+    }
+    let name = unsafe { ttyname(0) };
+    (!name.is_null()).then(|| {
+        unsafe { CStr::from_ptr(name) }
+            .to_string_lossy()
+            .into_owned()
+    })
+}
+
+fn auto_tty_mode(name: Option<&str>) -> bool {
+    name.is_some_and(|name| name.starts_with("/dev/tty"))
 }
 
 fn main() -> ExitCode {
@@ -103,6 +152,7 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<u8, String> {
+    let runtime_started = Instant::now();
     let cli = Cli::parse(std::env::args().skip(1))?;
     match cli.action {
         Some(Action::Help) => {
@@ -126,19 +176,44 @@ fn run() -> Result<u8, String> {
 
     let mut config = Config::load(cli.config_file.as_deref())?;
     config.apply_cli(&cli);
+    let tty_name = current_tty();
+    if cli.force_tty.is_none() && !config.tty_mode && auto_tty_mode(tty_name.as_deref()) {
+        config.tty_mode = true;
+    }
     logger::init();
     logger::set_level(config.value("log_level").unwrap_or("WARNING"), cli.debug);
+    if cli.debug {
+        logger::debug("Running in DEBUG mode!");
+    }
+    logger::info(&format!(
+        "Logger set to {}",
+        if cli.debug {
+            "DEBUG"
+        } else {
+            config.value("log_level").unwrap_or("WARNING")
+        }
+    ));
     for warning in &config.warnings {
         logger::warning(warning);
     }
-    logger::info("Running on Linux");
-    logger::debug("Running in DEBUG mode");
     ensure_utf8_locale(cli.force_utf)?;
     install_signal_handlers()?;
     let mut terminal = Terminal::enter(!config.disable_mouse, config.terminal_sync)?;
+    if let Some(tty_name) = tty_name.as_deref() {
+        logger::info(&format!("Running on {tty_name}"));
+    }
+    if cli.force_tty.is_some() {
+        logger::debug("TTY mode set via command line");
+    } else if config.bool_value("force_tty").unwrap_or(false) {
+        logger::debug("TTY mode set via config");
+    } else if auto_tty_mode(tty_name.as_deref()) {
+        logger::debug("Auto detect real TTY");
+    }
+    logger::debug(&format!("TTY mode enabled: {}", config.tty_mode));
     let mut collector = Collector::new(&config)?;
     let mut renderer = Renderer::new();
     let mut app = AppState::new(config);
+    app.set_debug(cli.debug);
     let mut collection_clock = CollectionClock::new(Instant::now(), app.config.update_ms);
 
     let exit_code = 'main: loop {
@@ -146,7 +221,7 @@ fn run() -> Result<u8, String> {
             app.config.value("log_level").unwrap_or("WARNING"),
             cli.debug,
         );
-        match handle_pending_signals(&mut terminal, &mut app)? {
+        match handle_pending_signals(&mut terminal, &mut app, &cli)? {
             SignalOutcome::Quit => break 'main 0,
             SignalOutcome::Redraw | SignalOutcome::None => {}
         }
@@ -176,6 +251,9 @@ fn run() -> Result<u8, String> {
                 Some(key) => {
                     if key == terminal::Key::CtrlR {
                         let _ = app.config.reload();
+                        app.config.apply_cli(&cli);
+                        terminal
+                            .apply_settings(!app.config.disable_mouse, app.config.terminal_sync)?;
                         app.needs_redraw = true;
                         break;
                     }
@@ -198,7 +276,7 @@ fn run() -> Result<u8, String> {
                 }
                 None => thread::yield_now(),
             }
-            match handle_pending_signals(&mut terminal, &mut app)? {
+            match handle_pending_signals(&mut terminal, &mut app, &cli)? {
                 SignalOutcome::Quit => break 'main 0,
                 SignalOutcome::Redraw => break,
                 SignalOutcome::None => {}
@@ -207,7 +285,10 @@ fn run() -> Result<u8, String> {
     };
     terminal.leave()?;
     let _ = app.config.save();
-    logger::info("Quitting!");
+    logger::info(&format!(
+        "Quitting! Runtime: {}",
+        units::duration(runtime_started.elapsed().as_secs())
+    ));
     Ok(exit_code)
 }
 
@@ -263,6 +344,7 @@ enum SignalOutcome {
 fn handle_pending_signals(
     terminal: &mut Terminal,
     app: &mut AppState,
+    cli: &Cli,
 ) -> Result<SignalOutcome, String> {
     let pending = PENDING_SIGNALS.swap(0, Ordering::Relaxed);
     if pending & SIGNAL_QUIT != 0 {
@@ -271,6 +353,8 @@ fn handle_pending_signals(
     let mut redraw = pending & SIGNAL_REDRAW != 0;
     if pending & SIGNAL_RELOAD != 0 {
         let _ = app.config.reload();
+        app.config.apply_cli(cli);
+        terminal.apply_settings(!app.config.disable_mouse, app.config.terminal_sync)?;
         redraw = true;
     }
     if pending & SIGNAL_SUSPEND != 0 {
@@ -301,7 +385,7 @@ fn suspend_process() -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CollectionClock, locale_is_utf8};
+    use super::{CollectionClock, auto_tty_mode, locale_is_utf8};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -338,5 +422,13 @@ mod tests {
         clock.sync_interval(changed, 2_000);
         assert!(!clock.collection_due(changed + Duration::from_millis(1_999)));
         assert!(clock.collection_due(changed + Duration::from_millis(2_000)));
+    }
+
+    #[test]
+    fn auto_tty_mode_matches_btop_real_console_detection() {
+        assert!(auto_tty_mode(Some("/dev/tty1")));
+        assert!(auto_tty_mode(Some("/dev/ttyS0")));
+        assert!(!auto_tty_mode(Some("/dev/pts/4")));
+        assert!(!auto_tty_mode(None));
     }
 }

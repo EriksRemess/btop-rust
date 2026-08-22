@@ -1,6 +1,8 @@
+use std::cell::UnsafeCell;
 use std::io::{self, Read, Write};
 use std::mem::MaybeUninit;
 use std::os::raw::{c_int, c_short, c_uchar, c_uint, c_ulong};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 const STDIN: c_int = 0;
@@ -16,6 +18,9 @@ const VTIME: usize = 5;
 const VMIN: usize = 6;
 const TIOCGWINSZ: c_ulong = 0x5413;
 const POLLIN: c_short = 0x0001;
+const F_GETFL: c_int = 3;
+const F_SETFL: c_int = 4;
+const O_NONBLOCK: c_int = 0x800;
 const ESCAPE_SEQUENCE_TIMEOUT: Duration = Duration::from_millis(25);
 
 #[repr(C)]
@@ -52,6 +57,45 @@ unsafe extern "C" {
     fn tcsetattr(fd: c_int, action: c_int, termios: *const Termios) -> c_int;
     fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
     fn poll(fds: *mut PollFd, count: c_ulong, timeout: c_int) -> c_int;
+    fn write(fd: c_int, buffer: *const u8, count: usize) -> isize;
+    fn fcntl(fd: c_int, command: c_int, ...) -> c_int;
+}
+
+struct CrashTermios(UnsafeCell<MaybeUninit<Termios>>);
+
+// The crash handler is the only reader, and signals cannot run concurrently on
+// the same thread. CRASH_TERMIOS_READY publishes the completed copy.
+unsafe impl Sync for CrashTermios {}
+
+static CRASH_TERMIOS: CrashTermios = CrashTermios(UnsafeCell::new(MaybeUninit::uninit()));
+static CRASH_TERMIOS_READY: AtomicBool = AtomicBool::new(false);
+const CRASH_RESTORE_SEQUENCE: &[u8] =
+    b"\x1b[?2026l\x1b[?1002l\x1b[?1015l\x1b[?1006l\x1b[?7h\x1b[?25h\x1b[?1049l\x1b[0m";
+
+/// Restore the terminal using only libc calls that are safe to make from the
+/// fatal-signal path. The handler re-raises the signal after calling this.
+pub unsafe fn restore_after_crash() {
+    if CRASH_TERMIOS_READY.swap(false, Ordering::SeqCst) {
+        // SAFETY: enter() initialized the published value before setting the
+        // ready flag, and the flag prevents a second restoration attempt.
+        let original = unsafe { (*CRASH_TERMIOS.0.get()).assume_init_ref() };
+        unsafe {
+            tcsetattr(STDIN, TCSANOW, original);
+        }
+    }
+    // A full terminal/PTY must not keep a fatal handler from reaching the
+    // default re-raise. Make this best-effort write nonblocking.
+    unsafe {
+        let flags = fcntl(STDOUT, F_GETFL);
+        if flags >= 0 {
+            fcntl(STDOUT, F_SETFL, flags | O_NONBLOCK);
+        }
+        write(
+            STDOUT,
+            CRASH_RESTORE_SEQUENCE.as_ptr(),
+            CRASH_RESTORE_SEQUENCE.len(),
+        );
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,6 +167,12 @@ impl Terminal {
                 io::Error::last_os_error()
             ));
         }
+        // SAFETY: the value is fully copied before the release store publishes
+        // it to the fatal-signal handler.
+        unsafe {
+            (*CRASH_TERMIOS.0.get()).write(original);
+        }
+        CRASH_TERMIOS_READY.store(true, Ordering::SeqCst);
         print!("\x1b[?1049h\x1b[?25l\x1b[?7l");
         if mouse_enabled {
             print!("\x1b[?1002h\x1b[?1015h\x1b[?1006h");
@@ -255,6 +305,7 @@ impl Terminal {
                 io::Error::last_os_error()
             ));
         }
+        CRASH_TERMIOS_READY.store(false, Ordering::SeqCst);
         self.active = false;
         Ok(())
     }
