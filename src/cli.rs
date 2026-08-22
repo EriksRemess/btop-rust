@@ -91,7 +91,10 @@ fn next_value(args: &mut impl Iterator<Item = String>, name: &str) -> Result<Str
 }
 
 pub fn print_version(verbose: bool) {
-    println!("btop version: \x1b[1m{}\x1b[0m", env!("CARGO_PKG_VERSION"));
+    println!(
+        "btoprs \x1b[1mv{}\x1b[0m (based on BTOP++ v1.4.7)",
+        env!("CARGO_PKG_VERSION")
+    );
     if verbose {
         println!("Compiled with: {}", env!("BTOPRS_RUSTC_VERSION"));
         println!(

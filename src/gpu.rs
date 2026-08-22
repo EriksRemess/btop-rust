@@ -8,6 +8,9 @@ use std::time::{Duration, Instant};
 
 use crate::config::Config;
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) mod macos;
+
 #[derive(Debug, Clone, Default)]
 pub struct GpuSupport {
     pub utilization: bool,
@@ -74,6 +77,8 @@ pub struct GpuCollector {
     rsmi: Option<Rsmi>,
     amd_sysfs: Vec<AmdSysfsDevice>,
     intel: Option<IntelPmu>,
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    apple: Option<macos::AppleGpuCollector>,
     shown: String,
     next_probe: Instant,
 }
@@ -96,11 +101,18 @@ impl GpuCollector {
             Vec::new()
         };
         let intel = shown.contains("intel").then(IntelPmu::load).flatten();
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let apple = shown
+            .contains("apple")
+            .then(macos::AppleGpuCollector::new)
+            .flatten();
         Self {
             nvml,
             rsmi,
             amd_sysfs,
             intel,
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            apple,
             shown,
             next_probe: Instant::now() + Duration::from_secs(10),
         }
@@ -112,7 +124,17 @@ impl GpuCollector {
             .unwrap_or("nvidia amd intel apple");
         let missing_requested = (shown.contains("nvidia") && self.nvml.is_none())
             || (shown.contains("amd") && self.rsmi.is_none() && self.amd_sysfs.is_empty())
-            || (shown.contains("intel") && self.intel.is_none());
+            || (shown.contains("intel") && self.intel.is_none())
+            || {
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                {
+                    shown.contains("apple") && self.apple.is_none()
+                }
+                #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+                {
+                    false
+                }
+            };
         if shown != self.shown || (missing_requested && Instant::now() >= self.next_probe) {
             *self = Self::new(config);
         }
@@ -133,6 +155,10 @@ impl GpuCollector {
         samples.extend(self.amd_sysfs.iter_mut().map(AmdSysfsDevice::collect));
         if let Some(intel) = &mut self.intel {
             samples.push(intel.collect());
+        }
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if let Some(apple) = &mut self.apple {
+            samples.push(apple.collect(check_temperature));
         }
         samples
     }

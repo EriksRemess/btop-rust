@@ -9,6 +9,9 @@ use std::time::Instant;
 use crate::config::Config;
 use crate::gpu::{GpuCollector, GpuSample};
 
+#[cfg(target_os = "macos")]
+mod macos;
+
 #[derive(Debug, Clone, Default)]
 pub struct CpuSample {
     pub total: f64,
@@ -146,7 +149,18 @@ impl Collector {
             previous_network: HashMap::new(),
             previous_disks: HashMap::new(),
             last_sample: Instant::now(),
-            cpu_name: read_cpu_name(),
+            cpu_name: if cfg!(target_os = "macos") {
+                #[cfg(target_os = "macos")]
+                {
+                    macos::read_cpu_name()
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    String::new()
+                }
+            } else {
+                read_cpu_name()
+            },
             users: read_users(),
             gpus: GpuCollector::new(config),
             rapl_previous: None,
@@ -198,6 +212,10 @@ impl Collector {
     }
 
     fn collect_cpu(&mut self, config: &Config) -> Result<(CpuSample, u64), String> {
+        if cfg!(target_os = "macos") {
+            #[cfg(target_os = "macos")]
+            return macos::collect_cpu(self, config);
+        }
         let stat = fs::read_to_string("/proc/stat")
             .map_err(|e| format!("could not read /proc/stat: {e}"))?;
         let current = parse_cpu_stat(&stat)?;
@@ -335,6 +353,10 @@ impl Collector {
     }
 
     fn collect_network(&mut self, config: &Config, elapsed: f64) -> Result<NetworkSample, String> {
+        if cfg!(target_os = "macos") {
+            #[cfg(target_os = "macos")]
+            return macos::collect_network(self, config, elapsed);
+        }
         let text = fs::read_to_string("/proc/net/dev")
             .map_err(|e| format!("could not read /proc/net/dev: {e}"))?;
         let mut counters = HashMap::new();
@@ -427,6 +449,10 @@ impl Collector {
         config: &Config,
         detailed_pid: Option<u32>,
     ) -> Result<Vec<ProcessSample>, String> {
+        if cfg!(target_os = "macos") {
+            #[cfg(target_os = "macos")]
+            return macos::collect_processes(self, total_delta, cores, config, detailed_pid);
+        }
         let entries =
             fs::read_dir("/proc").map_err(|e| format!("could not enumerate /proc: {e}"))?;
         let mut next_ticks = HashMap::new();
@@ -652,6 +678,10 @@ fn collect_memory(
     previous_disks: &mut HashMap<String, DiskCounters>,
     elapsed: f64,
 ) -> Result<MemorySample, String> {
+    if cfg!(target_os = "macos") {
+        #[cfg(target_os = "macos")]
+        return macos::collect_memory(config, previous_disks, elapsed);
+    }
     let text = fs::read_to_string("/proc/meminfo")
         .map_err(|e| format!("could not read /proc/meminfo: {e}"))?;
     let mut values = HashMap::new();
@@ -1711,6 +1741,9 @@ struct StatVfs {
     spare: [c_int; 6],
 }
 
+// getifaddrs uses platform-specific sockaddr layouts; the macOS collector has
+// its own declaration and never calls this Linux-layout version on Darwin.
+#[allow(clashing_extern_declarations)]
 unsafe extern "C" {
     fn statvfs(path: *const c_char, buf: *mut StatVfs) -> c_int;
     fn getifaddrs(addresses: *mut *mut IfAddrs) -> c_int;

@@ -8,23 +8,54 @@ use std::time::Duration;
 const STDIN: c_int = 0;
 const STDOUT: c_int = 1;
 const TCSANOW: c_int = 0;
+#[cfg(target_os = "linux")]
 const ICANON: c_uint = 0x0000_0002;
+#[cfg(target_os = "macos")]
+const ICANON: c_ulong = 0x0000_0100;
+#[cfg(target_os = "linux")]
 const ECHO: c_uint = 0x0000_0008;
+#[cfg(target_os = "macos")]
+const ECHO: c_ulong = 0x0000_0008;
+#[cfg(target_os = "linux")]
 const ISIG: c_uint = 0x0000_0001;
+#[cfg(target_os = "macos")]
+const ISIG: c_ulong = 0x0000_0080;
+#[cfg(target_os = "linux")]
 const IXON: c_uint = 0x0000_0400;
+#[cfg(target_os = "macos")]
+const IXON: c_ulong = 0x0000_0200;
+#[cfg(target_os = "linux")]
 const ICRNL: c_uint = 0x0000_0100;
+#[cfg(target_os = "macos")]
+const ICRNL: c_ulong = 0x0000_0100;
+#[cfg(target_os = "linux")]
 const OPOST: c_uint = 0x0000_0001;
+#[cfg(target_os = "macos")]
+const OPOST: c_ulong = 0x0000_0001;
+#[cfg(target_os = "linux")]
 const VTIME: usize = 5;
+#[cfg(target_os = "macos")]
+const VTIME: usize = 17;
+#[cfg(target_os = "linux")]
 const VMIN: usize = 6;
+#[cfg(target_os = "macos")]
+const VMIN: usize = 16;
+#[cfg(target_os = "linux")]
 const TIOCGWINSZ: c_ulong = 0x5413;
+#[cfg(target_os = "macos")]
+const TIOCGWINSZ: c_ulong = 0x4008_7468;
 const POLLIN: c_short = 0x0001;
 const F_GETFL: c_int = 3;
 const F_SETFL: c_int = 4;
+#[cfg(target_os = "linux")]
 const O_NONBLOCK: c_int = 0x800;
+#[cfg(target_os = "macos")]
+const O_NONBLOCK: c_int = 0x0000_0004;
 const ESCAPE_SEQUENCE_TIMEOUT: Duration = Duration::from_millis(25);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[cfg(target_os = "linux")]
 struct Termios {
     c_iflag: c_uint,
     c_oflag: c_uint,
@@ -34,6 +65,19 @@ struct Termios {
     c_cc: [c_uchar; 32],
     c_ispeed: c_uint,
     c_ospeed: c_uint,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[cfg(target_os = "macos")]
+struct Termios {
+    c_iflag: c_ulong,
+    c_oflag: c_ulong,
+    c_cflag: c_ulong,
+    c_lflag: c_ulong,
+    c_cc: [c_uchar; 20],
+    c_ispeed: c_ulong,
+    c_ospeed: c_ulong,
 }
 
 #[repr(C)]
@@ -56,7 +100,10 @@ unsafe extern "C" {
     fn tcgetattr(fd: c_int, termios: *mut Termios) -> c_int;
     fn tcsetattr(fd: c_int, action: c_int, termios: *const Termios) -> c_int;
     fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
+    #[cfg(target_os = "linux")]
     fn poll(fds: *mut PollFd, count: c_ulong, timeout: c_int) -> c_int;
+    #[cfg(target_os = "macos")]
+    fn poll(fds: *mut PollFd, count: c_uint, timeout: c_int) -> c_int;
     fn write(fd: c_int, buffer: *const u8, count: usize) -> isize;
     fn fcntl(fd: c_int, command: c_int, ...) -> c_int;
 }
@@ -481,6 +528,15 @@ fn utf8_sequence_width(first: u8) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_terminal_abi_matches_system_headers() {
+        assert_eq!(std::mem::size_of::<Termios>(), 72);
+        assert_eq!(std::mem::size_of::<WinSize>(), 8);
+        assert_eq!(TIOCGWINSZ, 0x4008_7468);
+        assert_eq!((VMIN, VTIME), (16, 17));
+    }
 
     #[test]
     fn preserves_coalesced_keys() {

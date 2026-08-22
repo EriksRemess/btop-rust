@@ -27,6 +27,37 @@ const SIGNAL_REDRAW: u32 = 1 << 2;
 const SIGNAL_RELOAD: u32 = 1 << 3;
 static PENDING_SIGNALS: AtomicU32 = AtomicU32::new(0);
 
+const SIGINT: i32 = 2;
+const SIGILL: i32 = 4;
+const SIGTRAP: i32 = 5;
+const SIGABRT: i32 = 6;
+const SIGSEGV: i32 = 11;
+const SIGWINCH: i32 = 28;
+#[cfg(target_os = "linux")]
+const SIGBUS: i32 = 7;
+#[cfg(target_os = "macos")]
+const SIGBUS: i32 = 10;
+#[cfg(target_os = "linux")]
+const SIGSTOP: i32 = 19;
+#[cfg(target_os = "macos")]
+const SIGSTOP: i32 = 17;
+#[cfg(target_os = "linux")]
+const SIGTSTP: i32 = 20;
+#[cfg(target_os = "macos")]
+const SIGTSTP: i32 = 18;
+#[cfg(target_os = "linux")]
+const SIGCONT: i32 = 18;
+#[cfg(target_os = "macos")]
+const SIGCONT: i32 = 19;
+#[cfg(target_os = "linux")]
+const SIGUSR1: i32 = 10;
+#[cfg(target_os = "macos")]
+const SIGUSR1: i32 = 30;
+#[cfg(target_os = "linux")]
+const SIGUSR2: i32 = 12;
+#[cfg(target_os = "macos")]
+const SIGUSR2: i32 = 31;
+
 struct CollectionClock {
     interval: Duration,
     deadline: Instant,
@@ -67,10 +98,10 @@ impl CollectionClock {
 
 extern "C" fn signal_handler(signal: i32) {
     let flag = match signal {
-        2 => SIGNAL_QUIT,
-        20 => SIGNAL_SUSPEND,
-        18 | 28 => SIGNAL_REDRAW,
-        12 => SIGNAL_RELOAD,
+        SIGINT => SIGNAL_QUIT,
+        SIGTSTP => SIGNAL_SUSPEND,
+        SIGCONT | SIGWINCH => SIGNAL_REDRAW,
+        SIGUSR2 => SIGNAL_RELOAD,
         _ => 0,
     };
     PENDING_SIGNALS.fetch_or(flag, Ordering::Relaxed);
@@ -101,7 +132,7 @@ unsafe fn raise_signal(signal_number: i32) -> i32 {
 }
 
 fn install_signal_handlers() -> Result<(), String> {
-    for signal_number in [2, 20, 18, 28, 10, 12] {
+    for signal_number in [SIGINT, SIGTSTP, SIGCONT, SIGWINCH, SIGUSR1, SIGUSR2] {
         if unsafe { set_signal_handler(signal_number, signal_handler as *const () as usize) }
             == usize::MAX
         {
@@ -111,7 +142,7 @@ fn install_signal_handlers() -> Result<(), String> {
             ));
         }
     }
-    for signal_number in [11, 6, 5, 7, 4] {
+    for signal_number in [SIGSEGV, SIGABRT, SIGTRAP, SIGBUS, SIGILL] {
         if unsafe { set_signal_handler(signal_number, crash_handler as *const () as usize) }
             == usize::MAX
         {
@@ -136,8 +167,16 @@ fn current_tty() -> Option<String> {
     })
 }
 
+#[cfg(target_os = "linux")]
 fn auto_tty_mode(name: Option<&str>) -> bool {
     name.is_some_and(|name| name.starts_with("/dev/tty"))
+}
+
+// All normal Darwin terminal sessions use /dev/ttysNNN. Unlike Linux
+// /dev/ttyN virtual consoles, these are full truecolor Unicode PTYs.
+#[cfg(target_os = "macos")]
+fn auto_tty_mode(_name: Option<&str>) -> bool {
+    false
 }
 
 fn main() -> ExitCode {
@@ -375,7 +414,6 @@ fn suspend_process() -> Result<(), String> {
     unsafe extern "C" {
         fn raise(signal: i32) -> i32;
     }
-    const SIGSTOP: i32 = 19;
     if unsafe { raise(SIGSTOP) } == 0 {
         Ok(())
     } else {
@@ -426,8 +464,16 @@ mod tests {
 
     #[test]
     fn auto_tty_mode_matches_btop_real_console_detection() {
-        assert!(auto_tty_mode(Some("/dev/tty1")));
-        assert!(auto_tty_mode(Some("/dev/ttyS0")));
+        #[cfg(target_os = "linux")]
+        {
+            assert!(auto_tty_mode(Some("/dev/tty1")));
+            assert!(auto_tty_mode(Some("/dev/ttyS0")));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert!(!auto_tty_mode(Some("/dev/ttys001")));
+            assert!(!auto_tty_mode(Some("/dev/tty")));
+        }
         assert!(!auto_tty_mode(Some("/dev/pts/4")));
         assert!(!auto_tty_mode(None));
     }

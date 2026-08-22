@@ -175,7 +175,7 @@ pub fn char_width(ch: char) -> usize {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub fn local_clock_format(format: &str) -> String {
     use std::ffi::CStr;
     use std::os::raw::{c_char, c_int, c_long};
@@ -256,7 +256,7 @@ mod tests {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 pub fn local_clock_format(_format: &str) -> String {
     String::new()
 }

@@ -99,7 +99,11 @@ fn write(level: Level, message: &str) {
         return;
     };
     if !state.wrote_header {
-        let _ = writeln!(file, "\n===> btop++ v{}", env!("CARGO_PKG_VERSION"));
+        let _ = writeln!(
+            file,
+            "\n===> btoprs v{} (based on BTOP++ v1.4.7)",
+            env!("CARGO_PKG_VERSION")
+        );
         state.wrote_header = true;
     }
     let name = match level {

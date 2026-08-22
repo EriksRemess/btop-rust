@@ -1,6 +1,6 @@
 [package]
 name = "btop"
-version = "1.4.7+d5e5619"
+version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "A Rust port of btop++"

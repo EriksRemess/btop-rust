@@ -2345,8 +2345,26 @@ fn draw_cpu(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
 
     let graph_width = box_x.saturating_sub(area.x + 1);
     let graph_height = area.h.saturating_sub(2);
-    let upper_field = app.config.value("cpu_graph_upper").unwrap_or("Auto");
-    let lower_field = app.config.value("cpu_graph_lower").unwrap_or("Auto");
+    let configured_upper = app.config.value("cpu_graph_upper").unwrap_or("Auto");
+    let upper_field = if configured_upper == "Auto"
+        || cpu_graph_history(app, configured_upper, &inline_gpus).is_none()
+    {
+        "total"
+    } else {
+        configured_upper
+    };
+    let configured_lower = app.config.value("cpu_graph_lower").unwrap_or("Auto");
+    let lower_field = if configured_lower == "Auto"
+        || cpu_graph_history(app, configured_lower, &inline_gpus).is_none()
+    {
+        if inline_gpus.is_empty() {
+            upper_field
+        } else {
+            "gpu-totals"
+        }
+    } else {
+        configured_lower
+    };
     let middle_line = !app.config.cpu_single_graph && upper_field != lower_field;
     let upper_height = if app.config.cpu_single_graph {
         graph_height
@@ -2357,15 +2375,7 @@ fn draw_cpu(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
     };
     let upper_history =
         cpu_graph_history(app, upper_field, &inline_gpus).unwrap_or(&app.cpu_history);
-    let lower_history = if lower_field == "Auto" {
-        inline_gpus
-            .first()
-            .and_then(|index| app.gpu_histories.get(*index))
-            .map(|history| &history.utilization)
-            .unwrap_or(upper_history)
-    } else {
-        cpu_graph_history(app, lower_field, &inline_gpus).unwrap_or(upper_history)
-    };
+    let lower_history = cpu_graph_history(app, lower_field, &inline_gpus).unwrap_or(upper_history);
     draw_graph_options(
         canvas,
         Rect::new(area.x + 1, area.y + 1, graph_width, upper_height),
@@ -2646,21 +2656,45 @@ fn draw_cpu(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
         } else {
             "GPU".into()
         };
+        let gpu_graph_width = if box_width < 42 { 4 } else { 5 };
+        let gpu_index_width = if app.sample.gpus.len() > 9 {
+            2
+        } else {
+            usize::from(app.sample.gpus.len() > 1)
+        };
+        let mut gpu_meter_width = box_width.saturating_sub(
+            10 + gpu_index_width
+                + if show_temps && gpu.support.temperature {
+                    11
+                } else {
+                    0
+                }
+                + if columns > 1 && gpu.support.memory_used && gpu.support.memory_total {
+                    5
+                } else {
+                    0
+                }
+                + if gpu.support.memory_used { 5 } else { 0 }
+                + if gpu.support.memory_total { 6 } else { 0 }
+                + if gpu.support.power { 6 } else { 0 },
+        );
+        if columns <= 1 {
+            gpu_meter_width = 0;
+        }
         canvas.text_bold(box_x + 1, y, &prefix, theme::MAIN);
         let mut x = box_x + 1 + prefix.len();
         if gpu.support.utilization {
-            let meter_width = if columns > 1 { 5 } else { 0 };
-            if meter_width > 0 {
+            if gpu_meter_width > 0 {
                 meter_bold(
                     canvas,
                     x + 1,
                     y,
-                    meter_width,
+                    gpu_meter_width,
                     f64::from(gpu.utilization),
                     theme::CPU,
                 );
             }
-            x += meter_width + 1;
+            x += gpu_meter_width + 1;
             draw_value_unit_bold(
                 canvas,
                 x,
@@ -2674,38 +2708,38 @@ fn draw_cpu(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
         }
         if gpu.support.memory_used {
             if columns > 1 && gpu.support.memory_total {
-                draw_graph_background(canvas, Rect::new(x + 1, y, 5, 1));
+                draw_graph_background(canvas, Rect::new(x + 1, y, gpu_graph_width, 1));
                 draw_graph(
                     canvas,
-                    Rect::new(x + 1, y, 5, 1),
+                    Rect::new(x + 1, y, gpu_graph_width, 1),
                     &history.memory_used,
                     100.0,
                     theme::Style::Used(100),
                 );
-                bold_area(canvas, Rect::new(x + 1, y, 5, 1));
-                x += 6;
+                bold_area(canvas, Rect::new(x + 1, y, gpu_graph_width, 1));
+                x += gpu_graph_width + 1;
             }
             let used = units::bytes_short(gpu.memory_used, app.config.base_10_sizes);
-            canvas.text_bold(x, y, &format!("{used:>5}"), theme::MAIN);
+            canvas.text(x, y, &format!("{used:>5}"), theme::MAIN);
             x += 5;
         }
         if gpu.support.memory_total {
             let total = units::bytes_short(gpu.memory_total, app.config.base_10_sizes);
             if gpu.support.memory_used {
-                canvas.put_bold(x, y, '/', theme::LOW);
-                canvas.text_bold(x + 1, y, &format!("{total:<4}"), theme::MAIN);
+                canvas.put(x, y, '/', theme::LOW);
+                canvas.text(x + 1, y, &format!("{total:<4}"), theme::MAIN);
             } else {
-                canvas.text_bold(x, y, &format!("{total:<5}"), theme::MAIN);
+                canvas.text(x, y, &format!("{total:<5}"), theme::MAIN);
             }
             x += 5;
         }
         if show_temps && gpu.support.temperature {
             let (display_temp, unit) = converted_temperature(gpu.temperature_c as f64, &app.config);
             if columns > 1 {
-                draw_graph_background(canvas, Rect::new(x + 1, y, 5, 1));
+                draw_graph_background(canvas, Rect::new(x + 1, y, gpu_graph_width, 1));
                 draw_graph_offset_options(
                     canvas,
-                    Rect::new(x + 1, y, 5, 1),
+                    Rect::new(x + 1, y, gpu_graph_width, 1),
                     &history.temperature,
                     gpu.temperature_max_c.max(1) as f64,
                     theme::Style::Temp(100),
@@ -2713,8 +2747,8 @@ fn draw_cpu(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
                     false,
                     -23.0,
                 );
-                bold_area(canvas, Rect::new(x + 1, y, 5, 1));
-                x += 6;
+                bold_area(canvas, Rect::new(x + 1, y, gpu_graph_width, 1));
+                x += gpu_graph_width + 1;
             }
             draw_value_unit_bold(
                 canvas,
@@ -3661,7 +3695,12 @@ fn draw_disks_capacity(
     app: &AppState,
     show_io_stat: bool,
 ) {
-    let meter_width = disks_width.saturating_sub(21).max(1);
+    let big_disk = disks_width >= 25;
+    let meter_width = if big_disk {
+        disks_width.saturating_sub(21)
+    } else {
+        disks_width.saturating_sub(7)
+    };
     let mut cy = 0usize;
     let swap = crate::collect::DiskSample {
         mount: "swap".into(),
@@ -3675,11 +3714,18 @@ fn draw_disks_capacity(
         ..crate::collect::DiskSample::default()
     };
     let mut disks: Vec<_> = app.sample.memory.disks.iter().collect();
+    if let Some(root_index) = disks.iter().position(|disk| disk.mount == "/") {
+        let root = disks.remove(root_index);
+        disks.insert(0, root);
+    }
     if app.sample.memory.swap_total > 0
         && app.config.bool_value("show_swap").unwrap_or(true)
         && app.config.bool_value("swap_disk").unwrap_or(true)
     {
-        disks.insert(0, &swap);
+        disks.insert(
+            usize::from(disks.first().is_some_and(|disk| disk.mount == "/")),
+            &swap,
+        );
     }
     let disk_ios = disks.iter().filter(|disk| disk.io_supported).count();
     let io_rows = usize::from(show_io_stat) * disk_ios;
@@ -3687,15 +3733,20 @@ fn draw_disks_capacity(
     let roomy_gap = disks.len() * 4 + io_rows <= area.h.saturating_sub(1);
     for disk in disks {
         let io_row = usize::from(show_io_stat && disk.io_supported);
-        let disk_rows = 2 + io_row + usize::from(show_free) + usize::from(roomy_gap);
-        if cy + disk_rows > area.h - 1 {
+        let content_rows = 2 + io_row + usize::from(show_free);
+        let disk_rows = content_rows + usize::from(roomy_gap);
+        if cy + content_rows > area.h.saturating_sub(2) {
             break;
         }
         let y = area.y + 1 + cy;
         draw_disk_divider(canvas, area, divider, y);
         let name = disk_name(&disk.mount);
         canvas.text_bold(divider + 2, y, &name, theme::TITLE);
-        let total = units::bytes_spaced(disk.total, app.config.base_10_sizes);
+        let total = if big_disk {
+            units::bytes_spaced(disk.total, app.config.base_10_sizes)
+        } else {
+            units::bytes_short(disk.total, app.config.base_10_sizes)
+        };
         canvas.text_preserve_spaces_bold(
             area.x + area.w.saturating_sub(total.len() + 2),
             y,
@@ -3707,9 +3758,7 @@ fn draw_disks_capacity(
             disk.write_per_second,
             app.config.base_10_sizes,
         );
-        if disks_width >= 25
-            && let Some(label) = &io_label
-        {
+        if big_disk && let Some(label) = &io_label {
             let center = divider + 1 + disks_width / 2;
             canvas.text_preserve_spaces(
                 center.saturating_sub(units::display_width(label).div_ceil(2)),
@@ -3735,14 +3784,20 @@ fn draw_disks_capacity(
                     false,
                 );
             }
-            canvas.text(divider + 2, row, "IO%", theme::MAIN);
-            if disks_width < 25
-                && let Some(label) = &io_label
-            {
-                canvas.text_preserve_spaces(
-                    area.x + area.w.saturating_sub(units::display_width(label) + 2),
+            canvas.text(
+                divider + 1,
+                row,
+                if big_disk { " IO%" } else { " IO" },
+                theme::MAIN,
+            );
+            if !big_disk && io_label.is_some() {
+                canvas.text(
+                    divider + 1,
                     row,
-                    label,
+                    &units::bytes_short(
+                        disk.read_per_second.saturating_add(disk.write_per_second),
+                        app.config.base_10_sizes,
+                    ),
                     theme::MAIN,
                 );
             }
@@ -3750,21 +3805,29 @@ fn draw_disks_capacity(
         }
         let used = ratio(disk.used, disk.total);
         let free = ratio(disk.free, disk.total);
-        canvas.text(
-            divider + 2,
-            row,
-            &format!("Used:{used:>3.0}% "),
-            theme::MAIN,
-        );
+        if big_disk {
+            canvas.text(
+                divider + 1,
+                row,
+                &format!(" Used:{used:>3.0}% "),
+                theme::MAIN,
+            );
+        } else {
+            canvas.text(divider + 1, row, "U", theme::MAIN);
+        }
         meter(
             canvas,
-            divider + 12,
+            divider + if big_disk { 12 } else { 3 },
             row,
             meter_width,
             used,
             theme::Style::Used(100),
         );
-        let used_human = units::bytes_spaced(disk.used, app.config.base_10_sizes);
+        let used_human = if big_disk {
+            units::bytes_spaced(disk.used, app.config.base_10_sizes)
+        } else {
+            units::bytes_short(disk.used, app.config.base_10_sizes)
+        };
         canvas.text(
             area.x + area.w.saturating_sub(used_human.len() + 2),
             row,
@@ -3773,21 +3836,29 @@ fn draw_disks_capacity(
         );
         row += 1;
         if show_free {
-            canvas.text(
-                divider + 2,
-                row,
-                &format!("Free:{free:>3.0}% "),
-                theme::MAIN,
-            );
+            if big_disk {
+                canvas.text(
+                    divider + 1,
+                    row,
+                    &format!(" Free:{free:>3.0}% "),
+                    theme::MAIN,
+                );
+            } else {
+                canvas.text(divider + 1, row, "F", theme::MAIN);
+            }
             meter(
                 canvas,
-                divider + 12,
+                divider + if big_disk { 12 } else { 3 },
                 row,
                 meter_width,
                 free,
                 theme::Style::Free(100),
             );
-            let free_human = units::bytes_spaced(disk.free, app.config.base_10_sizes);
+            let free_human = if big_disk {
+                units::bytes_spaced(disk.free, app.config.base_10_sizes)
+            } else {
+                units::bytes_short(disk.free, app.config.base_10_sizes)
+            };
             canvas.text(
                 area.x + area.w.saturating_sub(free_human.len() + 2),
                 row,
@@ -4828,6 +4899,20 @@ fn draw_processes(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
         .filter(|process| !(filter_kernel && process.kernel_thread))
         .cloned()
         .collect();
+    if !app.visible_pids.is_empty() {
+        let previous_order = app
+            .visible_pids
+            .iter()
+            .enumerate()
+            .map(|(index, pid)| (*pid, index))
+            .collect::<HashMap<_, _>>();
+        display_processes.sort_by_key(|process| {
+            previous_order
+                .get(&process.pid)
+                .copied()
+                .unwrap_or(usize::MAX)
+        });
+    }
     if app.config.process_tree {
         aggregate_tree_resources(
             &mut display_processes,
@@ -5548,13 +5633,14 @@ fn process_state(state: char) -> &'static str {
 
 fn draw_banner(canvas: &mut Canvas, y: usize) {
     const BANNER: [&str; 6] = [
-        "██████╗ ████████╗ ██████╗ ██████╗",
-        "██╔══██╗╚══██╔══╝██╔═══██╗██╔══██╗   ██╗    ██╗",
-        "██████╔╝   ██║   ██║   ██║██████╔╝ ██████╗██████╗",
-        "██╔══██╗   ██║   ██║   ██║██╔═══╝  ╚═██╔═╝╚═██╔═╝",
-        "██████╔╝   ██║   ╚██████╔╝██║        ╚═╝    ╚═╝",
-        "╚═════╝    ╚═╝    ╚═════╝ ╚═╝",
+        "██████╗ ████████╗ ██████╗ ██████╗     ██████╗ ███████╗",
+        "██╔══██╗╚══██╔══╝██╔═══██╗██╔══██╗    ██╔══██╗██╔════╝",
+        "██████╔╝   ██║   ██║   ██║██████╔╝    ██████╔╝███████╗",
+        "██╔══██╗   ██║   ██║   ██║██╔═══╝     ██╔══██╗╚════██║",
+        "██████╔╝   ██║   ╚██████╔╝██║         ██║  ██║███████║",
+        "╚═════╝    ╚═╝    ╚═════╝ ╚═╝         ╚═╝  ╚═╝╚══════╝",
     ];
+    const VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"), " (based on BTOP++ v1.4.7)");
     let width = BANNER
         .iter()
         .map(|line| units::display_width(line))
@@ -5577,14 +5663,19 @@ fn draw_banner(canvas: &mut Canvas, y: usize) {
             }
         }
     }
-    canvas.text_bold_italic(x + 42, y + 5, "v1.4.7", theme::MAIN);
+    canvas.text_bold_italic(
+        x + width.saturating_sub(units::display_width(VERSION)) / 2,
+        y + BANNER.len(),
+        VERSION,
+        theme::MAIN,
+    );
 }
 
 fn draw_no_boxes(canvas: &mut Canvas) {
-    let banner_y = canvas.height.saturating_div(2).saturating_sub(11);
+    let banner_y = canvas.height.saturating_div(2).saturating_sub(12);
     draw_banner(canvas, banner_y);
     let x = canvas.width.saturating_div(2).saturating_sub(11);
-    canvas.text_bold(x, banner_y + 6, "No boxes shown!", theme::TITLE);
+    canvas.text_bold(x, banner_y + 7, "No boxes shown!", theme::TITLE);
     for (row, (key, description)) in [
         ("1", "Show CPU box"),
         ("2", "Show MEM box"),
@@ -5597,10 +5688,10 @@ fn draw_no_boxes(canvas: &mut Canvas) {
     .iter()
     .enumerate()
     {
-        canvas.text_bold(x.saturating_sub(2), banner_y + 8 + row, key, theme::HI);
+        canvas.text_bold(x.saturating_sub(2), banner_y + 9 + row, key, theme::HI);
         canvas.text_bold(
             x.saturating_sub(2) + units::display_width(key),
-            banner_y + 8 + row,
+            banner_y + 9 + row,
             &format!(" | {description}"),
             theme::MAIN,
         );
@@ -5736,11 +5827,11 @@ fn draw_help(canvas: &mut Canvas, page: usize) {
     let banner_y = canvas
         .height
         .saturating_div(2)
-        .saturating_sub(5 + HELP.len() / 2);
+        .saturating_sub(6 + HELP.len() / 2);
     draw_banner(canvas, banner_y);
     let area = Rect::new(
         source_center_x(canvas.width, panel_width),
-        banner_y + 6,
+        banner_y + 7,
         panel_width,
         height,
     );
@@ -5898,11 +5989,11 @@ fn draw_options(
     let banner_y = canvas
         .height
         .saturating_div(2)
-        .saturating_sub(4 + max_items);
+        .saturating_sub(5 + max_items);
     draw_banner(canvas, banner_y);
     let area = Rect::new(
         source_center_x(canvas.width, width),
-        banner_y + 6,
+        banner_y + 7,
         width,
         height,
     );
@@ -7236,17 +7327,12 @@ fn set_nice(pid: u32, value: i32) -> Result<(), i32> {
 
 fn compare_process(a: &&ProcessSample, b: &&ProcessSample, sort: ProcessSort) -> Ordering {
     match sort {
-        ProcessSort::CpuDirect => b
-            .cpu
-            .partial_cmp(&a.cpu)
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| a.pid.cmp(&b.pid)),
+        ProcessSort::CpuDirect => b.cpu.partial_cmp(&a.cpu).unwrap_or(Ordering::Equal),
         ProcessSort::CpuLazy => b
             .cumulative_cpu
             .partial_cmp(&a.cumulative_cpu)
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| a.pid.cmp(&b.pid)),
-        ProcessSort::Memory => b.memory.cmp(&a.memory).then_with(|| a.pid.cmp(&b.pid)),
+            .unwrap_or(Ordering::Equal),
+        ProcessSort::Memory => b.memory.cmp(&a.memory),
         ProcessSort::Pid => b.pid.cmp(&a.pid),
         ProcessSort::Name => a
             .name
@@ -7256,8 +7342,8 @@ fn compare_process(a: &&ProcessSample, b: &&ProcessSample, sort: ProcessSort) ->
             .command
             .to_ascii_lowercase()
             .cmp(&b.command.to_ascii_lowercase()),
-        ProcessSort::User => a.user.cmp(&b.user).then_with(|| a.pid.cmp(&b.pid)),
-        ProcessSort::Threads => b.threads.cmp(&a.threads).then_with(|| a.pid.cmp(&b.pid)),
+        ProcessSort::User => a.user.cmp(&b.user),
+        ProcessSort::Threads => b.threads.cmp(&a.threads),
     }
 }
 
@@ -8569,15 +8655,20 @@ mod tests {
         assert_eq!(source_center_x(180, 19), 80);
         assert_eq!(source_center_x(180, 12), 83);
 
-        let mut canvas = Canvas::new(180, 6);
+        let mut canvas = Canvas::new(180, 7);
         draw_banner(&mut canvas, 0);
-        let version = canvas.cells[5 * 180..6 * 180]
+        let version_text = concat!("v", env!("CARGO_PKG_VERSION"), " (based on BTOP++ v1.4.7)");
+        let version = canvas.cells[6 * 180..7 * 180]
             .iter()
             .position(|cell| cell.ch == 'v')
             .unwrap();
-        assert_eq!(version, source_center_x(180, 49) + 42);
-        assert!(canvas.cells[5 * 180 + version].bold);
-        assert!(canvas.cells[5 * 180 + version].italic);
+        assert_eq!(
+            version,
+            source_center_x(180, 54) + (54 - units::display_width(version_text)) / 2
+        );
+        assert!(canvas.cells[6 * 180 + version].bold);
+        assert!(canvas.cells[6 * 180 + version].italic);
+        assert!(canvas_text(&canvas).contains(version_text));
     }
 
     #[test]
@@ -8794,12 +8885,28 @@ mod tests {
 
         // The graphs retain their Used/Free gradients, but btop resets the
         // rendition before printing both numeric percentages.
+        assert!(
+            canvas.cells[4 * 100 + 76..4 * 100 + 81]
+                .iter()
+                .all(|cell| !cell.bold)
+        );
+        assert!(
+            canvas.cells[4 * 100 + 89..4 * 100 + 97]
+                .iter()
+                .all(|cell| !cell.bold)
+        );
         assert!(canvas.cells[5 * 100 + 51].bold);
         assert_eq!(canvas.cells[5 * 100 + 77].ch, '5');
         assert_eq!(canvas.cells[5 * 100 + 77].style, theme::MAIN);
         assert!(!canvas.cells[5 * 100 + 77].bold);
         assert_eq!(canvas.cells[7 * 100 + 52].ch, '7');
         assert_eq!(canvas.cells[7 * 100 + 52].style, theme::MAIN);
+        let output = canvas.finish();
+        let used = output.find("Used:").unwrap();
+        assert!(
+            output[..used].rfind("\x1b[22m") > output[..used].rfind("\x1b[1m"),
+            "VRAM usage must explicitly leave bold mode"
+        );
     }
 
     #[test]
@@ -9071,6 +9178,66 @@ mod tests {
                     .all(|cell| cell.ch != ' ')
             );
         }
+    }
+
+    #[test]
+    fn auto_cpu_graph_fields_split_total_from_inline_gpu_like_btop() {
+        let mut app = app();
+        let mut gpu = GpuSample::default();
+        gpu.support.utilization = true;
+        app.sample.gpus.push(gpu);
+        app.cpu_history = VecDeque::from(vec![20.0; 100]);
+        app.gpu_histories.push(GpuHistory {
+            utilization: VecDeque::from(vec![40.0; 100]),
+            ..GpuHistory::default()
+        });
+        let mut canvas = Canvas::new(120, 20);
+
+        draw_cpu(&mut canvas, Rect::new(0, 0, 120, 20), &mut app);
+
+        assert!(canvas_text(&canvas).contains("total ▲▼ gpu-totals"));
+    }
+
+    #[test]
+    fn compact_inline_gpu_shrinks_usage_meter_to_keep_power_visible() {
+        let mut app = app();
+        app.sample.cpu.temperature = Some(42.0);
+        let mut gpu = GpuSample {
+            utilization: 12,
+            memory_used: 6_400_000_000,
+            memory_total: 8_000_000_000,
+            temperature_c: 0,
+            power_mw: 50,
+            ..GpuSample::default()
+        };
+        gpu.support.utilization = true;
+        gpu.support.memory_used = true;
+        gpu.support.memory_total = true;
+        gpu.support.temperature = true;
+        gpu.support.power = true;
+        app.sample.gpus.push(gpu);
+        app.gpu_histories.push(GpuHistory::default());
+        let mut canvas = Canvas::new(95, 20);
+
+        draw_cpu(&mut canvas, Rect::new(0, 0, 95, 20), &mut app);
+
+        let output = canvas_text(&canvas);
+        let (gpu_y, gpu_row) = output
+            .lines()
+            .enumerate()
+            .find(|(_, line)| line.contains("GPU"))
+            .unwrap();
+        assert!(gpu_row.contains("0.05W"), "{gpu_row}");
+        let slash_x = canvas.cells[gpu_y * 95..(gpu_y + 1) * 95]
+            .iter()
+            .position(|cell| cell.ch == '/')
+            .expect("inline GPU memory separator");
+        assert!(
+            canvas.cells[gpu_y * 95 + slash_x.saturating_sub(4)..gpu_y * 95 + slash_x + 5]
+                .iter()
+                .all(|cell| !cell.bold),
+            "inline GPU memory values must not be bold"
+        );
     }
 
     #[test]
@@ -9553,6 +9720,55 @@ mod tests {
     }
 
     #[test]
+    fn narrow_disks_use_btop_labels_units_meters_and_mount_order() {
+        let mut app = app();
+        app.sample.memory.swap_total = 2 * 1024 * 1024 * 1024;
+        app.sample.memory.swap_used = 1024 * 1024 * 1024;
+        app.sample.memory.disks = ["/Volumes/VM", "/", "/System/Volumes/Preboot"]
+            .into_iter()
+            .map(|mount| DiskSample {
+                mount: mount.into(),
+                total: 1024 * 1024 * 1024,
+                used: 512 * 1024 * 1024,
+                free: 512 * 1024 * 1024,
+                io_supported: mount == "/",
+                read_per_second: usize::from(mount == "/") as u64 * 1024 * 1024,
+                write_per_second: usize::from(mount == "/") as u64 * 2 * 1024 * 1024,
+                ..DiskSample::default()
+            })
+            .collect();
+        app.disk_histories.insert(
+            "/".into(),
+            DiskHistory {
+                activity: VecDeque::from([25.0]),
+                ..DiskHistory::default()
+            },
+        );
+        let mut canvas = Canvas::new(50, 20);
+
+        draw_memory(&mut canvas, Rect::new(0, 0, 50, 20), &mut app);
+
+        let rows: Vec<_> = (0..20).map(|y| canvas_row(&canvas, y)).collect();
+        let root = rows.iter().position(|row| row.contains("root")).unwrap();
+        let swap = rows.iter().position(|row| row.contains("swap")).unwrap();
+        let vm = rows.iter().position(|row| row.contains("VM")).unwrap();
+        let preboot = rows.iter().position(|row| row.contains("Preboot")).unwrap();
+        assert!(root < swap && swap < vm && vm < preboot);
+        assert!(rows[root].contains("1.0G"));
+        assert!(rows[root + 1].contains("3.0M"));
+
+        let divider = 24;
+        assert_eq!(canvas.cells[(root + 2) * 50 + divider + 1].ch, 'U');
+        assert_eq!(canvas.cells[(root + 3) * 50 + divider + 1].ch, 'F');
+        assert!(
+            canvas.cells[(root + 2) * 50 + divider + 3..(root + 2) * 50 + divider + 20]
+                .iter()
+                .all(|cell| cell.ch == '■')
+        );
+        assert!(rows[swap].contains("2.0G"));
+    }
+
+    #[test]
     fn disk_io_speed_overrides_are_in_mebibytes() {
         assert_eq!(
             disk_io_speeds("/:10 /home:250"),
@@ -9702,6 +9918,38 @@ mod tests {
         promote_busy_processes(&mut refs);
         assert_eq!(refs[0].pid, 8);
         assert_eq!(refs[1].pid, 1);
+    }
+
+    #[test]
+    fn cpu_direct_keeps_previous_order_for_equal_usage_like_btop_stable_sort() {
+        let mut app = app();
+        app.config.process_sort = ProcessSort::CpuDirect;
+        app.sample.processes = vec![
+            ProcessSample {
+                pid: 1,
+                name: "launchd".into(),
+                user: "root".into(),
+                ..ProcessSample::default()
+            },
+            ProcessSample {
+                pid: 20_000,
+                name: "worker".into(),
+                user: "user".into(),
+                cpu: 2.0,
+                memory: 64 * 1024 * 1024,
+                ..ProcessSample::default()
+            },
+        ];
+        let mut canvas = Canvas::new(80, 10);
+        draw_processes(&mut canvas, Rect::new(0, 0, 80, 10), &mut app);
+        assert_eq!(app.visible_pids, [20_000, 1]);
+
+        app.sample.processes.reverse();
+        app.sample.processes[0].cpu = 0.0;
+        let mut canvas = Canvas::new(80, 10);
+        draw_processes(&mut canvas, Rect::new(0, 0, 80, 10), &mut app);
+
+        assert_eq!(app.visible_pids, [20_000, 1]);
     }
 
     #[test]

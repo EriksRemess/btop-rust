@@ -2,8 +2,8 @@
 
 A work-in-progress, standard-library-only Rust port of btop++ 1.4.7. The current
 implementation targets Linux and reads the same kernel interfaces as btop++:
-`/proc/stat`, `/proc/meminfo`, `/proc/net/dev`, `/proc/[pid]`, `/proc/mounts`,
-`/sys/class/thermal`, and `/sys/class/power_supply`.
+the relevant procfs CPU, memory, network, process, and mount entries, plus the
+sysfs thermal and power-supply entries.
 
 ```console
 cargo build --release
