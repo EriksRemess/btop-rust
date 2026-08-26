@@ -149,6 +149,10 @@ pub struct AppState {
     network_hitboxes: Vec<NetworkHitbox>,
     cpu_control_hitboxes: Vec<CpuControlHitbox>,
     memory_control_hitboxes: Vec<MemoryControlHitbox>,
+    disk_offset: usize,
+    disk_scroll_area: Option<Rect>,
+    disk_scrollbar: Option<DiskScrollbar>,
+    dragging_disk_scrollbar: bool,
     gpu_histories: Vec<GpuHistory>,
     pub selected_process: usize,
     pub process_selected: bool,
@@ -294,6 +298,17 @@ struct MemoryControlHitbox {
     action: MemoryControlAction,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct DiskScrollbar {
+    x: usize,
+    up_y: usize,
+    down_y: usize,
+    track_top: usize,
+    track_bottom: usize,
+    thumb_y: usize,
+    maximum_offset: usize,
+}
+
 #[derive(Default)]
 struct GpuHistory {
     utilization: VecDeque<f64>,
@@ -369,6 +384,10 @@ impl AppState {
             network_hitboxes: Vec::new(),
             cpu_control_hitboxes: Vec::new(),
             memory_control_hitboxes: Vec::new(),
+            disk_offset: 0,
+            disk_scroll_area: None,
+            disk_scrollbar: None,
+            dragging_disk_scrollbar: false,
             gpu_histories: Vec::new(),
             selected_process: 0,
             process_selected: false,
@@ -1742,6 +1761,12 @@ impl AppState {
         }
         if !pressed {
             self.dragging_process_scrollbar = false;
+            self.dragging_disk_scrollbar = false;
+            return false;
+        }
+        if self.dragging_disk_scrollbar && button & 32 != 0 {
+            self.select_from_disk_scrollbar(y);
+            self.needs_redraw = true;
             return false;
         }
         if self.dragging_process_scrollbar && button & 32 != 0 {
@@ -1762,6 +1787,36 @@ impl AppState {
                 self.dragging_process_scrollbar = y == scrollbar.thumb_y;
                 self.select_from_process_scrollbar(y);
             }
+            self.needs_redraw = true;
+            return false;
+        }
+        if button == 0
+            && let Some(scrollbar) = self.disk_scrollbar
+            && x == scrollbar.x
+            && (scrollbar.up_y..=scrollbar.down_y).contains(&y)
+        {
+            if y == scrollbar.up_y {
+                self.disk_offset = self.disk_offset.saturating_sub(1);
+            } else if y == scrollbar.down_y {
+                self.disk_offset = (self.disk_offset + 1).min(scrollbar.maximum_offset);
+            } else {
+                self.dragging_disk_scrollbar = y == scrollbar.thumb_y;
+                self.select_from_disk_scrollbar(y);
+            }
+            self.needs_redraw = true;
+            return false;
+        }
+        if matches!(button, 64 | 65)
+            && self
+                .disk_scroll_area
+                .is_some_and(|area| area.contains(x, y))
+            && let Some(scrollbar) = self.disk_scrollbar
+        {
+            self.disk_offset = if button == 65 {
+                (self.disk_offset + 1).min(scrollbar.maximum_offset)
+            } else {
+                self.disk_offset.saturating_sub(1)
+            };
             self.needs_redraw = true;
             return false;
         }
@@ -1852,6 +1907,27 @@ impl AppState {
             self.needs_redraw = true;
         }
         false
+    }
+
+    fn select_from_disk_scrollbar(&mut self, y: usize) {
+        let Some(scrollbar) = self.disk_scrollbar else {
+            return;
+        };
+        let track_len = scrollbar.track_bottom.saturating_sub(scrollbar.track_top);
+        if track_len == 0 || scrollbar.maximum_offset == 0 {
+            self.disk_offset = 0;
+            return;
+        }
+        let position = y
+            .clamp(
+                scrollbar.track_top,
+                scrollbar.track_bottom.saturating_sub(1),
+            )
+            .saturating_sub(scrollbar.track_top);
+        self.disk_offset = ((position as f64 * scrollbar.maximum_offset as f64
+            / track_len.saturating_sub(1).max(1) as f64)
+            .round() as usize)
+            .min(scrollbar.maximum_offset);
     }
 
     fn select_from_process_scrollbar(&mut self, y: usize) {
@@ -3366,6 +3442,8 @@ fn draw_inline_swap_header(
 
 fn draw_memory(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
     app.memory_control_hitboxes.clear();
+    app.disk_scroll_area = None;
+    app.disk_scrollbar = None;
     if area.h < 3 || area.w < 3 {
         return;
     }
@@ -3675,6 +3753,82 @@ fn draw_disk_divider(canvas: &mut Canvas, area: Rect, divider: usize, y: usize) 
     canvas.put(area.x + area.w - 1, y, '┤', theme::MEM_BOX);
 }
 
+fn last_disk_page_start(layout: &[(usize, usize)], available_rows: usize) -> usize {
+    let mut start = layout.len();
+    let mut required_rows = 0usize;
+    for index in (0..layout.len()).rev() {
+        let (content_rows, advance_rows) = layout[index];
+        let candidate = if start == layout.len() {
+            content_rows
+        } else {
+            advance_rows.saturating_add(required_rows)
+        };
+        if candidate > available_rows {
+            break;
+        }
+        start = index;
+        required_rows = candidate;
+    }
+    if start == layout.len() {
+        layout.len().saturating_sub(1)
+    } else {
+        start
+    }
+}
+
+fn draw_disk_scrollbar(
+    canvas: &mut Canvas,
+    area: Rect,
+    divider: usize,
+    app: &mut AppState,
+    maximum_offset: usize,
+) {
+    app.disk_offset = app.disk_offset.min(maximum_offset);
+    if maximum_offset == 0 || area.h < 5 {
+        if maximum_offset == 0 {
+            app.disk_offset = 0;
+        }
+        return;
+    }
+    let x = area.x + area.w - 1;
+    let up_y = area.y + 1;
+    let down_y = area.y + area.h - 2;
+    let track_top = up_y + 1;
+    let track_bottom = down_y;
+    let track_len = track_bottom.saturating_sub(track_top);
+    let thumb_offset = if track_len <= 1 {
+        0
+    } else {
+        ((app.disk_offset as f64 * (track_len - 1) as f64 / maximum_offset as f64).round() as usize)
+            .min(track_len - 1)
+    };
+    let thumb_y = track_top + thumb_offset;
+    canvas.put_bold(x, up_y, '↑', theme::MAIN);
+    canvas.put_bold(x, down_y, '↓', theme::MAIN);
+    for y in track_top..track_bottom {
+        if y == thumb_y {
+            canvas.put_bold(x, y, '█', theme::MAIN);
+        } else {
+            canvas.put(x, y, '│', theme::MEM_BOX);
+        }
+    }
+    app.disk_scroll_area = Some(Rect::new(
+        divider + 1,
+        area.y + 1,
+        area.x + area.w - divider - 1,
+        area.h - 2,
+    ));
+    app.disk_scrollbar = Some(DiskScrollbar {
+        x,
+        up_y,
+        down_y,
+        track_top,
+        track_bottom,
+        thumb_y,
+        maximum_offset,
+    });
+}
+
 fn disk_name(mount: &str) -> String {
     if mount == "/" {
         "root".to_string()
@@ -3692,7 +3846,7 @@ fn draw_disks_capacity(
     area: Rect,
     divider: usize,
     disks_width: usize,
-    app: &AppState,
+    app: &mut AppState,
     show_io_stat: bool,
 ) {
     let big_disk = disks_width >= 25;
@@ -3713,7 +3867,7 @@ fn draw_disks_capacity(
             .saturating_sub(app.sample.memory.swap_used),
         ..crate::collect::DiskSample::default()
     };
-    let mut disks: Vec<_> = app.sample.memory.disks.iter().collect();
+    let mut disks = app.sample.memory.disks.clone();
     if let Some(root_index) = disks.iter().position(|disk| disk.mount == "/") {
         let root = disks.remove(root_index);
         disks.insert(0, root);
@@ -3724,14 +3878,25 @@ fn draw_disks_capacity(
     {
         disks.insert(
             usize::from(disks.first().is_some_and(|disk| disk.mount == "/")),
-            &swap,
+            swap,
         );
     }
     let disk_ios = disks.iter().filter(|disk| disk.io_supported).count();
     let io_rows = usize::from(show_io_stat) * disk_ios;
     let show_free = disks.len() * 3 + io_rows <= area.h.saturating_sub(1);
     let roomy_gap = disks.len() * 4 + io_rows <= area.h.saturating_sub(1);
-    for disk in disks {
+    let layout: Vec<_> = disks
+        .iter()
+        .map(|disk| {
+            let io_row = usize::from(show_io_stat && disk.io_supported);
+            let content_rows = 2 + io_row + usize::from(show_free);
+            (content_rows, content_rows + usize::from(roomy_gap))
+        })
+        .collect();
+    let maximum_offset = last_disk_page_start(&layout, area.h.saturating_sub(2));
+    app.disk_offset = app.disk_offset.min(maximum_offset);
+    let disk_offset = app.disk_offset;
+    for disk in disks.into_iter().skip(disk_offset) {
         let io_row = usize::from(show_io_stat && disk.io_supported);
         let content_rows = 2 + io_row + usize::from(show_free);
         let disk_rows = content_rows + usize::from(roomy_gap);
@@ -3871,6 +4036,7 @@ fn draw_disks_capacity(
     if cy < area.h - 2 {
         draw_disk_divider(canvas, area, divider, area.y + 1 + cy);
     }
+    draw_disk_scrollbar(canvas, area, divider, app, maximum_offset);
 }
 
 fn disk_io_label(read_per_second: u64, write_per_second: u64, base_10: bool) -> Option<String> {
@@ -3892,7 +4058,7 @@ fn draw_disks_io(
     area: Rect,
     divider: usize,
     disks_width: usize,
-    app: &AppState,
+    app: &mut AppState,
     combined: bool,
 ) {
     let disks: Vec<_> = app
@@ -3901,6 +4067,7 @@ fn draw_disks_io(
         .disks
         .iter()
         .filter(|disk| disk.io_supported)
+        .cloned()
         .collect();
     if disks.is_empty() {
         return;
@@ -3913,8 +4080,17 @@ fn draw_disks_io(
         .max(if combined { 1 } else { 2 });
     let half_height = graph_height.div_ceil(2);
     let custom_speeds = disk_io_speeds(app.config.value("io_graph_speeds").unwrap_or(""));
+    let visible = area
+        .h
+        .saturating_sub(2)
+        .checked_div(graph_height + 2)
+        .unwrap_or(0)
+        .max(1);
+    let maximum_offset = disks.len().saturating_sub(visible);
+    app.disk_offset = app.disk_offset.min(maximum_offset);
+    let disk_offset = app.disk_offset;
     let mut cy = 0usize;
-    for disk in disks {
+    for disk in disks.into_iter().skip(disk_offset) {
         if cy + graph_height + 1 >= area.h - 1 {
             break;
         }
@@ -4036,6 +4212,7 @@ fn draw_disks_io(
     if cy < area.h - 2 {
         draw_disk_divider(canvas, area, divider, area.y + 1 + cy);
     }
+    draw_disk_scrollbar(canvas, area, divider, app, maximum_offset);
 }
 
 fn disk_io_speeds(value: &str) -> HashMap<String, u64> {
@@ -9717,6 +9894,112 @@ mod tests {
         assert!(output.contains("root"));
         assert!(output.contains("efi"));
         assert!(!canvas_row(&canvas, 9).contains("Free:"));
+    }
+
+    #[test]
+    fn overflowing_storage_list_scrolls_by_disk_under_the_mouse() {
+        let mut app = app();
+        app.sample.memory.disks = (0..8)
+            .map(|index| DiskSample {
+                mount: format!("/disk-{index}"),
+                total: 1024 * 1024 * 1024,
+                used: 512 * 1024 * 1024,
+                free: 512 * 1024 * 1024,
+                ..DiskSample::default()
+            })
+            .collect();
+        let area = Rect::new(0, 0, 54, 10);
+        let mut canvas = Canvas::new(54, 10);
+        draw_memory(&mut canvas, area, &mut app);
+
+        assert_eq!(app.disk_offset, 0);
+        assert_eq!(app.disk_scrollbar.unwrap().maximum_offset, 4);
+        assert!(canvas_text(&canvas).contains("disk-0"));
+        assert!(!canvas_text(&canvas).contains("disk-7"));
+
+        app.handle_key(Key::Mouse {
+            button: 65,
+            x: 40,
+            y: 5,
+            pressed: true,
+        });
+        assert_eq!(app.disk_offset, 1);
+        let mut canvas = Canvas::new(54, 10);
+        draw_memory(&mut canvas, area, &mut app);
+        assert!(canvas_text(&canvas).contains("disk-1"));
+
+        for _ in 0..20 {
+            app.handle_key(Key::Mouse {
+                button: 65,
+                x: 40,
+                y: 5,
+                pressed: true,
+            });
+        }
+        assert_eq!(app.disk_offset, 4);
+        let mut canvas = Canvas::new(54, 10);
+        draw_memory(&mut canvas, area, &mut app);
+        assert!(canvas_text(&canvas).contains("disk-7"));
+        let scrollbar = app.disk_scrollbar.unwrap();
+        assert_eq!(canvas.cells[scrollbar.up_y * 54 + scrollbar.x].ch, '↑');
+        assert_eq!(canvas.cells[scrollbar.down_y * 54 + scrollbar.x].ch, '↓');
+        assert_eq!(canvas.cells[scrollbar.thumb_y * 54 + scrollbar.x].ch, '█');
+
+        app.handle_key(Key::Mouse {
+            button: 0,
+            x: scrollbar.x as u16,
+            y: scrollbar.up_y as u16,
+            pressed: true,
+        });
+        assert_eq!(app.disk_offset, 3);
+        app.handle_key(Key::Mouse {
+            button: 0,
+            x: scrollbar.x as u16,
+            y: scrollbar.down_y as u16,
+            pressed: true,
+        });
+        assert_eq!(app.disk_offset, 4);
+
+        app.handle_key(Key::Mouse {
+            button: 64,
+            x: 10,
+            y: 5,
+            pressed: true,
+        });
+        assert_eq!(app.disk_offset, 4, "wheel outside storage was ignored");
+    }
+
+    #[test]
+    fn overflowing_disk_io_list_uses_the_same_scroll_viewport() {
+        let mut app = app();
+        app.config.set_value("io_mode", "true");
+        app.sample.memory.disks = (0..6)
+            .map(|index| DiskSample {
+                mount: format!("/io-{index}"),
+                total: 1024 * 1024 * 1024,
+                used: 512 * 1024 * 1024,
+                free: 512 * 1024 * 1024,
+                io_supported: true,
+                ..DiskSample::default()
+            })
+            .collect();
+        let area = Rect::new(0, 0, 80, 12);
+        let mut canvas = Canvas::new(80, 12);
+        draw_memory(&mut canvas, area, &mut app);
+        assert_eq!(app.disk_scrollbar.unwrap().maximum_offset, 4);
+
+        app.handle_key(Key::Mouse {
+            button: 65,
+            x: 60,
+            y: 5,
+            pressed: true,
+        });
+        let mut canvas = Canvas::new(80, 12);
+        draw_memory(&mut canvas, area, &mut app);
+
+        assert_eq!(app.disk_offset, 1);
+        assert!(canvas_text(&canvas).contains("io-1"));
+        assert!(!canvas_text(&canvas).contains("io-0"));
     }
 
     #[test]
