@@ -1,3 +1,8 @@
+#[cfg(all(target_pointer_width = "32", target_env = "musl"))]
+type TimeT = i64;
+#[cfg(not(all(target_pointer_width = "32", target_env = "musl")))]
+type TimeT = std::os::raw::c_long;
+
 pub fn bytes(value: u64, base_10: bool) -> String {
     human_bytes(value, base_10, false)
 }
@@ -195,8 +200,8 @@ pub fn local_clock_format(format: &str) -> String {
         zone: *const c_char,
     }
     unsafe extern "C" {
-        fn time(value: *mut c_long) -> c_long;
-        fn localtime_r(value: *const c_long, result: *mut Tm) -> *mut Tm;
+        fn time(value: *mut TimeT) -> TimeT;
+        fn localtime_r(value: *const TimeT, result: *mut Tm) -> *mut Tm;
         fn strftime(
             output: *mut c_char,
             size: usize,

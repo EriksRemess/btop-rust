@@ -183,11 +183,18 @@ impl DynamicLibrary {
     }
 
     fn symbol<T: Copy>(&self, name: &'static [u8]) -> Option<T> {
-        let pointer = unsafe { dlsym(self.handle, name.as_ptr().cast()) };
+        let name = CStr::from_bytes_with_nul(name).ok()?;
+        if mem::size_of::<T>() != mem::size_of::<*mut c_void>() {
+            return None;
+        }
+        let pointer = unsafe { dlsym(self.handle, name.as_ptr()) };
         if pointer.is_null() {
             None
         } else {
-            debug_assert_eq!(mem::size_of::<T>(), mem::size_of_val(&pointer));
+            // POSIX specifies conversion of a dlsym result to the matching
+            // function-pointer type. The size check above makes the generic
+            // transmute_copy fail closed if a future call site passes any
+            // representation that cannot hold that pointer.
             Some(unsafe { mem::transmute_copy(&pointer) })
         }
     }
@@ -558,6 +565,19 @@ struct RsmiFunctions {
     pcie: RsmiPcie,
 }
 
+struct RsmiInitGuard {
+    shutdown: RsmiShutdown,
+    armed: bool,
+}
+
+impl Drop for RsmiInitGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            unsafe { (self.shutdown)() };
+        }
+    }
+}
+
 struct Rsmi {
     _library: DynamicLibrary,
     functions: RsmiFunctions,
@@ -585,6 +605,13 @@ impl Rsmi {
         if unsafe { init(0) } != RSMI_SUCCESS {
             return None;
         }
+        // Every fallible symbol/version/device check below may return early.
+        // Keep the driver initialized only after ownership has transferred to
+        // the completed Rsmi backend.
+        let mut init_guard = RsmiInitGuard {
+            shutdown,
+            armed: true,
+        };
         let mut version = RsmiVersion {
             major: 0,
             minor: 0,
@@ -592,7 +619,6 @@ impl Rsmi {
             build: ptr::null(),
         };
         if unsafe { version_get(&mut version) } != RSMI_SUCCESS {
-            unsafe { shutdown() };
             return None;
         }
         let effective_major = if version.major == 1 {
@@ -609,7 +635,6 @@ impl Rsmi {
         };
         let clock_pointer = unsafe { dlsym(library.handle, c"rsmi_dev_gpu_clk_freq_get".as_ptr()) };
         if clock_pointer.is_null() {
-            unsafe { shutdown() };
             return None;
         }
         let clock = match effective_major {
@@ -620,7 +645,6 @@ impl Rsmi {
                 RsmiClock::V6(unsafe { mem::transmute::<*mut c_void, RsmiClockV6>(clock_pointer) })
             }
             _ => {
-                unsafe { shutdown() };
                 return None;
             }
         };
@@ -639,7 +663,6 @@ impl Rsmi {
         };
         let mut count = 0;
         if unsafe { get_count(&mut count) } != RSMI_SUCCESS || count == 0 {
-            unsafe { shutdown() };
             return None;
         }
         let mut names = Vec::with_capacity(count as usize);
@@ -678,6 +701,7 @@ impl Rsmi {
             .into_iter()
             .map(|sample| sample.support)
             .collect();
+        init_guard.armed = false;
         Some(backend)
     }
 
@@ -1154,6 +1178,43 @@ unsafe extern "C" {
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static SHUTDOWN_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn record_rsmi_shutdown() -> RsmiStatus {
+        SHUTDOWN_CALLS.fetch_add(1, Ordering::Relaxed);
+        RSMI_SUCCESS
+    }
+
+    #[test]
+    fn dynamic_symbols_reject_invalid_names_and_representations() {
+        let library = DynamicLibrary {
+            handle: ptr::null_mut(),
+        };
+        assert!(library.symbol::<usize>(b"missing-nul").is_none());
+        assert!(library.symbol::<[usize; 2]>(b"symbol\0").is_none());
+    }
+
+    #[test]
+    fn partial_rsmi_initialization_always_shuts_down() {
+        SHUTDOWN_CALLS.store(0, Ordering::Relaxed);
+        {
+            let _guard = RsmiInitGuard {
+                shutdown: record_rsmi_shutdown,
+                armed: true,
+            };
+        }
+        assert_eq!(SHUTDOWN_CALLS.load(Ordering::Relaxed), 1);
+
+        {
+            let _guard = RsmiInitGuard {
+                shutdown: record_rsmi_shutdown,
+                armed: false,
+            };
+        }
+        assert_eq!(SHUTDOWN_CALLS.load(Ordering::Relaxed), 1);
+    }
 
     #[test]
     fn cleans_nvidia_brand_like_reference() {

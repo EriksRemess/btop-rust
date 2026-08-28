@@ -138,7 +138,7 @@ fn processor_ticks() -> Result<Vec<CpuTicks>, String> {
     let values = unsafe { std::slice::from_raw_parts(info, info_count as usize) };
     let mut aggregate = CpuTicks::default();
     let mut cores = Vec::with_capacity(cpu_count as usize + 1);
-    for values in values.chunks_exact(4).take(cpu_count as usize) {
+    for values in values.as_chunks::<4>().0.iter().take(cpu_count as usize) {
         let user = values[CPU_STATE_USER].max(0) as u64;
         let nice = values[CPU_STATE_NICE].max(0) as u64;
         let system = values[CPU_STATE_SYSTEM].max(0) as u64;
@@ -367,13 +367,18 @@ fn io_registry_property(entry: u32, key: &str) -> Option<*const c_void> {
 
 fn io_registry_bool(entry: u32, key: &str) -> Option<bool> {
     let value = io_registry_property(entry, key)?;
-    let result = unsafe { CFBooleanGetValue(value) };
+    let result =
+        unsafe { cf_is_type(value, CFBooleanGetTypeID()).then(|| CFBooleanGetValue(value)) };
     unsafe { CFRelease(value) };
-    Some(result)
+    result
 }
 
 fn io_registry_string(entry: u32, key: &str) -> Option<String> {
     let value = io_registry_property(entry, key)?;
+    if unsafe { !cf_is_type(value, CFStringGetTypeID()) } {
+        unsafe { CFRelease(value) };
+        return None;
+    }
     let mut buffer = [0_i8; 1024];
     let success = unsafe {
         CFStringGetCString(
@@ -839,20 +844,18 @@ fn read_battery() -> Option<BatterySample> {
 }
 
 unsafe fn cf_dictionary_i32(dictionary: *const c_void, key: &str) -> Option<i32> {
-    let key = CString::new(key).ok()?;
-    let cf_key = unsafe { CFStringCreateWithCString(ptr::null(), key.as_ptr(), 0x0800_0100) };
-    if cf_key.is_null() {
+    let value = unsafe { cf_dictionary_value(dictionary, key) }?;
+    if unsafe { !cf_is_type(value, CFNumberGetTypeID()) } {
         return None;
     }
-    let value = unsafe { CFDictionaryGetValue(dictionary, cf_key) };
     let mut result = 0_i32;
-    let success =
-        !value.is_null() && unsafe { CFNumberGetValue(value, 3, (&mut result as *mut i32).cast()) };
-    unsafe { CFRelease(cf_key) };
-    success.then_some(result)
+    unsafe { CFNumberGetValue(value, 3, (&mut result as *mut i32).cast()) }.then_some(result)
 }
 
 unsafe fn cf_dictionary_value(dictionary: *const c_void, key: &str) -> Option<*const c_void> {
+    if unsafe { !cf_is_type(dictionary, CFDictionaryGetTypeID()) } {
+        return None;
+    }
     let key = CString::new(key).ok()?;
     let cf_key = unsafe { CFStringCreateWithCString(ptr::null(), key.as_ptr(), 0x0800_0100) };
     if cf_key.is_null() {
@@ -865,20 +868,20 @@ unsafe fn cf_dictionary_value(dictionary: *const c_void, key: &str) -> Option<*c
 
 unsafe fn cf_dictionary_i64(dictionary: *const c_void, key: &str) -> Option<i64> {
     let value = unsafe { cf_dictionary_value(dictionary, key) }?;
+    if unsafe { !cf_is_type(value, CFNumberGetTypeID()) } {
+        return None;
+    }
     let mut result = 0_i64;
     unsafe { CFNumberGetValue(value, 4, (&mut result as *mut i64).cast()) }.then_some(result)
 }
 
 unsafe fn cf_dictionary_bool(dictionary: *const c_void, key: &str) -> Option<bool> {
-    let key = CString::new(key).ok()?;
-    let cf_key = unsafe { CFStringCreateWithCString(ptr::null(), key.as_ptr(), 0x0800_0100) };
-    if cf_key.is_null() {
-        return None;
-    }
-    let value = unsafe { CFDictionaryGetValue(dictionary, cf_key) };
-    let result = (!value.is_null()).then(|| unsafe { CFBooleanGetValue(value) });
-    unsafe { CFRelease(cf_key) };
-    result
+    let value = unsafe { cf_dictionary_value(dictionary, key) }?;
+    unsafe { cf_is_type(value, CFBooleanGetTypeID()).then(|| CFBooleanGetValue(value)) }
+}
+
+unsafe fn cf_is_type(value: *const c_void, expected: usize) -> bool {
+    !value.is_null() && unsafe { CFGetTypeID(value) == expected }
 }
 
 fn sysctl_string(name: &str) -> Option<String> {
@@ -1257,6 +1260,11 @@ unsafe extern "C" {
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
     fn CFRelease(value: *const c_void);
+    fn CFGetTypeID(value: *const c_void) -> usize;
+    fn CFBooleanGetTypeID() -> usize;
+    fn CFDictionaryGetTypeID() -> usize;
+    fn CFNumberGetTypeID() -> usize;
+    fn CFStringGetTypeID() -> usize;
     fn CFArrayGetCount(array: *const c_void) -> isize;
     fn CFArrayGetValueAtIndex(array: *const c_void, index: isize) -> *const c_void;
     fn CFDictionaryGetValue(dictionary: *const c_void, key: *const c_void) -> *const c_void;

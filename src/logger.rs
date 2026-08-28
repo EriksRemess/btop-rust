@@ -7,6 +7,13 @@ use std::sync::{Mutex, OnceLock};
 
 const ONE_MEBIBYTE: u64 = 1024 * 1024;
 
+// musl switched 32-bit targets to a 64-bit time_t while c_long remains
+// 32-bit. Other currently supported Unix targets use c_long for time_t.
+#[cfg(all(target_pointer_width = "32", target_env = "musl"))]
+type TimeT = i64;
+#[cfg(not(all(target_pointer_width = "32", target_env = "musl")))]
+type TimeT = c_long;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Level {
     Disabled,
@@ -149,8 +156,8 @@ struct Tm {
 
 fn utc_timestamp() -> String {
     unsafe extern "C" {
-        fn time(value: *mut c_long) -> c_long;
-        fn gmtime_r(value: *const c_long, result: *mut Tm) -> *mut Tm;
+        fn time(value: *mut TimeT) -> TimeT;
+        fn gmtime_r(value: *const TimeT, result: *mut Tm) -> *mut Tm;
         fn strftime(
             output: *mut c_char,
             size: usize,

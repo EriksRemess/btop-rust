@@ -110,8 +110,10 @@ unsafe extern "C" {
 
 struct CrashTermios(UnsafeCell<MaybeUninit<Termios>>);
 
-// The crash handler is the only reader, and signals cannot run concurrently on
-// the same thread. CRASH_TERMIOS_READY publishes the completed copy.
+// enter() is the only writer and runs before collector worker threads exist.
+// Once CRASH_TERMIOS_READY publishes the completed copy it remains immutable;
+// a fatal signal may read it from any thread, and swap(false) admits only one
+// reader before the next enter().
 unsafe impl Sync for CrashTermios {}
 
 static CRASH_TERMIOS: CrashTermios = CrashTermios(UnsafeCell::new(MaybeUninit::uninit()));

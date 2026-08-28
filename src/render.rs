@@ -3420,11 +3420,7 @@ fn draw_inline_swap_header(
     if area.h.saturating_sub(cy) > 6 {
         if graph_height > 0 {
             let y = area.y + 1 + cy;
-            canvas.put(area.x, y, '├', theme::MEM_BOX);
-            for x in area.x + 1..divider {
-                canvas.put(x, y, '─', theme::BOX);
-            }
-            canvas.put(divider, y, '┤', theme::MEM_BOX);
+            draw_memory_divider(canvas, area, divider, y);
         }
         cy += 1;
     }
@@ -3438,6 +3434,19 @@ fn draw_inline_swap_header(
         theme::TITLE,
     );
     Some(cy + 1)
+}
+
+fn draw_memory_divider(canvas: &mut Canvas, area: Rect, divider: usize, y: usize) {
+    canvas.put(area.x, y, '├', theme::MEM_BOX);
+    for x in area.x + 1..divider {
+        canvas.put(x, y, '─', theme::BOX);
+    }
+    let right_style = if divider < area.x + area.w.saturating_sub(1) {
+        theme::BOX
+    } else {
+        theme::MEM_BOX
+    };
+    canvas.put(divider, y, '┤', right_style);
 }
 
 fn draw_memory(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
@@ -3646,11 +3655,7 @@ fn draw_memory(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
         }
         if cy < area.h - 2 {
             let y = area.y + 1 + cy;
-            canvas.put(area.x, y, '├', theme::MEM_BOX);
-            for x in area.x + 1..divider {
-                canvas.put(x, y, '─', theme::BOX);
-            }
-            canvas.put(divider, y, '┤', theme::MEM_BOX);
+            draw_memory_divider(canvas, area, divider, y);
         }
     } else {
         for (title, value, basis, history, style, swap_start) in entries {
@@ -3672,11 +3677,7 @@ fn draw_memory(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
                 break;
             }
             let y = area.y + 1 + cy;
-            canvas.put(area.x, y, '├', theme::MEM_BOX);
-            for x in area.x + 1..divider {
-                canvas.put(x, y, '─', theme::BOX);
-            }
-            canvas.put(divider, y, '┤', theme::MEM_BOX);
+            draw_memory_divider(canvas, area, divider, y);
             let human = units::bytes_spaced(value, app.config.base_10_sizes);
             canvas.text(area.x + 2, y, &format!("{title}:"), theme::MAIN);
             canvas.text_preserve_spaces(
@@ -3726,11 +3727,7 @@ fn draw_memory(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
         }
         if use_graphs && cy < area.h - 2 {
             let separator_y = area.y + 1 + cy;
-            canvas.put(area.x, separator_y, '├', theme::MEM_BOX);
-            for x in area.x + 1..divider {
-                canvas.put(x, separator_y, '─', theme::BOX);
-            }
-            canvas.put(divider, separator_y, '┤', theme::MEM_BOX);
+            draw_memory_divider(canvas, area, divider, separator_y);
         }
     }
     if show_disks {
@@ -4600,6 +4597,13 @@ fn matches_process_filter(process: &ProcessSample, filter: &str) -> bool {
         || process.user.to_ascii_lowercase().contains(&filter)
 }
 
+const POSIX_REGEX_STORAGE_BYTES: usize = 1024;
+
+// regex_t is opaque here to keep the crate dependency-free. Supported libcs
+// use pointer alignment and only a small fraction of this storage.
+#[repr(C, align(16))]
+struct PosixRegexStorage([u8; POSIX_REGEX_STORAGE_BYTES]);
+
 fn posix_regex_matches(pattern: &str, value: &str, whole: bool) -> bool {
     use std::ffi::CString;
     use std::os::raw::{c_char, c_int, c_void};
@@ -4626,9 +4630,7 @@ fn posix_regex_matches(pattern: &str, value: &str, whole: bool) -> bool {
     let (Ok(pattern), Ok(value)) = (CString::new(pattern), CString::new(value)) else {
         return false;
     };
-    // regex_t is opaque to Rust. This aligned storage is larger than regex_t
-    // on every Linux libc target supported by this port.
-    let mut regex = [0usize; 128];
+    let mut regex = std::mem::MaybeUninit::<PosixRegexStorage>::zeroed();
     let regex_ptr = regex.as_mut_ptr().cast::<c_void>();
     if unsafe { regcomp(regex_ptr, pattern.as_ptr(), REG_EXTENDED | REG_NOSUB) } != 0 {
         return false;
@@ -8631,8 +8633,8 @@ mod tests {
             actual,
             [
                 2_770_106_502_089_868_106,
-                18_097_391_836_841_027_499,
-                14_449_041_907_813_186_248,
+                10_351_852_488_876_681_533,
+                9_364_860_840_329_026_809,
             ]
         );
     }
@@ -9757,6 +9759,21 @@ mod tests {
         assert!(output.contains("▲1.0M"));
         assert!(output.contains("▼2.0M"));
         assert!(output.contains("IO%"));
+    }
+
+    #[test]
+    fn memory_separator_keeps_the_internal_junction_in_div_line_color() {
+        let mut canvas = Canvas::new(80, 10);
+        let area = Rect::new(0, 0, 80, 10);
+
+        draw_memory_divider(&mut canvas, area, 40, 3);
+
+        assert_eq!(canvas.cells[3 * 80].style, theme::MEM_BOX);
+        assert_eq!(canvas.cells[3 * 80 + 1].style, theme::BOX);
+        assert_eq!(canvas.cells[3 * 80 + 40].style, theme::BOX);
+
+        draw_memory_divider(&mut canvas, area, 79, 5);
+        assert_eq!(canvas.cells[5 * 80 + 79].style, theme::MEM_BOX);
     }
 
     #[test]
