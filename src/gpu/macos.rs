@@ -425,31 +425,30 @@ fn thermal_sensors() -> Vec<(String, f64)> {
         let services = IOHIDEventSystemClientCopyServices(client);
         let mut result = Vec::new();
         if !services.is_null() {
-            let product_key = cf_string("Product");
-            for index in 0..CFArrayGetCount(services) {
-                let service = CFArrayGetValueAtIndex(services, index);
-                if service.is_null() || product_key.is_none() {
-                    continue;
-                }
-                let property = IOHIDServiceClientCopyProperty(service, product_key.unwrap());
-                let event = IOHIDServiceClientCopyEvent(service, HID_EVENT_TEMPERATURE, 0, 0);
-                if !property.is_null() && !event.is_null() {
-                    let name = cf_string_value(property);
-                    let value =
-                        IOHIDEventGetFloatValue(event, (HID_EVENT_TEMPERATURE << 16) as i32);
-                    if !name.is_empty() && value > 0.0 && value < 150.0 {
-                        result.push((name, value));
+            if let Some(product_key) = cf_string("Product") {
+                for index in 0..CFArrayGetCount(services) {
+                    let service = CFArrayGetValueAtIndex(services, index);
+                    if service.is_null() {
+                        continue;
+                    }
+                    let property = IOHIDServiceClientCopyProperty(service, product_key);
+                    let event = IOHIDServiceClientCopyEvent(service, HID_EVENT_TEMPERATURE, 0, 0);
+                    if !property.is_null() && !event.is_null() {
+                        let name = cf_string_value(property);
+                        let value =
+                            IOHIDEventGetFloatValue(event, (HID_EVENT_TEMPERATURE << 16) as i32);
+                        if !name.is_empty() && value > 0.0 && value < 150.0 {
+                            result.push((name, value));
+                        }
+                    }
+                    if !property.is_null() {
+                        CFRelease(property);
+                    }
+                    if !event.is_null() {
+                        CFRelease(event);
                     }
                 }
-                if !property.is_null() {
-                    CFRelease(property);
-                }
-                if !event.is_null() {
-                    CFRelease(event);
-                }
-            }
-            if let Some(key) = product_key {
-                CFRelease(key);
+                CFRelease(product_key);
             }
             CFRelease(services);
         }

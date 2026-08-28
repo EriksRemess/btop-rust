@@ -33,6 +33,12 @@ fn state() -> &'static Mutex<State> {
     })
 }
 
+fn lock_state() -> std::sync::MutexGuard<'static, State> {
+    state()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 pub fn init() {
     let Some(path) = log_path() else {
         return;
@@ -42,7 +48,7 @@ pub fn init() {
     {
         return;
     }
-    state().lock().unwrap().path = Some(path);
+    lock_state().path = Some(path);
 }
 
 pub fn set_level(level: &str, debug: bool) {
@@ -58,7 +64,7 @@ pub fn set_level(level: &str, debug: bool) {
             _ => Level::Warning,
         }
     };
-    state().lock().unwrap().level = level;
+    lock_state().level = level;
 }
 
 pub fn error(message: &str) {
@@ -78,7 +84,7 @@ pub fn debug(message: &str) {
 }
 
 fn write(level: Level, message: &str) {
-    let mut state = state().lock().unwrap();
+    let mut state = lock_state();
     if level == Level::Disabled || state.level < level {
         return;
     }
@@ -94,16 +100,19 @@ fn write(level: Level, message: &str) {
         if fs::rename(&path, old).is_err() {
             return;
         }
+        state.wrote_header = false;
     }
     let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) else {
         return;
     };
-    if !state.wrote_header {
-        let _ = writeln!(
+    if (!state.wrote_header || file.metadata().is_ok_and(|metadata| metadata.len() == 0))
+        && writeln!(
             file,
             "\n===> btoprs v{} (based on BTOP++ v1.4.7)",
             env!("CARGO_PKG_VERSION")
-        );
+        )
+        .is_ok()
+    {
         state.wrote_header = true;
     }
     let name = match level {
@@ -168,6 +177,7 @@ fn utc_timestamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn utc_log_timestamp_has_reference_shape() {
@@ -175,5 +185,38 @@ mod tests {
         assert_eq!(timestamp.len(), 19);
         assert_eq!(&timestamp[4..5], "-");
         assert_eq!(&timestamp[10..11], "T");
+    }
+
+    #[test]
+    fn rotated_log_starts_with_a_fresh_header() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("btoprs-log-{}-{suffix}", std::process::id()));
+        fs::write(&path, vec![b'x'; ONE_MEBIBYTE as usize + 1]).unwrap();
+
+        let previous = {
+            let mut state = lock_state();
+            std::mem::replace(
+                &mut *state,
+                State {
+                    level: Level::Info,
+                    path: Some(path.clone()),
+                    wrote_header: true,
+                },
+            )
+        };
+        write(Level::Info, "after rotation");
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("===> btoprs v"));
+        assert!(contents.contains("INFO: after rotation"));
+        let old_path =
+            path.with_file_name(format!("{}.1", path.file_name().unwrap().to_string_lossy()));
+        assert!(old_path.exists());
+
+        *lock_state() = previous;
+        let _ = fs::remove_file(old_path);
+        let _ = fs::remove_file(path);
     }
 }

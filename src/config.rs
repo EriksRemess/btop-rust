@@ -234,7 +234,7 @@ impl Config {
 
     pub fn apply_cli(&mut self, cli: &Cli) {
         if let Some(update_ms) = cli.update_ms {
-            self.update_ms = update_ms;
+            self.update_ms = update_ms.clamp(100, 86_400_000);
         }
         if let Some(filter) = &cli.filter {
             self.process_filter.clone_from(filter);

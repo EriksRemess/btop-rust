@@ -694,7 +694,7 @@ fn collect_memory(
             .next()
             .and_then(|v| v.parse::<u64>().ok())
         {
-            values.insert(key, number * 1024);
+            values.insert(key, number.saturating_mul(1024));
         }
     }
     let total = values.get("MemTotal").copied().unwrap_or(0);
@@ -1495,7 +1495,9 @@ fn interface_ipv4(iface: &str) -> Option<String> {
             let name = unsafe { std::ffi::CStr::from_ptr(address.name) }.to_string_lossy();
             let socket = unsafe { &*address.address };
             if name == iface && socket.family == AF_INET {
-                let ipv4 = unsafe { &*(address.address.cast::<SockAddrIn>()) };
+                // getifaddrs does not promise alignment for the concrete
+                // sockaddr type behind this pointer.
+                let ipv4 = unsafe { ptr::read_unaligned(address.address.cast::<SockAddrIn>()) };
                 let bytes = ipv4.address.to_ne_bytes();
                 result = Some(format!(
                     "{}.{}.{}.{}",
@@ -1789,9 +1791,9 @@ fn stat_vfs(path: &Path) -> Option<(u64, u64, u64)> {
     }
     let fragment = u64::from(stats.fragment_size);
     Some((
-        u64::from(stats.blocks) * fragment,
-        u64::from(stats.blocks_free) * fragment,
-        u64::from(stats.blocks_available) * fragment,
+        u64::from(stats.blocks).saturating_mul(fragment),
+        u64::from(stats.blocks_free).saturating_mul(fragment),
+        u64::from(stats.blocks_available).saturating_mul(fragment),
     ))
 }
 

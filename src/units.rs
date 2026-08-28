@@ -12,12 +12,12 @@ pub fn bytes_short(value: u64, base_10: bool) -> String {
 
 fn human_bytes(value: u64, base_10: bool, shorten: bool) -> String {
     let units = if base_10 {
-        ["Byte", "kB", "MB", "GB", "TB", "PB"]
+        ["Byte", "kB", "MB", "GB", "TB", "PB", "EB"]
     } else {
-        ["Byte", "KiB", "MiB", "GiB", "TiB", "PiB"]
+        ["Byte", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"]
     };
-    let base = if base_10 { 1000 } else { 1024 };
-    let mut value = value.saturating_mul(100);
+    let base: u128 = if base_10 { 1000 } else { 1024 };
+    let mut value = u128::from(value) * 100;
     let mut unit = 0;
     while value >= base * 100 && unit + 1 < units.len() {
         value /= base;
@@ -62,8 +62,8 @@ pub fn bits_per_second(bytes_per_second: u64, base_10: bool) -> String {
     } else {
         ["bit", "Kib", "Mib", "Gib", "Tib", "Pib", "Eib"]
     };
-    let base = if base_10 { 1000 } else { 1024 };
-    let mut value = bytes_per_second.saturating_mul(800);
+    let base: u128 = if base_10 { 1000 } else { 1024 };
+    let mut value = u128::from(bytes_per_second) * 800;
     let mut unit = 0;
     while value >= base * 100 && unit < units.len() - 1 {
         value /= base;
@@ -235,6 +235,14 @@ mod tests {
         assert_eq!(bits_per_second(1_000, true), "8.00 kbps");
         assert_eq!(bits_per_second(36 * 1_024, false), "288 Kibps");
         assert_eq!(bits_per_second(1_875_000, false), "14.3 Mibps");
+    }
+
+    #[test]
+    fn humanizers_do_not_overflow_at_u64_scale() {
+        assert_eq!(bytes(u64::MAX, false), "15.9 EiB");
+        assert_eq!(bytes(u64::MAX, true), "18 EB");
+        assert_eq!(bytes_short(u64::MAX, false), "16E");
+        assert_eq!(bits_per_second(u64::MAX, false), "127 Eibps");
     }
 
     #[test]

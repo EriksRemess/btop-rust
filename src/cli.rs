@@ -1,5 +1,8 @@
 use std::path::PathBuf;
 
+const MIN_UPDATE_MS: u64 = 100;
+const MAX_UPDATE_MS: u64 = 86_400_000;
+
 #[derive(Debug, Clone)]
 pub enum Action {
     Help,
@@ -67,7 +70,7 @@ impl Cli {
                         value
                             .parse::<u64>()
                             .map_err(|_| "Update must be a positive number")?
-                            .max(100),
+                            .clamp(MIN_UPDATE_MS, MAX_UPDATE_MS),
                     );
                 }
                 _ => return Err(format!("Unknown argument '\x1b[33m{arg}\x1b[0m'")),
@@ -127,4 +130,18 @@ pub fn print_usage() {
     println!(
         "  \x1b[1m-V, --version\x1b[0m           Show a version message and exit (more with --version)"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_interval_is_bounded_before_it_reaches_instant_arithmetic() {
+        let minimum = Cli::parse(["--update".into(), "1".into()]).unwrap();
+        assert_eq!(minimum.update_ms, Some(MIN_UPDATE_MS));
+
+        let maximum = Cli::parse(["--update".into(), u64::MAX.to_string()]).unwrap();
+        assert_eq!(maximum.update_ms, Some(MAX_UPDATE_MS));
+    }
 }

@@ -32,8 +32,8 @@ clock data. Stable
 
 ## Verification gate
 
-- 112 regular unit, fixture, menu and mouse tests pass on macOS, with one
-  additional opt-in live macOS collector test.
+- The regular unit, fixture, menu and mouse suite passes on Linux and macOS,
+  with an additional opt-in live macOS collector test.
 - The opt-in live-NVML test passes on the installed RTX A4000.
 - `cargo clippy --all-targets -- -D warnings` and the release build pass.
 - Help and default-config output match btop byte-for-byte.

@@ -402,8 +402,16 @@ fn io_registry_disk_statistics(entry: u32) -> Option<(u64, u64)> {
     let statistics = unsafe { cf_dictionary_value(properties, "Statistics") };
     let result = statistics.and_then(|statistics| unsafe {
         Some((
-            cf_dictionary_i64(statistics, "Bytes read from block device")? as u64,
-            cf_dictionary_i64(statistics, "Bytes written to block device")? as u64,
+            u64::try_from(cf_dictionary_i64(
+                statistics,
+                "Bytes read from block device",
+            )?)
+            .ok()?,
+            u64::try_from(cf_dictionary_i64(
+                statistics,
+                "Bytes written to block device",
+            )?)
+            .ok()?,
         ))
     });
     unsafe { CFRelease(properties) };
@@ -433,15 +441,16 @@ pub(super) fn collect_network(
             let entry = found.entry(name).or_default();
             entry.connected |= address.flags & IFF_RUNNING != 0;
             if !address.data.is_null() {
-                let data = unsafe { &*address.data.cast::<IfData>() };
+                let data = unsafe { ptr::read_unaligned(address.data.cast::<IfData>()) };
                 entry.received = u64::from(data.bytes_received);
                 entry.transmitted = u64::from(data.bytes_transmitted);
             }
             if !address.address.is_null() {
-                let socket = unsafe { &*address.address };
+                let socket = unsafe { ptr::read_unaligned(address.address) };
                 match socket.family {
                     AF_INET if entry.ipv4.is_none() => {
-                        let socket = unsafe { &*address.address.cast::<SockAddrIn>() };
+                        let socket =
+                            unsafe { ptr::read_unaligned(address.address.cast::<SockAddrIn>()) };
                         let bytes = socket.address.to_ne_bytes();
                         entry.ipv4 = Some(format!(
                             "{}.{}.{}.{}",
@@ -449,7 +458,8 @@ pub(super) fn collect_network(
                         ));
                     }
                     AF_INET6 if entry.ipv6.is_none() => {
-                        let socket = unsafe { &*address.address.cast::<SockAddrIn6>() };
+                        let socket =
+                            unsafe { ptr::read_unaligned(address.address.cast::<SockAddrIn6>()) };
                         entry.ipv6 = Some(Ipv6Addr::from(socket.address).to_string());
                     }
                     _ => {}
@@ -1029,6 +1039,7 @@ struct IfAddrs {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct SockAddr {
     length: u8,
     family: u8,
@@ -1036,6 +1047,7 @@ struct SockAddr {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct SockAddrIn {
     length: u8,
     family: u8,
@@ -1045,6 +1057,7 @@ struct SockAddrIn {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct SockAddrIn6 {
     length: u8,
     family: u8,
@@ -1055,6 +1068,7 @@ struct SockAddrIn6 {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct IfData {
     kind: u8,
     type_length: u8,

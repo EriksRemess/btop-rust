@@ -289,8 +289,9 @@ fn run() -> Result<u8, String> {
             match terminal.read_key(wait)? {
                 Some(key) => {
                     if key == terminal::Key::CtrlR {
-                        let _ = app.config.reload();
-                        app.config.apply_cli(&cli);
+                        if let Err(error) = reload_config(&mut app.config, &cli) {
+                            logger::warning(&format!("Could not reload configuration: {error}"));
+                        }
                         terminal
                             .apply_settings(!app.config.disable_mouse, app.config.terminal_sync)?;
                         app.needs_redraw = true;
@@ -323,12 +324,24 @@ fn run() -> Result<u8, String> {
         }
     };
     terminal.leave()?;
-    let _ = app.config.save();
     logger::info(&format!(
         "Quitting! Runtime: {}",
         units::duration(runtime_started.elapsed().as_secs())
     ));
+    app.config
+        .save()
+        .map_err(|error| format!("could not save configuration: {error}"))?;
     Ok(exit_code)
+}
+
+fn reload_config(config: &mut Config, cli: &Cli) -> Result<(), String> {
+    // Load into a temporary copy so a malformed or unreadable file cannot
+    // partially replace the live settings.
+    let mut reloaded = config.clone();
+    reloaded.reload()?;
+    reloaded.apply_cli(cli);
+    *config = reloaded;
+    Ok(())
 }
 
 fn ensure_utf8_locale(force: bool) -> Result<(), String> {
@@ -391,8 +404,9 @@ fn handle_pending_signals(
     }
     let mut redraw = pending & SIGNAL_REDRAW != 0;
     if pending & SIGNAL_RELOAD != 0 {
-        let _ = app.config.reload();
-        app.config.apply_cli(cli);
+        if let Err(error) = reload_config(&mut app.config, cli) {
+            logger::warning(&format!("Could not reload configuration: {error}"));
+        }
         terminal.apply_settings(!app.config.disable_mouse, app.config.terminal_sync)?;
         redraw = true;
     }

@@ -8176,13 +8176,7 @@ impl Canvas {
         for ch in text.chars() {
             let width = units::char_width(ch);
             if width == 0 {
-                if x > 0 && y < self.height {
-                    let mut index = y * self.width + x - 1;
-                    if self.cells[index].continuation && x > 1 {
-                        index -= 1;
-                    }
-                    self.cells[index].combining.push(ch);
-                }
+                self.append_combining(x, y, ch);
                 continue;
             }
             if x + width > self.width {
@@ -8207,13 +8201,7 @@ impl Canvas {
         for ch in text.chars() {
             let width = units::char_width(ch);
             if width == 0 {
-                if x > 0 && y < self.height {
-                    let mut index = y * self.width + x - 1;
-                    if self.cells[index].continuation && x > 1 {
-                        index -= 1;
-                    }
-                    self.cells[index].combining.push(ch);
-                }
+                self.append_combining(x, y, ch);
                 continue;
             }
             if x + width > self.width {
@@ -8238,9 +8226,7 @@ impl Canvas {
         for ch in text.chars() {
             let width = units::char_width(ch);
             if width == 0 {
-                if x > 0 && y < self.height {
-                    self.cells[y * self.width + x - 1].combining.push(ch);
-                }
+                self.append_combining(x, y, ch);
                 continue;
             }
             if x + width > self.width {
@@ -8265,9 +8251,7 @@ impl Canvas {
         for ch in text.chars() {
             let width = units::char_width(ch);
             if width == 0 {
-                if x > 0 && y < self.height {
-                    self.cells[y * self.width + x - 1].combining.push(ch);
-                }
+                self.append_combining(x, y, ch);
                 continue;
             }
             if x + width > self.width {
@@ -8301,6 +8285,16 @@ impl Canvas {
             next.combining.clear();
             next.continuation = false;
         }
+    }
+    fn append_combining(&mut self, x: usize, y: usize, ch: char) {
+        if x == 0 || x > self.width || y >= self.height {
+            return;
+        }
+        let mut index = y * self.width + x - 1;
+        if self.cells[index].continuation && x > 1 {
+            index -= 1;
+        }
+        self.cells[index].combining.push(ch);
     }
     fn control_title(
         &mut self,
@@ -8421,13 +8415,7 @@ impl Canvas {
         for ch in text.chars() {
             let width = units::char_width(ch);
             if width == 0 {
-                if x > 0 && y < self.height {
-                    let mut index = y * self.width + x - 1;
-                    if self.cells[index].continuation && x > 1 {
-                        index -= 1;
-                    }
-                    self.cells[index].combining.push(ch);
-                }
+                self.append_combining(x, y, ch);
                 continue;
             }
             if x + width > self.width {
@@ -8449,9 +8437,7 @@ impl Canvas {
         for ch in text.chars() {
             let width = units::char_width(ch);
             if width == 0 {
-                if x > 0 && y < self.height {
-                    self.cells[y * self.width + x - 1].combining.push(ch);
-                }
+                self.append_combining(x, y, ch);
                 continue;
             }
             if x + width > self.width {
@@ -8596,6 +8582,22 @@ mod tests {
         frame.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
             (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
         })
+    }
+
+    #[test]
+    fn combining_marks_attach_once_to_the_leading_cell() {
+        let mut canvas = Canvas::new(4, 1);
+        canvas.text_bold(0, 0, "a\u{301}", theme::MAIN);
+        assert_eq!(canvas.cells[0].combining, "\u{301}");
+
+        canvas.text_italic(1, 0, "界\u{301}", theme::MAIN);
+        assert_eq!(canvas.cells[1].combining, "\u{301}");
+        assert!(canvas.cells[2].continuation);
+        assert!(canvas.cells[2].combining.is_empty());
+
+        // A clipped label can begin outside the canvas; its combining mark
+        // must be ignored instead of indexing beyond the row.
+        canvas.text_preserve_spaces_bold(8, 0, "\u{301}", theme::MAIN);
     }
 
     #[test]

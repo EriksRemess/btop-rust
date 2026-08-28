@@ -220,19 +220,31 @@ impl Terminal {
             (*CRASH_TERMIOS.0.get()).write(original);
         }
         CRASH_TERMIOS_READY.store(true, Ordering::SeqCst);
-        print!("\x1b[?1049h\x1b[?25l\x1b[?7l");
-        if mouse_enabled {
-            print!("\x1b[?1002h\x1b[?1015h\x1b[?1006h");
-        }
-        print!("\x1b[2J\x1b[H");
-        io::stdout().flush().map_err(|e| e.to_string())?;
-        Ok(Self {
+        let mut terminal = Self {
             original,
             active: true,
             pending: Vec::new(),
             mouse_enabled,
             synchronized,
-        })
+        };
+        let output_result = (|| -> io::Result<()> {
+            let mut stdout = io::stdout().lock();
+            stdout.write_all(b"\x1b[?1049h\x1b[?25l\x1b[?7l")?;
+            if mouse_enabled {
+                stdout.write_all(b"\x1b[?1002h\x1b[?1015h\x1b[?1006h")?;
+            }
+            stdout.write_all(b"\x1b[2J\x1b[H")?;
+            stdout.flush()
+        })();
+        if let Err(error) = output_result {
+            // Restore both the display modes and termios. If cleanup itself
+            // fails, Drop retains an active Terminal and makes another pass.
+            return match terminal.leave() {
+                Ok(()) => Err(error.to_string()),
+                Err(cleanup) => Err(format!("{error}; terminal cleanup also failed: {cleanup}")),
+            };
+        }
+        Ok(terminal)
     }
 
     pub fn size(&self) -> Result<Size, String> {
@@ -251,21 +263,24 @@ impl Terminal {
 
     pub fn draw(&mut self, frame: &str) -> Result<(), String> {
         let mut stdout = io::stdout().lock();
-        if self.synchronized {
-            stdout
-                .write_all(b"\x1b[?2026h")
-                .map_err(|e| e.to_string())?;
+        let result = (|| -> io::Result<()> {
+            if self.synchronized {
+                stdout.write_all(b"\x1b[?2026h")?;
+            }
+            stdout.write_all(b"\x1b[H")?;
+            stdout.write_all(frame.as_bytes())?;
+            if self.synchronized {
+                stdout.write_all(b"\x1b[?2026l")?;
+            }
+            stdout.flush()
+        })();
+        if result.is_err() && self.synchronized {
+            // Do not knowingly leave a terminal in a synchronized-update
+            // transaction if a frame write fails part-way through.
+            let _ = stdout.write_all(b"\x1b[?2026l");
+            let _ = stdout.flush();
         }
-        stdout.write_all(b"\x1b[H").map_err(|e| e.to_string())?;
-        stdout
-            .write_all(frame.as_bytes())
-            .map_err(|e| e.to_string())?;
-        if self.synchronized {
-            stdout
-                .write_all(b"\x1b[?2026l")
-                .map_err(|e| e.to_string())?;
-        }
-        stdout.flush().map_err(|e| e.to_string())
+        result.map_err(|error| error.to_string())
     }
 
     pub fn apply_settings(
@@ -274,12 +289,20 @@ impl Terminal {
         synchronized: bool,
     ) -> Result<(), String> {
         if self.mouse_enabled != mouse_enabled {
-            if mouse_enabled {
-                print!("\x1b[?1002h\x1b[?1015h\x1b[?1006h");
+            let sequence = if mouse_enabled {
+                // Record the conservative state before writing: even a failed
+                // write may have enabled one or more mouse protocols, and
+                // leave() must disable them again.
+                self.mouse_enabled = true;
+                b"\x1b[?1002h\x1b[?1015h\x1b[?1006h".as_slice()
             } else {
-                print!("\x1b[?1002l\x1b[?1015l\x1b[?1006l");
-            }
-            io::stdout().flush().map_err(|error| error.to_string())?;
+                b"\x1b[?1002l\x1b[?1015l\x1b[?1006l".as_slice()
+            };
+            let mut stdout = io::stdout().lock();
+            stdout
+                .write_all(sequence)
+                .and_then(|()| stdout.flush())
+                .map_err(|error| error.to_string())?;
             self.mouse_enabled = mouse_enabled;
         }
         self.synchronized = synchronized;
@@ -338,23 +361,29 @@ impl Terminal {
         if !self.active {
             return Ok(());
         }
-        if self.synchronized {
-            print!("\x1b[?2026l");
-        }
-        if self.mouse_enabled {
-            print!("\x1b[?1002l\x1b[?1015l\x1b[?1006l");
-        }
-        print!("\x1b[?7h\x1b[?25h\x1b[?1049l\x1b[0m");
-        io::stdout().flush().map_err(|e| e.to_string())?;
-        if unsafe { tcsetattr(STDIN, TCSANOW, &self.original) } != 0 {
-            return Err(format!(
+        let output_result = (|| -> io::Result<()> {
+            let mut stdout = io::stdout().lock();
+            if self.synchronized {
+                stdout.write_all(b"\x1b[?2026l")?;
+            }
+            if self.mouse_enabled {
+                stdout.write_all(b"\x1b[?1002l\x1b[?1015l\x1b[?1006l")?;
+            }
+            stdout.write_all(b"\x1b[?7h\x1b[?25h\x1b[?1049l\x1b[0m")?;
+            stdout.flush()
+        })();
+        let terminal_result = if unsafe { tcsetattr(STDIN, TCSANOW, &self.original) } == 0 {
+            Ok(())
+        } else {
+            Err(format!(
                 "could not restore terminal settings: {}",
                 io::Error::last_os_error()
-            ));
-        }
+            ))
+        };
+        terminal_result?;
         CRASH_TERMIOS_READY.store(false, Ordering::SeqCst);
         self.active = false;
-        Ok(())
+        output_result.map_err(|error| error.to_string())
     }
 }
 
@@ -444,11 +473,15 @@ fn take_key_inner(bytes: &mut Vec<u8>, sequence_timed_out: bool) -> Option<Key> 
         [byte, ..] if byte.is_ascii() && !byte.is_ascii_control() => (Key::Char(*byte as char), 1),
         [byte, ..] if *byte >= 0x80 => {
             let width = utf8_sequence_width(*byte);
-            if width == 0 || bytes.len() < width {
+            if width == 0 {
+                (Key::Unknown, 1)
+            } else if bytes.len() < width {
                 return None;
+            } else if let Ok(text) = std::str::from_utf8(&bytes[..width]) {
+                (Key::Char(text.chars().next()?), width)
+            } else {
+                (Key::Unknown, 1)
             }
-            let text = std::str::from_utf8(&bytes[..width]).ok()?;
-            (Key::Char(text.chars().next()?), width)
         }
         _ => (Key::Unknown, 1),
     };
@@ -462,23 +495,20 @@ fn parse_sgr_mouse(bytes: &[u8]) -> Option<(Key, usize)> {
     };
     let end = rest.iter().position(|byte| matches!(byte, b'M' | b'm'))?;
     let pressed = rest[end] == b'M';
-    let fields = std::str::from_utf8(&rest[..end])
-        .ok()
-        .map(|text| {
-            text.split(';')
-                .filter_map(|field| field.parse::<u16>().ok())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let key = if fields.len() == 3 {
-        Key::Mouse {
-            button: fields[0],
-            x: fields[1].saturating_sub(1),
-            y: fields[2].saturating_sub(1),
+    let fields = std::str::from_utf8(&rest[..end]).ok().and_then(|text| {
+        text.split(';')
+            .map(str::parse::<u16>)
+            .collect::<Result<Vec<_>, _>>()
+            .ok()
+    });
+    let key = match fields.as_deref() {
+        Some([button, x, y]) if *x > 0 && *y > 0 => Key::Mouse {
+            button: *button,
+            x: x - 1,
+            y: y - 1,
             pressed,
-        }
-    } else {
-        Key::Unknown
+        },
+        _ => Key::Unknown,
     };
     Some((key, end + 4))
 }
@@ -562,6 +592,35 @@ mod tests {
             })
         );
         assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn malformed_mouse_fields_are_consumed_without_becoming_clicks() {
+        for report in [
+            b"\x1b[<0;bad;7M".as_slice(),
+            b"\x1b[<0;12;bad;7M".as_slice(),
+            b"\x1b[<0;0;7M".as_slice(),
+            b"\x1b[<0;12;0M".as_slice(),
+        ] {
+            let mut bytes = report.to_vec();
+            assert_eq!(take_key(&mut bytes), Some(Key::Unknown));
+            assert!(bytes.is_empty());
+        }
+    }
+
+    #[test]
+    fn invalid_utf8_cannot_block_later_keyboard_input() {
+        let mut bytes = vec![0xff, 0xc2, b' ', b'q'];
+        assert_eq!(take_key(&mut bytes), Some(Key::Unknown));
+        assert_eq!(take_key(&mut bytes), Some(Key::Unknown));
+        assert_eq!(take_key(&mut bytes), Some(Key::Char(' ')));
+        assert_eq!(take_key(&mut bytes), Some(Key::Char('q')));
+        assert!(bytes.is_empty());
+
+        let mut partial = vec![0xe2, 0x82];
+        assert_eq!(take_key(&mut partial), None);
+        partial.push(0xac);
+        assert_eq!(take_key(&mut partial), Some(Key::Char('€')));
     }
 
     #[test]
