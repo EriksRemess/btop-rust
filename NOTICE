@@ -1,7 +1,7 @@
 btop-rust
 Copyright 2026 Ēriks Remess
 
-This product is a Rust port of and contains material derived from btop++:
+This product contains material derived from btop++:
 
     btop++
     Copyright 2021 Aristocratos (jakob@qvantnet.com)

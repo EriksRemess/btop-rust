@@ -113,12 +113,7 @@ fn write(level: Level, message: &str) {
         return;
     };
     if (!state.wrote_header || file.metadata().is_ok_and(|metadata| metadata.len() == 0))
-        && writeln!(
-            file,
-            "\n===> btoprs v{} (based on BTOP++ v1.4.7)",
-            env!("CARGO_PKG_VERSION")
-        )
-        .is_ok()
+        && writeln!(file, "\n===> btoprs v{}", env!("CARGO_PKG_VERSION")).is_ok()
     {
         state.wrote_header = true;
     }

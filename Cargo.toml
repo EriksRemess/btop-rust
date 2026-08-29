@@ -1,9 +1,12 @@
 [package]
-name = "btop"
+name = "btoprs"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-description = "A Rust port of btop++"
+description = "A dependency-free terminal resource monitor"
+readme = "README.md"
+homepage = "https://github.com/EriksRemess/btop-rust"
+repository = "https://github.com/EriksRemess/btop-rust"
 
 [[bin]]
 name = "btoprs"

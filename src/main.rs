@@ -212,7 +212,7 @@ fn run() -> Result<u8, String> {
     }
 
     if !io::stdout().is_terminal() || !io::stdin().is_terminal() {
-        return Err("btop requires an interactive terminal".into());
+        return Err("btoprs requires an interactive terminal".into());
     }
 
     let mut config = Config::load(cli.config_file.as_deref())?;

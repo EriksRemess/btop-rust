@@ -117,7 +117,8 @@ struct CpuTicks {
 struct DiskCounters {
     sectors_read: u64,
     sectors_written: u64,
-    io_milliseconds: u64,
+    activity: u64,
+    activity_valid: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -457,6 +458,9 @@ impl Collector {
             fs::read_dir("/proc").map_err(|e| format!("could not enumerate /proc: {e}"))?;
         let mut next_ticks = HashMap::new();
         let mut result = Vec::new();
+        let clock_ticks = clock_ticks() as f64;
+        let uptime_ticks = read_uptime() * clock_ticks;
+        let page_size = page_size();
         for entry in entries.flatten() {
             let Some(pid) = entry
                 .file_name()
@@ -484,10 +488,9 @@ impl Collector {
                 cpu *= cores as f64;
             }
             cpu = (cpu * 10.0).round() / 10.0;
-            let uptime_ticks = read_uptime() * clock_ticks() as f64;
             let elapsed_ticks = (uptime_ticks - raw.start_ticks as f64).max(1.0);
             let cumulative_cpu = ticks as f64 * 100.0 / elapsed_ticks;
-            let elapsed_seconds = (elapsed_ticks / clock_ticks() as f64) as u64;
+            let elapsed_seconds = (elapsed_ticks / clock_ticks) as u64;
             let status = fs::read_to_string(entry.path().join("status")).unwrap_or_default();
             let uid = status
                 .lines()
@@ -499,13 +502,13 @@ impl Collector {
                         .ok()
                 })
                 .unwrap_or(0);
-            let stat_memory = raw.rss_pages.saturating_mul(page_size());
+            let stat_memory = raw.rss_pages.saturating_mul(page_size);
             let memory = if detailed_pid == Some(pid)
                 && config.bool_value("proc_info_smaps").unwrap_or(false)
             {
                 read_smaps_rss(&entry.path().join("smaps")).unwrap_or(stat_memory)
             } else if total_memory > 0 && stat_memory >= total_memory {
-                read_statm_rss(&entry.path().join("statm")).unwrap_or(stat_memory)
+                read_statm_rss(&entry.path().join("statm"), page_size).unwrap_or(stat_memory)
             } else {
                 stat_memory
             };
@@ -522,7 +525,11 @@ impl Collector {
                 })
                 .filter(|v| !v.is_empty())
                 .unwrap_or_default();
-            let (read_bytes, write_bytes) = read_process_io(pid);
+            let (read_bytes, write_bytes) = if detailed_pid == Some(pid) {
+                read_process_io(pid)
+            } else {
+                (0, 0)
+            };
             result.push(ProcessSample {
                 pid,
                 parent: raw.parent,
@@ -565,14 +572,14 @@ fn read_smaps_rss(path: &Path) -> Option<u64> {
     (kibibytes > 0).then_some(kibibytes.saturating_mul(1024))
 }
 
-fn read_statm_rss(path: &Path) -> Option<u64> {
+fn read_statm_rss(path: &Path, page_size: u64) -> Option<u64> {
     fs::read_to_string(path)
         .ok()?
         .split_whitespace()
         .nth(1)?
         .parse::<u64>()
         .ok()
-        .map(|pages| pages.saturating_mul(page_size()))
+        .map(|pages| pages.saturating_mul(page_size))
 }
 
 fn read_process_io(pid: u32) -> (u64, u64) {
@@ -820,21 +827,24 @@ fn disk_counter_delta(
     zfs: bool,
     elapsed: f64,
 ) -> (u64, u64, f64) {
+    let seconds = elapsed.max(0.001);
     let read = now
         .sectors_read
         .saturating_sub(old.sectors_read)
-        .saturating_mul(block_size);
+        .saturating_mul(block_size) as f64
+        / seconds;
     let write = now
         .sectors_written
         .saturating_sub(old.sectors_written)
-        .saturating_mul(block_size);
-    let activity_delta = now.io_milliseconds.saturating_sub(old.io_milliseconds) as f64;
+        .saturating_mul(block_size) as f64
+        / seconds;
+    let activity_delta = now.activity.saturating_sub(old.activity) as f64;
     let activity = if zfs {
         activity_delta
     } else {
-        (activity_delta / elapsed.max(0.001) / 10.0).clamp(0.0, 100.0)
+        (activity_delta / seconds / 10.0).clamp(0.0, 100.0)
     };
-    (read, write, activity)
+    (read.round() as u64, write.round() as u64, activity)
 }
 
 fn read_zfs_arcstats(path: &Path) -> Option<(u64, u64)> {
@@ -877,9 +887,8 @@ fn read_zfs_counters(root: &Path, device: &str, pool_total: bool) -> Option<Disk
             total.sectors_written = total
                 .sectors_written
                 .saturating_add(counters.sectors_written);
-            total.io_milliseconds = total
-                .io_milliseconds
-                .saturating_add(counters.io_milliseconds);
+            total.activity = total.activity.saturating_add(counters.activity);
+            total.activity_valid |= counters.activity_valid;
             matched += 1;
             if !pool_total {
                 break;
@@ -918,7 +927,8 @@ fn parse_zfs_objset(text: &str) -> Option<(String, DiskCounters)> {
         DiskCounters {
             sectors_read: bytes_read,
             sectors_written: bytes_written,
-            io_milliseconds: reads + writes,
+            activity: reads + writes,
+            activity_valid: true,
         },
     ))
 }
@@ -1000,7 +1010,8 @@ fn parse_disk_stat(text: &str) -> Option<DiskCounters> {
     Some(DiskCounters {
         sectors_read: *fields.get(2)?,
         sectors_written: *fields.get(6)?,
-        io_milliseconds: *fields.get(9)?,
+        activity: *fields.get(9)?,
+        activity_valid: true,
     })
 }
 
@@ -1329,7 +1340,11 @@ fn read_temperature_info(config: &Config) -> Option<(f64, f64)> {
     {
         return Some((value / 1000.0, sensor.critical));
     }
-    let entries = fs::read_dir("/sys/class/thermal").ok()?;
+    read_thermal_zone_fallback(Path::new("/sys/class/thermal"))
+}
+
+fn read_thermal_zone_fallback(root: &Path) -> Option<(f64, f64)> {
+    let entries = fs::read_dir(root).ok()?;
     let mut fallback = None;
     for entry in entries.flatten() {
         if !entry
@@ -1339,12 +1354,13 @@ fn read_temperature_info(config: &Config) -> Option<(f64, f64)> {
         {
             continue;
         }
-        let temp = fs::read_to_string(entry.path().join("temp"))
-            .ok()?
-            .trim()
-            .parse::<f64>()
-            .ok()?
-            / 1000.0;
+        let Some(temp) = fs::read_to_string(entry.path().join("temp"))
+            .ok()
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .map(|value| value / 1000.0)
+        else {
+            continue;
+        };
         let kind = fs::read_to_string(entry.path().join("type"))
             .unwrap_or_default()
             .to_ascii_lowercase();
@@ -1585,9 +1601,7 @@ fn read_battery_at(root: &Path, selected: &str) -> Option<BatterySample> {
         .trim()
         .to_ascii_lowercase();
     if status == "unknown" {
-        let online = [path.join("AC0/online"), path.join("AC/online")]
-            .into_iter()
-            .find_map(read_number);
+        let online = power_supply_online(root);
         if online == Some(1.0) {
             status = if percent < 100 { "charging" } else { "full" }.into();
         } else if online == Some(0.0) {
@@ -1606,7 +1620,8 @@ fn read_battery_at(root: &Path, selected: &str) -> Option<BatterySample> {
                     .zip(charge_now)
                     .zip(positive_current)
                     .map(|((full, now), current)| ((full - now).max(0.0) / current * 3600.0) as u64)
-            }),
+            })
+            .or_else(|| power_supply_time(path, &["time_to_full_now", "time_to_full_avg"])),
         "full" => None,
         _ => energy_now
             .zip(positive_power)
@@ -1616,7 +1631,7 @@ fn read_battery_at(root: &Path, selected: &str) -> Option<BatterySample> {
                     .zip(positive_current)
                     .map(|(charge, current)| (charge / current * 3600.0) as u64)
             })
-            .or_else(|| read_number(path.join("time_to_empty")).map(|minutes| minutes as u64 * 60)),
+            .or_else(|| power_supply_time(path, &["time_to_empty_now", "time_to_empty_avg"])),
     }
     .filter(|seconds| *seconds > 0);
     let watts = power_now
@@ -1628,6 +1643,27 @@ fn read_battery_at(root: &Path, selected: &str) -> Option<BatterySample> {
         watts,
         seconds,
     })
+}
+
+fn power_supply_online(root: &Path) -> Option<f64> {
+    let mut found = false;
+    let mut online = false;
+    for entry in fs::read_dir(root).ok()?.flatten() {
+        let Some(value) = read_number(entry.path().join("online")) else {
+            continue;
+        };
+        found = true;
+        online |= value > 0.0;
+    }
+    found.then_some(if online { 1.0 } else { 0.0 })
+}
+
+fn power_supply_time(path: &Path, names: &[&str]) -> Option<u64> {
+    names
+        .iter()
+        .find_map(|name| read_number(path.join(name)))
+        .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+        .map(|seconds| seconds as u64)
 }
 
 fn battery_names(root: &Path) -> Vec<String> {
@@ -1832,29 +1868,32 @@ mod tests {
             DiskCounters {
                 sectors_read: 400,
                 sectors_written: 800,
-                io_milliseconds: 1100,
+                activity: 1100,
+                activity_valid: true,
             }
         );
         assert!(parse_disk_stat("1 2 3").is_none());
     }
 
     #[test]
-    fn disk_deltas_match_block_and_zfs_reference_accounting() {
+    fn disk_deltas_are_normalized_to_per_second() {
         let old = DiskCounters {
             sectors_read: 100,
             sectors_written: 200,
-            io_milliseconds: 1_000,
+            activity: 1_000,
+            activity_valid: true,
         };
         let now = DiskCounters {
             sectors_read: 110,
             sectors_written: 220,
-            io_milliseconds: 1_500,
+            activity: 1_500,
+            activity_valid: true,
         };
         assert_eq!(
             disk_counter_delta(old, now, 512, false, 2.0),
-            (5_120, 10_240, 25.0)
+            (2_560, 5_120, 25.0)
         );
-        assert_eq!(disk_counter_delta(old, now, 1, true, 2.0), (10, 20, 500.0));
+        assert_eq!(disk_counter_delta(old, now, 1, true, 2.0), (5, 10, 500.0));
     }
 
     #[test]
@@ -1954,6 +1993,46 @@ mod tests {
         assert_eq!(read_battery_at(&root, "missing").unwrap().percent, 40);
         assert_eq!(battery_names(&root), ["Auto", "BAT0", "UPS0"]);
 
+        fs::remove_file(root.join("BAT0/power_now")).unwrap();
+        fs::write(root.join("BAT0/status"), "Unknown").unwrap();
+        fs::write(root.join("BAT0/time_to_empty_now"), "1234").unwrap();
+        let ac = root.join("AC0");
+        fs::create_dir_all(&ac).unwrap();
+        fs::write(ac.join("type"), "Mains").unwrap();
+        fs::write(ac.join("online"), "0").unwrap();
+        let discharging = read_battery_at(&root, "BAT0").unwrap();
+        assert_eq!(discharging.status, "discharging");
+        assert_eq!(discharging.seconds, Some(1_234));
+
+        fs::write(root.join("BAT0/time_to_full_now"), "4321").unwrap();
+        fs::write(ac.join("online"), "1").unwrap();
+        let charging = read_battery_at(&root, "BAT0").unwrap();
+        assert_eq!(charging.status, "charging");
+        assert_eq!(charging.seconds, Some(4_321));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn thermal_fallback_skips_malformed_zones() {
+        let root = std::env::temp_dir().join(format!(
+            "btoprs-thermal-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let malformed = root.join("thermal_zone0");
+        let cpu = root.join("thermal_zone1");
+        fs::create_dir_all(&malformed).unwrap();
+        fs::create_dir_all(&cpu).unwrap();
+        fs::write(malformed.join("temp"), "not-a-temperature").unwrap();
+        fs::write(cpu.join("temp"), "42500").unwrap();
+        fs::write(cpu.join("type"), "cpu-thermal").unwrap();
+
+        assert_eq!(read_thermal_zone_fallback(&root), Some((42.5, 95.0)));
+
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2018,7 +2097,8 @@ mod tests {
             Some(DiskCounters {
                 sectors_read: 4096,
                 sectors_written: 8192,
-                io_milliseconds: 14,
+                activity: 14,
+                activity_valid: true,
             })
         );
         assert_eq!(
@@ -2026,7 +2106,8 @@ mod tests {
             Some(DiskCounters {
                 sectors_read: 5120,
                 sectors_written: 10240,
-                io_milliseconds: 19,
+                activity: 19,
+                activity_valid: true,
             })
         );
 

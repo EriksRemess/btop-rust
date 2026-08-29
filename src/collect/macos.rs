@@ -23,7 +23,11 @@ const PROC_PIDTASKINFO: c_int = 4;
 const PROC_PIDT_SHORTBSDINFO: c_int = 13;
 const PROC_FLAG_SYSTEM: u32 = 1;
 const CTL_KERN: c_int = 1;
+const CTL_NET: c_int = 4;
 const KERN_PROCARGS2: c_int = 49;
+const PF_ROUTE: c_int = 17;
+const NET_RT_IFLIST2: c_int = 6;
+const RTM_IFINFO2: u8 = 0x12;
 const AF_INET: u8 = 2;
 const AF_INET6: u8 = 30;
 const IFF_RUNNING: c_uint = 0x40;
@@ -41,7 +45,7 @@ pub(super) fn collect_cpu(
     collector: &mut Collector,
     config: &Config,
 ) -> Result<(CpuSample, u64), String> {
-    let current = processor_ticks()?;
+    let current = processor_ticks(&collector.previous_cpu)?;
     let percentages = current
         .iter()
         .enumerate()
@@ -82,11 +86,7 @@ pub(super) fn collect_cpu(
         getloadavg(load.as_mut_ptr(), load.len() as c_int);
     }
     let core_count = percentages.len().saturating_sub(1);
-    let (temperature, core_temperatures) = if config.check_temperature {
-        crate::gpu::macos::read_cpu_temperatures(core_count)
-    } else {
-        (None, vec![None; core_count])
-    };
+    let (temperature, core_temperatures) = cpu_temperatures(config.check_temperature, core_count);
     Ok((
         CpuSample {
             total: percentages.first().copied().unwrap_or(0.0),
@@ -117,7 +117,29 @@ pub(super) fn collect_cpu(
     ))
 }
 
-fn processor_ticks() -> Result<Vec<CpuTicks>, String> {
+fn cpu_temperatures(enabled: bool, core_count: usize) -> (Option<f64>, Vec<Option<f64>>) {
+    if !enabled {
+        return (None, vec![None; core_count]);
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        crate::gpu::macos::read_cpu_temperatures(core_count)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        (None, vec![None; core_count])
+    }
+}
+
+fn extend_u32_counter(current: u32, previous: u64) -> u64 {
+    let mut extended = (previous & !u64::from(u32::MAX)) | u64::from(current);
+    if extended < previous {
+        extended = extended.saturating_add(1_u64 << 32);
+    }
+    extended
+}
+
+fn processor_ticks(previous: &[CpuTicks]) -> Result<Vec<CpuTicks>, String> {
     let mut cpu_count = 0_u32;
     let mut info = ptr::null_mut::<c_int>();
     let mut info_count = 0_u32;
@@ -138,11 +160,18 @@ fn processor_ticks() -> Result<Vec<CpuTicks>, String> {
     let values = unsafe { std::slice::from_raw_parts(info, info_count as usize) };
     let mut aggregate = CpuTicks::default();
     let mut cores = Vec::with_capacity(cpu_count as usize + 1);
-    for values in values.as_chunks::<4>().0.iter().take(cpu_count as usize) {
-        let user = values[CPU_STATE_USER].max(0) as u64;
-        let nice = values[CPU_STATE_NICE].max(0) as u64;
-        let system = values[CPU_STATE_SYSTEM].max(0) as u64;
-        let idle = values[CPU_STATE_IDLE].max(0) as u64;
+    for (core_index, values) in values
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .take(cpu_count as usize)
+        .enumerate()
+    {
+        let old = previous.get(core_index + 1).copied().unwrap_or_default();
+        let user = extend_u32_counter(values[CPU_STATE_USER] as u32, old.fields[0]);
+        let nice = extend_u32_counter(values[CPU_STATE_NICE] as u32, old.fields[1]);
+        let system = extend_u32_counter(values[CPU_STATE_SYSTEM] as u32, old.fields[2]);
+        let idle = extend_u32_counter(values[CPU_STATE_IDLE] as u32, old.fields[3]);
         let total = user + nice + system + idle;
         let ticks = CpuTicks {
             busy: total.saturating_sub(idle),
@@ -216,7 +245,11 @@ pub(super) fn collect_memory(
     }
     let free = u64::from(stats.free_count).saturating_mul(page_size);
     let cached = u64::from(stats.external_page_count).saturating_mul(page_size);
-    let used_pages = u64::from(stats.active_count).saturating_add(u64::from(stats.wire_count));
+    // Apple's internal/external counters describe backing type, while the
+    // active/inactive counters describe page-queue state and therefore overlap.
+    // Treat anonymous, wired and compressor storage as used; file-backed pages
+    // remain reclaimable cache. Purgeable pages are reclaimable as well.
+    let used_pages = macos_used_pages(&stats);
     let used = used_pages.saturating_mul(page_size).min(total);
     let available = total.saturating_sub(used);
     let swap = sysctl_value::<XswUsage>("vm.swapusage").unwrap_or_default();
@@ -234,6 +267,13 @@ pub(super) fn collect_memory(
             Vec::new()
         },
     })
+}
+
+fn macos_used_pages(stats: &VmStatistics64) -> u64 {
+    u64::from(stats.internal_page_count)
+        .saturating_add(u64::from(stats.wire_count))
+        .saturating_add(u64::from(stats.compressor_page_count))
+        .saturating_sub(u64::from(stats.purgeable_count))
 }
 
 fn collect_disks(
@@ -326,22 +366,22 @@ fn collect_disk_io(
             }
             if let Some(mount) = mappings.get(&device)
                 && let Some(disk) = disks.iter_mut().find(|disk| &disk.mount == mount)
-                && let Some((read, write)) = io_registry_disk_statistics(volume)
+                && let Some((read, write, total_time)) = io_registry_disk_statistics(volume)
             {
-                let had_previous = previous.contains_key(mount);
-                let saved = previous.entry(mount.clone()).or_default();
-                let read_delta = read.saturating_sub(saved.sectors_read);
-                let write_delta = write.saturating_sub(saved.sectors_written);
-                saved.sectors_read = read;
-                saved.sectors_written = write;
+                let current = super::DiskCounters {
+                    sectors_read: read,
+                    sectors_written: write,
+                    activity: total_time.unwrap_or_default(),
+                    activity_valid: total_time.is_some(),
+                };
+                let old = previous.insert(mount.clone(), current);
                 disk.io_supported = true;
-                if had_previous {
-                    disk.read_per_second = (read_delta as f64 / elapsed.max(0.001)) as u64;
-                    disk.write_per_second = (write_delta as f64 / elapsed.max(0.001)) as u64;
-                    disk.io_activity = ((read_delta.saturating_add(write_delta)) as f64
-                        / (1_u64 << 20) as f64)
-                        .round()
-                        .clamp(0.0, 100.0);
+                if let Some(old) = old {
+                    let (read_per_second, write_per_second, activity) =
+                        macos_disk_counter_delta(old, current, elapsed);
+                    disk.read_per_second = read_per_second;
+                    disk.write_per_second = write_per_second;
+                    disk.io_activity = activity;
                 }
             }
         }
@@ -396,7 +436,25 @@ fn io_registry_string(entry: u32, key: &str) -> Option<String> {
     })
 }
 
-fn io_registry_disk_statistics(entry: u32) -> Option<(u64, u64)> {
+fn macos_disk_counter_delta(
+    old: super::DiskCounters,
+    now: super::DiskCounters,
+    elapsed: f64,
+) -> (u64, u64, f64) {
+    let seconds = elapsed.max(0.001);
+    let read = (now.sectors_read.saturating_sub(old.sectors_read) as f64 / seconds).round() as u64;
+    let write =
+        (now.sectors_written.saturating_sub(old.sectors_written) as f64 / seconds).round() as u64;
+    let activity = if old.activity_valid && now.activity_valid {
+        let busy_nanoseconds = now.activity.saturating_sub(old.activity) as f64;
+        (busy_nanoseconds / (seconds * 1_000_000_000.0) * 100.0).clamp(0.0, 100.0)
+    } else {
+        0.0
+    };
+    (read, write, activity)
+}
+
+fn io_registry_disk_statistics(entry: u32) -> Option<(u64, u64, Option<u64>)> {
     let mut properties = ptr::null();
     if unsafe { IORegistryEntryCreateCFProperties(entry, &mut properties, ptr::null(), 0) }
         != KERN_SUCCESS
@@ -406,19 +464,65 @@ fn io_registry_disk_statistics(entry: u32) -> Option<(u64, u64)> {
     }
     let statistics = unsafe { cf_dictionary_value(properties, "Statistics") };
     let result = statistics.and_then(|statistics| unsafe {
-        Some((
-            u64::try_from(cf_dictionary_i64(
-                statistics,
-                "Bytes read from block device",
-            )?)
-            .ok()?,
-            u64::try_from(cf_dictionary_i64(
-                statistics,
-                "Bytes written to block device",
-            )?)
-            .ok()?,
-        ))
+        let read = cf_dictionary_u64(statistics, "Bytes read from block device")
+            .or_else(|| cf_dictionary_u64(statistics, "Bytes (Read)"))?;
+        let write = cf_dictionary_u64(statistics, "Bytes written to block device")
+            .or_else(|| cf_dictionary_u64(statistics, "Bytes (Write)"))?;
+        Some((read, write))
     });
+    unsafe { CFRelease(properties) };
+    let (read, write) = result?;
+    Some((read, write, io_registry_ancestor_total_time(entry)))
+}
+
+fn io_registry_ancestor_total_time(entry: u32) -> Option<u64> {
+    let mut current = 0_u32;
+    if unsafe { IORegistryEntryGetParentEntry(entry, c"IOService".as_ptr(), &mut current) }
+        != KERN_SUCCESS
+        || current == 0
+    {
+        return None;
+    }
+    for _ in 0..64 {
+        if let Some(total) = io_registry_total_time(current) {
+            unsafe { IOObjectRelease(current) };
+            return Some(total);
+        }
+        let mut parent = 0_u32;
+        let got_parent =
+            unsafe { IORegistryEntryGetParentEntry(current, c"IOService".as_ptr(), &mut parent) }
+                == KERN_SUCCESS;
+        unsafe { IOObjectRelease(current) };
+        if !got_parent || parent == 0 {
+            return None;
+        }
+        current = parent;
+    }
+    unsafe { IOObjectRelease(current) };
+    None
+}
+
+fn io_registry_total_time(entry: u32) -> Option<u64> {
+    let mut properties = ptr::null();
+    if unsafe { IORegistryEntryCreateCFProperties(entry, &mut properties, ptr::null(), 0) }
+        != KERN_SUCCESS
+        || properties.is_null()
+    {
+        return None;
+    }
+    let result = unsafe {
+        cf_dictionary_value(properties, "Statistics").and_then(|statistics| {
+            let read = cf_dictionary_u64(statistics, "Total Time (Read)");
+            let write = cf_dictionary_u64(statistics, "Total Time (Write)");
+            match (read, write) {
+                (None, None) => None,
+                (read, write) => Some(
+                    read.unwrap_or_default()
+                        .saturating_add(write.unwrap_or_default()),
+                ),
+            }
+        })
+    };
     unsafe { CFRelease(properties) };
     result
 }
@@ -445,11 +549,6 @@ pub(super) fn collect_network(
                 .into_owned();
             let entry = found.entry(name).or_default();
             entry.connected |= address.flags & IFF_RUNNING != 0;
-            if !address.data.is_null() {
-                let data = unsafe { ptr::read_unaligned(address.data.cast::<IfData>()) };
-                entry.received = u64::from(data.bytes_received);
-                entry.transmitted = u64::from(data.bytes_transmitted);
-            }
             if !address.address.is_null() {
                 let socket = unsafe { ptr::read_unaligned(address.address) };
                 match socket.family {
@@ -475,6 +574,12 @@ pub(super) fn collect_network(
     }
     unsafe { freeifaddrs(head) };
 
+    for (name, (received, transmitted)) in interface_counters64()? {
+        let entry = found.entry(name).or_default();
+        entry.received = received;
+        entry.transmitted = transmitted;
+    }
+
     let mut interfaces = found.keys().cloned().collect::<Vec<_>>();
     interfaces.sort();
     let selected = config
@@ -482,6 +587,7 @@ pub(super) fn collect_network(
         .as_ref()
         .filter(|name| found.contains_key(*name))
         .cloned()
+        .or_else(|| primary_network_interface().filter(|name| found.contains_key(name)))
         .or_else(|| {
             interfaces
                 .iter()
@@ -536,6 +642,95 @@ pub(super) fn collect_network(
     })
 }
 
+fn interface_counters64() -> Result<HashMap<String, (u64, u64)>, String> {
+    let mut mib = [CTL_NET, PF_ROUTE, 0, 0, NET_RT_IFLIST2, 0];
+    let mut size = 0_usize;
+    if unsafe {
+        sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as c_uint,
+            ptr::null_mut(),
+            &mut size,
+            ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        return Err(format!(
+            "NET_RT_IFLIST2 size query failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let mut buffer = vec![0_u8; size];
+    if unsafe {
+        sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as c_uint,
+            buffer.as_mut_ptr().cast(),
+            &mut size,
+            ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        return Err(format!(
+            "NET_RT_IFLIST2 query failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    buffer.truncate(size);
+
+    let mut counters = HashMap::new();
+    let mut offset = 0_usize;
+    while offset + mem::size_of::<RouteMessageHeader>() <= buffer.len() {
+        let header = unsafe {
+            ptr::read_unaligned(buffer.as_ptr().add(offset).cast::<RouteMessageHeader>())
+        };
+        let message_length = usize::from(header.length);
+        if message_length == 0 || offset.saturating_add(message_length) > buffer.len() {
+            break;
+        }
+        if header.kind == RTM_IFINFO2 && message_length >= mem::size_of::<IfMessageHeader2>() {
+            let message = unsafe {
+                ptr::read_unaligned(buffer.as_ptr().add(offset).cast::<IfMessageHeader2>())
+            };
+            let mut name = [0_i8; 16];
+            if unsafe { !if_indextoname(u32::from(message.index), name.as_mut_ptr()).is_null() } {
+                counters.insert(
+                    unsafe { CStr::from_ptr(name.as_ptr()) }
+                        .to_string_lossy()
+                        .into_owned(),
+                    (message.data.bytes_received, message.data.bytes_transmitted),
+                );
+            }
+        }
+        offset += message_length;
+    }
+    Ok(counters)
+}
+
+fn primary_network_interface() -> Option<String> {
+    for path in ["State:/Network/Global/IPv4", "State:/Network/Global/IPv6"] {
+        let key = cf_string(path)?;
+        let value = unsafe { SCDynamicStoreCopyValue(ptr::null(), key) };
+        unsafe { CFRelease(key) };
+        if value.is_null() {
+            continue;
+        }
+        let interface = unsafe {
+            cf_is_type(value, CFDictionaryGetTypeID())
+                .then(|| cf_dictionary_value(value, "PrimaryInterface"))
+                .flatten()
+                .and_then(|name| cf_string_to_string(name))
+        };
+        unsafe { CFRelease(value) };
+        if interface.is_some() {
+            return interface;
+        }
+    }
+    None
+}
+
 pub(super) fn collect_processes(
     collector: &mut Collector,
     total_delta: u64,
@@ -575,6 +770,10 @@ pub(super) fn collect_processes(
     let interval_ns = total_delta.max(1) as f64 * 1_000_000_000.0 / clock_ticks;
     let mut next_times = HashMap::new();
     let mut processes = Vec::with_capacity(pids.len());
+    let argument_limit = sysctl_value::<c_int>("kern.argmax")
+        .unwrap_or(4096)
+        .clamp(4096, 1 << 20) as usize;
+    let mut argument_buffer = vec![0_u8; argument_limit];
     for pid in pids.into_iter().filter(|pid| *pid > 0) {
         let mut bsd = ProcBsdInfo::default();
         let got_full_bsd = unsafe {
@@ -661,7 +860,7 @@ pub(super) fn collect_processes(
             .or_else(|| c_array_opt(&bsd.name))
             .or_else(|| c_array_opt(&bsd.command))
             .unwrap_or_else(|| pid.to_string());
-        let command = process_arguments(pid)
+        let command = process_arguments(pid, &mut argument_buffer)
             .unwrap_or_else(|| process_path(pid).unwrap_or_else(|| name.clone()));
         let (read_bytes, write_bytes) = if detailed_pid == Some(pid as u32) {
             process_io(pid)
@@ -752,9 +951,7 @@ fn process_path(pid: c_int) -> Option<String> {
     })
 }
 
-fn process_arguments(pid: c_int) -> Option<String> {
-    let argmax = sysctl_value::<c_int>("kern.argmax")?.clamp(4096, 1 << 20) as usize;
-    let mut buffer = vec![0_u8; argmax];
+fn process_arguments(pid: c_int, buffer: &mut [u8]) -> Option<String> {
     let mut size = buffer.len();
     let mut mib = [CTL_KERN, KERN_PROCARGS2, pid];
     if unsafe {
@@ -771,7 +968,7 @@ fn process_arguments(pid: c_int) -> Option<String> {
     {
         return None;
     }
-    buffer.truncate(size);
+    let buffer = buffer.get(..size)?;
     let argc = c_int::from_ne_bytes(buffer.get(..4)?.try_into().ok()?).max(0) as usize;
     let mut index = 4;
     index += buffer.get(index..)?.iter().position(|byte| *byte == 0)?;
@@ -813,34 +1010,75 @@ fn read_battery() -> Option<BatterySample> {
             CFRelease(info);
             return None;
         }
-        let source = CFArrayGetValueAtIndex(list, 0);
-        let description = IOPSGetPowerSourceDescription(info, source);
+        let mut description: *const c_void = ptr::null();
+        for index in 0..CFArrayGetCount(list) {
+            let source = CFArrayGetValueAtIndex(list, index);
+            let candidate = IOPSGetPowerSourceDescription(info, source);
+            if candidate.is_null() {
+                continue;
+            }
+            if description.is_null() {
+                description = candidate;
+            }
+            if cf_dictionary_value(candidate, "Type")
+                .and_then(|value| cf_string_to_string(value))
+                .as_deref()
+                == Some("InternalBattery")
+            {
+                description = candidate;
+                break;
+            }
+        }
         if description.is_null() {
             CFRelease(list);
             CFRelease(info);
             return None;
         }
-        let percent = cf_dictionary_i32(description, "Current Capacity")
-            .unwrap_or(0)
-            .clamp(0, 100) as u8;
-        let minutes = cf_dictionary_i32(description, "Time to Empty").filter(|value| *value > 0);
+        let current = i64::from(cf_dictionary_i32(description, "Current Capacity").unwrap_or(0));
+        let maximum = i64::from(cf_dictionary_i32(description, "Max Capacity").unwrap_or(100));
+        let percent = battery_percent(current, maximum);
         let charging = cf_dictionary_bool(description, "Is Charging").unwrap_or(false);
+        let charged = cf_dictionary_bool(description, "Is Charged").unwrap_or(false);
+        let power_state = cf_dictionary_value(description, "Power Source State")
+            .and_then(|value| cf_string_to_string(value));
+        let minutes = if charging {
+            cf_dictionary_i32(description, "Time to Full Charge")
+        } else if power_state.as_deref() == Some("Battery Power") {
+            cf_dictionary_i32(description, "Time to Empty")
+        } else {
+            None
+        }
+        .filter(|value| *value > 0);
         CFRelease(list);
         CFRelease(info);
         Some(BatterySample {
             percent,
-            status: if percent == 100 {
+            status: if charged || (percent == 100 && !charging) {
                 "full"
             } else if charging {
                 "charging"
-            } else {
+            } else if power_state.as_deref() == Some("Battery Power") {
                 "discharging"
+            } else {
+                "unknown"
             }
             .to_string(),
             watts: None,
             seconds: minutes.map(|minutes| minutes as u64 * 60),
         })
     }
+}
+
+fn battery_percent(current: i64, maximum: i64) -> u8 {
+    if maximum <= 0 {
+        return 0;
+    }
+    current
+        .saturating_mul(100)
+        .saturating_add(maximum / 2)
+        .checked_div(maximum)
+        .unwrap_or(0)
+        .clamp(0, 100) as u8
 }
 
 unsafe fn cf_dictionary_i32(dictionary: *const c_void, key: &str) -> Option<i32> {
@@ -850,6 +1088,32 @@ unsafe fn cf_dictionary_i32(dictionary: *const c_void, key: &str) -> Option<i32>
     }
     let mut result = 0_i32;
     unsafe { CFNumberGetValue(value, 3, (&mut result as *mut i32).cast()) }.then_some(result)
+}
+
+fn cf_string(value: &str) -> Option<*const c_void> {
+    let value = CString::new(value).ok()?;
+    let string = unsafe { CFStringCreateWithCString(ptr::null(), value.as_ptr(), 0x0800_0100) };
+    (!string.is_null()).then_some(string)
+}
+
+unsafe fn cf_string_to_string(value: *const c_void) -> Option<String> {
+    if unsafe { !cf_is_type(value, CFStringGetTypeID()) } {
+        return None;
+    }
+    let mut buffer = [0_i8; 256];
+    unsafe {
+        CFStringGetCString(
+            value,
+            buffer.as_mut_ptr(),
+            buffer.len() as isize,
+            0x0800_0100,
+        )
+    }
+    .then(|| {
+        unsafe { CStr::from_ptr(buffer.as_ptr()) }
+            .to_string_lossy()
+            .into_owned()
+    })
 }
 
 unsafe fn cf_dictionary_value(dictionary: *const c_void, key: &str) -> Option<*const c_void> {
@@ -873,6 +1137,10 @@ unsafe fn cf_dictionary_i64(dictionary: *const c_void, key: &str) -> Option<i64>
     }
     let mut result = 0_i64;
     unsafe { CFNumberGetValue(value, 4, (&mut result as *mut i64).cast()) }.then_some(result)
+}
+
+unsafe fn cf_dictionary_u64(dictionary: *const c_void, key: &str) -> Option<u64> {
+    u64::try_from(unsafe { cf_dictionary_i64(dictionary, key) }?).ok()
 }
 
 unsafe fn cf_dictionary_bool(dictionary: *const c_void, key: &str) -> Option<bool> {
@@ -1072,7 +1340,15 @@ struct SockAddrIn6 {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct IfData {
+struct RouteMessageHeader {
+    length: u16,
+    version: u8,
+    kind: u8,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct IfData64Prefix {
     kind: u8,
     type_length: u8,
     physical: u8,
@@ -1083,14 +1359,30 @@ struct IfData {
     unused: u8,
     mtu: u32,
     metric: u32,
-    baud_rate: u32,
-    packets_received: u32,
-    receive_errors: u32,
-    packets_transmitted: u32,
-    transmit_errors: u32,
-    collisions: u32,
-    bytes_received: u32,
-    bytes_transmitted: u32,
+    baud_rate: u64,
+    packets_received: u64,
+    receive_errors: u64,
+    packets_transmitted: u64,
+    transmit_errors: u64,
+    collisions: u64,
+    bytes_received: u64,
+    bytes_transmitted: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct IfMessageHeader2 {
+    length: u16,
+    version: u8,
+    kind: u8,
+    addresses: c_int,
+    flags: c_int,
+    index: u16,
+    send_length: c_int,
+    send_max_length: c_int,
+    send_drops: c_int,
+    timer: c_int,
+    data: IfData64Prefix,
 }
 
 #[repr(C)]
@@ -1215,6 +1507,7 @@ unsafe extern "C" {
     fn getmntinfo(mounts: *mut *mut StatFs, flags: c_int) -> c_int;
     fn getifaddrs(addresses: *mut *mut IfAddrs) -> c_int;
     fn freeifaddrs(addresses: *mut IfAddrs);
+    fn if_indextoname(index: c_uint, name: *mut c_char) -> *mut c_char;
     fn proc_listallpids(buffer: *mut c_void, buffer_size: c_int) -> c_int;
     fn proc_pidinfo(
         pid: c_int,
@@ -1227,6 +1520,11 @@ unsafe extern "C" {
     fn proc_pidpath(pid: c_int, buffer: *mut c_void, buffer_size: u32) -> c_int;
     fn proc_pid_rusage(pid: c_int, flavor: c_int, buffer: *mut c_void) -> c_int;
     fn getpwuid(uid: u32) -> *mut Passwd;
+}
+
+#[link(name = "SystemConfiguration", kind = "framework")]
+unsafe extern "C" {
+    fn SCDynamicStoreCopyValue(store: *const c_void, key: *const c_void) -> *const c_void;
 }
 
 #[link(name = "IOKit", kind = "framework")]
@@ -1288,6 +1586,70 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unsigned_cpu_ticks_extend_across_the_u32_wrap() {
+        assert_eq!(extend_u32_counter(0x8000_0000, 0), 0x8000_0000);
+        assert_eq!(extend_u32_counter(0x20, 0xffff_fff0), 0x1_0000_0020);
+        assert_eq!(extend_u32_counter(0x30, 0x1_0000_0020), 0x1_0000_0030);
+    }
+
+    #[test]
+    fn route_interface_header_matches_the_darwin_64_bit_counter_prefix() {
+        assert_eq!(mem::size_of::<RouteMessageHeader>(), 4);
+        assert_eq!(mem::offset_of!(IfMessageHeader2, data), 32);
+        assert_eq!(mem::offset_of!(IfData64Prefix, bytes_received), 64);
+        assert_eq!(mem::offset_of!(IfData64Prefix, bytes_transmitted), 72);
+    }
+
+    #[test]
+    fn memory_categories_do_not_mix_page_state_with_backing_type() {
+        let stats = VmStatistics64 {
+            internal_page_count: 100,
+            wire_count: 20,
+            compressor_page_count: 30,
+            purgeable_count: 10,
+            external_page_count: 200,
+            active_count: 999,
+            ..VmStatistics64::default()
+        };
+        assert_eq!(macos_used_pages(&stats), 140);
+    }
+
+    #[test]
+    fn battery_capacity_uses_the_source_reported_maximum() {
+        assert_eq!(battery_percent(2_500, 5_000), 50);
+        assert_eq!(battery_percent(95, 100), 95);
+        assert_eq!(battery_percent(1, 0), 0);
+        assert_eq!(battery_percent(6_000, 5_000), 100);
+    }
+
+    #[test]
+    fn disk_counters_use_elapsed_time_and_native_busy_time() {
+        let old = super::super::DiskCounters {
+            sectors_read: 1_000,
+            sectors_written: 2_000,
+            activity: 5_000_000_000,
+            activity_valid: true,
+        };
+        let now = super::super::DiskCounters {
+            sectors_read: 5_000,
+            sectors_written: 8_000,
+            activity: 5_500_000_000,
+            activity_valid: true,
+        };
+
+        assert_eq!(
+            macos_disk_counter_delta(old, now, 2.0),
+            (2_000, 3_000, 25.0)
+        );
+
+        let unavailable = super::super::DiskCounters {
+            activity_valid: false,
+            ..now
+        };
+        assert_eq!(macos_disk_counter_delta(old, unavailable, 2.0).2, 0.0);
+    }
+
+    #[test]
     #[ignore = "requires live macOS host APIs outside the Codex sandbox"]
     fn live_collector_returns_core_system_data() {
         let config = Config::default();
@@ -1301,7 +1663,24 @@ mod tests {
         assert!(sample.memory.total > 0);
         assert!(sample.memory.disks.iter().any(|disk| disk.mount == "/"));
         assert!(sample.memory.disks.iter().any(|disk| disk.io_supported));
+        assert!(
+            collector
+                .previous_disks
+                .values()
+                .any(|counters| counters.activity_valid)
+        );
         assert!(!sample.network.interfaces.is_empty());
+        let native_network = interface_counters64().unwrap();
+        assert!(!native_network.is_empty());
+        assert!(
+            native_network
+                .values()
+                .any(|(received, transmitted)| received.saturating_add(*transmitted) > 0)
+        );
+        if let Some(primary) = primary_network_interface() {
+            assert!(native_network.contains_key(&primary));
+            assert_eq!(sample.network.selected, primary);
+        }
         assert!(
             sample
                 .processes
@@ -1325,10 +1704,20 @@ mod tests {
             assert!(sample.gpus[0].support.utilization);
             assert!(sample.gpus[0].support.gpu_clock);
             assert!(sample.gpus[0].gpu_clock_mhz > 0);
-            assert!(sample.gpus[0].memory_total > 0);
-            assert!(sample.gpus[0].memory_used > 0);
+            assert!(sample.gpus[0].support.power_state);
+            assert_eq!(sample.gpus[0].power_limit_mw, 0);
+            assert!(sample.gpus[0].support.memory_total);
+            assert!(sample.gpus[0].support.memory_used);
+            assert!(sample.gpus[0].support.unified_memory);
+            assert!(sample.gpus[0].support.encoder_sessions);
+            assert!(sample.gpus[0].support.decoder_sessions);
+            assert_eq!(sample.gpus[0].memory_total, sample.memory.total);
+            assert!(sample.gpus[0].memory_used <= sample.gpus[0].memory_total);
             if sample.cpu.name.contains("A18") {
+                assert!(sample.gpus[0].name.contains("5-core GPU"));
                 assert!(sample.gpus[0].temperature_c > 0);
+                assert!(sample.gpus[0].support.memory_utilization);
+                assert!(sample.gpus[0].memory_utilization <= 100);
             }
         }
     }

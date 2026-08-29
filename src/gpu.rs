@@ -22,9 +22,16 @@ pub struct GpuSupport {
     pub temperature: bool,
     pub memory_total: bool,
     pub memory_used: bool,
+    pub unified_memory: bool,
     pub pcie: bool,
     pub encoder: bool,
     pub decoder: bool,
+    pub encoder_power: bool,
+    pub decoder_power: bool,
+    pub encoder_bandwidth: bool,
+    pub decoder_bandwidth: bool,
+    pub encoder_sessions: bool,
+    pub decoder_sessions: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -45,6 +52,14 @@ pub struct GpuSample {
     pub pcie_rx_kib: i64,
     pub encoder_utilization: u32,
     pub decoder_utilization: u32,
+    pub encoder_power_mw: f64,
+    pub decoder_power_mw: f64,
+    pub encoder_read_bps: u64,
+    pub encoder_write_bps: u64,
+    pub decoder_read_bps: u64,
+    pub decoder_write_bps: u64,
+    pub encoder_sessions: u32,
+    pub decoder_sessions: u32,
     pub support: GpuSupport,
 }
 
@@ -67,6 +82,14 @@ impl Default for GpuSample {
             pcie_rx_kib: -1,
             encoder_utilization: 0,
             decoder_utilization: 0,
+            encoder_power_mw: 0.0,
+            decoder_power_mw: 0.0,
+            encoder_read_bps: 0,
+            encoder_write_bps: 0,
+            decoder_read_bps: 0,
+            decoder_write_bps: 0,
+            encoder_sessions: 0,
+            decoder_sessions: 0,
             support: GpuSupport::default(),
         }
     }
@@ -122,21 +145,14 @@ impl GpuCollector {
         let shown = config
             .value("shown_gpus")
             .unwrap_or("nvidia amd intel apple");
-        let missing_requested = (shown.contains("nvidia") && self.nvml.is_none())
-            || (shown.contains("amd") && self.rsmi.is_none() && self.amd_sysfs.is_empty())
-            || (shown.contains("intel") && self.intel.is_none())
-            || {
-                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-                {
-                    shown.contains("apple") && self.apple.is_none()
-                }
-                #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-                {
-                    false
-                }
-            };
-        if shown != self.shown || (missing_requested && Instant::now() >= self.next_probe) {
+        let missing_requested = self.missing_requested(shown);
+        if shown != self.shown {
             *self = Self::new(config);
+        } else if missing_requested && Instant::now() >= self.next_probe {
+            // Preserve working delta-based collectors while probing only the
+            // missing backend; replacing the whole collector creates a false
+            // sample at every retry interval.
+            self.retry_missing(shown);
         }
         let check_temperature = config.check_temperature;
         let nvml_pcie = config
@@ -161,6 +177,48 @@ impl GpuCollector {
             samples.push(apple.collect(check_temperature));
         }
         samples
+    }
+
+    fn missing_requested(&self, shown: &str) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            (shown.contains("nvidia") && self.nvml.is_none())
+                || (shown.contains("amd") && self.rsmi.is_none() && self.amd_sysfs.is_empty())
+                || (shown.contains("intel") && self.intel.is_none())
+        }
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            shown.contains("apple") && self.apple.is_none()
+        }
+        #[cfg(not(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64"))))]
+        {
+            let _ = shown;
+            false
+        }
+    }
+
+    fn retry_missing(&mut self, shown: &str) {
+        let _ = shown;
+        #[cfg(target_os = "linux")]
+        {
+            if shown.contains("nvidia") && self.nvml.is_none() {
+                self.nvml = Nvml::load();
+            }
+            if shown.contains("amd") && self.rsmi.is_none() {
+                self.rsmi = Rsmi::load();
+                if self.rsmi.is_none() && self.amd_sysfs.is_empty() {
+                    self.amd_sysfs = discover_amd_sysfs();
+                }
+            }
+            if shown.contains("intel") && self.intel.is_none() {
+                self.intel = IntelPmu::load();
+            }
+        }
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if shown.contains("apple") && self.apple.is_none() {
+            self.apple = macos::AppleGpuCollector::new();
+        }
+        self.next_probe = Instant::now() + Duration::from_secs(10);
     }
 }
 
@@ -1194,6 +1252,22 @@ mod tests {
         };
         assert!(library.symbol::<usize>(b"missing-nul").is_none());
         assert!(library.symbol::<[usize; 2]>(b"symbol\0").is_none());
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn macos_retry_logic_ignores_unavailable_linux_gpu_backends() {
+        let collector = GpuCollector {
+            nvml: None,
+            rsmi: None,
+            amd_sysfs: Vec::new(),
+            intel: None,
+            apple: None,
+            shown: String::new(),
+            next_probe: Instant::now(),
+        };
+        assert!(!collector.missing_requested("nvidia amd intel"));
+        assert!(collector.missing_requested("nvidia amd intel apple"));
     }
 
     #[test]

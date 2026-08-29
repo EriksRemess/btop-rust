@@ -2854,11 +2854,15 @@ fn draw_cpu(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
                 y,
                 &power,
                 "W",
-                theme::Style::Cached(
-                    ratio(gpu.power_mw, gpu.power_limit_mw)
-                        .round()
-                        .clamp(0.0, 100.0) as u8,
-                ),
+                if gpu.power_limit_mw > 0 {
+                    theme::Style::Cached(
+                        ratio(gpu.power_mw, gpu.power_limit_mw)
+                            .round()
+                            .clamp(0.0, 100.0) as u8,
+                    )
+                } else {
+                    theme::MAIN
+                },
                 theme::MAIN,
             );
         }
@@ -2886,10 +2890,10 @@ fn draw_cpu(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
             .filter(|seconds| *seconds > 0)
             .map(battery_duration)
             .unwrap_or_default();
-        let prefix = format!("BAT{symbol} {}%", battery.percent);
+        let prefix = format!("BAT {symbol} {}%", battery.percent);
         let source_length = usize::from(canvas.width >= 100) * 11
             + units::display_width(&battery.percent.to_string())
-            + 1
+            + 2
             + units::display_width(&time)
             + units::display_width(&watts)
             + app.config.update_ms.to_string().len();
@@ -2997,12 +3001,117 @@ fn inline_gpu_panels(config: &Config, gpus: &[GpuSample], dedicated: &[usize]) -
 }
 
 fn gpu_height_offset(gpu: &GpuSample) -> usize {
+    let sessions = gpu.support.encoder_sessions || gpu.support.decoder_sessions;
     usize::from(gpu.support.utilization)
         + usize::from(gpu.support.power)
         + usize::from(gpu.support.encoder || gpu.support.decoder)
-        + usize::from(gpu.support.memory_total || gpu.support.memory_used)
-            * (1 + 2 * usize::from(gpu.support.memory_total && gpu.support.memory_used)
-                + 2 * usize::from(gpu.support.memory_utilization))
+        + usize::from(sessions && !gpu_sessions_share_power_row(gpu))
+        + usize::from(gpu_media_metrics_visible(
+            gpu.support.encoder_power && !gpu_sessions_share_power_row(gpu),
+            gpu.encoder_power_mw,
+            gpu.support.encoder_bandwidth,
+            gpu.encoder_read_bps,
+            gpu.encoder_write_bps,
+        ))
+        + usize::from(gpu_media_metrics_visible(
+            gpu.support.decoder_power && !gpu_sessions_share_power_row(gpu),
+            gpu.decoder_power_mw,
+            gpu.support.decoder_bandwidth,
+            gpu.decoder_read_bps,
+            gpu.decoder_write_bps,
+        ))
+        + if gpu.support.memory_total && gpu.support.memory_used {
+            5
+        } else {
+            usize::from(gpu.support.memory_total || gpu.support.memory_used)
+        }
+}
+
+fn gpu_media_metrics_visible(
+    power_supported: bool,
+    power_mw: f64,
+    bandwidth_supported: bool,
+    read_bps: u64,
+    write_bps: u64,
+) -> bool {
+    (power_supported && power_mw > 0.0)
+        || (bandwidth_supported && read_bps.saturating_add(write_bps) > 0)
+}
+
+fn gpu_sessions_share_power_row(gpu: &GpuSample) -> bool {
+    gpu.support.power
+        && gpu.power_limit_mw == 0
+        && (gpu.support.encoder_sessions || gpu.support.decoder_sessions)
+}
+
+fn gpu_session_text(gpu: &GpuSample) -> String {
+    match (gpu.support.encoder_sessions, gpu.support.decoder_sessions) {
+        (true, true) => format!(
+            "ENC {} │ DEC {}",
+            gpu.encoder_sessions, gpu.decoder_sessions
+        ),
+        (true, false) => format!("ENC {}", gpu.encoder_sessions),
+        (false, true) => format!("DEC {}", gpu.decoder_sessions),
+        (false, false) => String::new(),
+    }
+}
+
+fn compact_media_power(power_mw: f64) -> String {
+    let watts = power_mw / 1000.0;
+    if power_mw < 10.0 {
+        format!("~{power_mw:.2}mW")
+    } else if power_mw < 10_000.0 {
+        format!("~{watts:.2}W")
+    } else if power_mw < 100_000.0 {
+        format!("~{watts:.1}W")
+    } else {
+        format!("~{watts:.0}W")
+    }
+}
+
+fn gpu_session_text_with_power(gpu: &GpuSample, maximum_width: usize) -> String {
+    let engine = |label: &str, sessions: u32, supported: bool, power_mw: f64| {
+        if supported {
+            format!("{label} {sessions} {}", compact_media_power(power_mw))
+        } else {
+            format!("{label} {sessions}")
+        }
+    };
+    let candidate = match (gpu.support.encoder_sessions, gpu.support.decoder_sessions) {
+        (true, true) => format!(
+            "{} │ {}",
+            engine(
+                "ENC",
+                gpu.encoder_sessions,
+                gpu.support.encoder_power,
+                gpu.encoder_power_mw,
+            ),
+            engine(
+                "DEC",
+                gpu.decoder_sessions,
+                gpu.support.decoder_power,
+                gpu.decoder_power_mw,
+            ),
+        ),
+        (true, false) => engine(
+            "ENC",
+            gpu.encoder_sessions,
+            gpu.support.encoder_power,
+            gpu.encoder_power_mw,
+        ),
+        (false, true) => engine(
+            "DEC",
+            gpu.decoder_sessions,
+            gpu.support.decoder_power,
+            gpu.decoder_power_mw,
+        ),
+        (false, false) => String::new(),
+    };
+    if units::display_width(&candidate) <= maximum_width {
+        candidate
+    } else {
+        gpu_session_text(gpu)
+    }
 }
 
 fn gpu_panel_height(
@@ -3184,19 +3293,29 @@ fn draw_gpu(canvas: &mut Canvas, area: Rect, app: &AppState, index: usize) {
         row += 1;
     }
 
+    let sessions_inline = gpu_sessions_share_power_row(gpu);
     if gpu.support.power && row < box_y + box_height - 1 {
         let show_state = gpu.support.power_state && gpu.power_state != 32;
-        let meter_width = box_width.saturating_sub(if show_state { 25 } else { 12 });
+        let has_power_limit = gpu.power_limit_mw > 0;
+        let meter_width = if has_power_limit {
+            box_width.saturating_sub(if show_state { 25 } else { 12 })
+        } else {
+            0
+        };
         let power_percent = ratio(gpu.power_mw, gpu.power_limit_mw);
-        canvas.text_bold(box_x + 1, row, "PWR ", theme::MAIN);
-        meter_bold(
-            canvas,
-            box_x + 5,
-            row,
-            meter_width,
-            power_percent,
-            theme::Style::Cached(100),
-        );
+        if !sessions_inline {
+            canvas.text_bold(box_x + 1, row, "PWR ", theme::MAIN);
+        }
+        if has_power_limit {
+            meter_bold(
+                canvas,
+                box_x + 5,
+                row,
+                meter_width,
+                power_percent,
+                theme::Style::Cached(100),
+            );
+        }
         let watts = gpu.power_mw as f64 / 1000.0;
         let value = if gpu.power_mw < 10_000 {
             format!("{watts:>5.2}")
@@ -3205,30 +3324,52 @@ fn draw_gpu(canvas: &mut Canvas, area: Rect, app: &AppState, index: usize) {
         } else {
             format!("{watts:>5.0}")
         };
-        draw_value_unit_bold(
-            canvas,
-            box_x + 5 + meter_width,
-            row,
-            &value,
-            "W",
-            theme::Style::Cached(power_percent.round().clamp(0.0, 100.0) as u8),
-            theme::MAIN,
-        );
-        if show_state {
-            let state_x = box_x + 5 + meter_width + units::display_width(&value) + 1;
+        if sessions_inline {
+            let wattage = format!("{}W", value.trim());
+            let right_stats = if show_state {
+                format!("P-state: P{}  {wattage}", gpu.power_state)
+            } else {
+                wattage
+            };
+            let right_x = box_x + box_width - 1 - units::display_width(&right_stats);
+            let sessions = gpu_session_text_with_power(gpu, right_x.saturating_sub(box_x + 2));
             canvas.text_bold(
-                state_x,
+                box_x + 1,
                 row,
-                &format!(" P-state: {}P", if gpu.power_state <= 9 { " " } else { "" }),
+                &units::truncate(&sessions, right_x.saturating_sub(box_x + 2)),
                 theme::MAIN,
             );
-            let state_prefix_width = 11 + usize::from(gpu.power_state <= 9);
-            canvas.text_bold(
-                state_x + state_prefix_width,
+            canvas.text_bold(right_x, row, &right_stats, theme::MAIN);
+        } else {
+            draw_value_unit_bold(
+                canvas,
+                box_x + 5 + meter_width,
                 row,
-                &gpu.power_state.to_string(),
-                theme::Style::Cached(gpu.power_state.clamp(0, 100) as u8),
+                &value,
+                "W",
+                if has_power_limit {
+                    theme::Style::Cached(power_percent.round().clamp(0.0, 100.0) as u8)
+                } else {
+                    theme::MAIN
+                },
+                theme::MAIN,
             );
+            if show_state {
+                let state_x = box_x + 5 + meter_width + units::display_width(&value) + 1;
+                canvas.text_bold(
+                    state_x,
+                    row,
+                    &format!(" P-state: {}P", if gpu.power_state <= 9 { " " } else { "" }),
+                    theme::MAIN,
+                );
+                let state_prefix_width = 11 + usize::from(gpu.power_state <= 9);
+                canvas.text_bold(
+                    state_x + state_prefix_width,
+                    row,
+                    &gpu.power_state.to_string(),
+                    theme::Style::Cached(gpu.power_state.clamp(0, 100) as u8),
+                );
+            }
         }
         row += 1;
     }
@@ -3280,6 +3421,54 @@ fn draw_gpu(canvas: &mut Canvas, area: Rect, app: &AppState, index: usize) {
         row += 1;
     }
 
+    if !sessions_inline
+        && (gpu.support.encoder_sessions || gpu.support.decoder_sessions)
+        && row < box_y + box_height - 1
+    {
+        let sessions = gpu_session_text(gpu);
+        canvas.text_bold(
+            box_x + 1,
+            row,
+            &units::truncate(&sessions, box_width.saturating_sub(2)),
+            theme::MAIN,
+        );
+        row += 1;
+    }
+
+    let encoder_power =
+        (!sessions_inline && gpu.support.encoder_power).then_some(gpu.encoder_power_mw);
+    let encoder_bandwidth = (gpu.support.encoder_bandwidth
+        && gpu.encoder_read_bps.saturating_add(gpu.encoder_write_bps) > 0)
+        .then_some((gpu.encoder_read_bps, gpu.encoder_write_bps));
+    if (encoder_power.is_some() || encoder_bandwidth.is_some()) && row < box_y + box_height - 1 {
+        draw_gpu_media_engine(
+            canvas,
+            Rect::new(box_x, row, box_width, 1),
+            "ENC",
+            encoder_power,
+            encoder_bandwidth,
+            app.config.base_10_sizes,
+        );
+        row += 1;
+    }
+
+    let decoder_power =
+        (!sessions_inline && gpu.support.decoder_power).then_some(gpu.decoder_power_mw);
+    let decoder_bandwidth = (gpu.support.decoder_bandwidth
+        && gpu.decoder_read_bps.saturating_add(gpu.decoder_write_bps) > 0)
+        .then_some((gpu.decoder_read_bps, gpu.decoder_write_bps));
+    if (decoder_power.is_some() || decoder_bandwidth.is_some()) && row < box_y + box_height - 1 {
+        draw_gpu_media_engine(
+            canvas,
+            Rect::new(box_x, row, box_width, 1),
+            "DEC",
+            decoder_power,
+            decoder_bandwidth,
+            app.config.base_10_sizes,
+        );
+        row += 1;
+    }
+
     if gpu.support.memory_total && gpu.support.memory_used && row + 4 < box_y + box_height {
         let percentage = ratio(gpu.memory_used, gpu.memory_total);
         let middle = box_x + box_width / 2;
@@ -3290,7 +3479,16 @@ fn draw_gpu(canvas: &mut Canvas, area: Rect, app: &AppState, index: usize) {
         canvas.put(box_x, row, '├', theme::BOX);
         canvas.put(middle, row, '┬', theme::BOX);
         canvas.put(right, row, '┤', theme::BOX);
-        canvas.title(box_x + 2, row, "vram", theme::BOX);
+        canvas.title(
+            box_x + 2,
+            row,
+            if gpu.support.unified_memory {
+                "uma"
+            } else {
+                "vram"
+            },
+            theme::BOX,
+        );
         if gpu.support.memory_clock {
             let clock = format!("{} MHz", gpu.memory_clock_mhz);
             canvas.title(
@@ -3363,20 +3561,44 @@ fn draw_gpu(canvas: &mut Canvas, area: Rect, app: &AppState, index: usize) {
         }
     } else if (gpu.support.memory_total || gpu.support.memory_used) && row < box_y + box_height - 1
     {
-        let value = if gpu.support.memory_total {
-            gpu.memory_total
+        let kind = if gpu.support.unified_memory {
+            "UMA"
         } else {
-            gpu.memory_used
+            "VRAM"
         };
-        let label = if gpu.support.memory_total {
-            "VRAM total:"
+        let value = if gpu.support.memory_total && gpu.support.memory_used {
+            format!(
+                "{kind}: {} / {}",
+                units::bytes(gpu.memory_used, app.config.base_10_sizes),
+                units::bytes(gpu.memory_total, app.config.base_10_sizes)
+            )
+        } else if gpu.support.memory_total {
+            if gpu.support.unified_memory {
+                format!(
+                    "UMA total: {}",
+                    units::bytes(gpu.memory_total, app.config.base_10_sizes)
+                )
+            } else {
+                format!(
+                    "VRAM total: {}",
+                    units::bytes(gpu.memory_total, app.config.base_10_sizes)
+                )
+            }
+        } else if gpu.support.unified_memory {
+            format!(
+                "UMA usage: {}",
+                units::bytes(gpu.memory_used, app.config.base_10_sizes)
+            )
         } else {
-            "VRAM usage:"
+            format!(
+                "VRAM usage: {}",
+                units::bytes(gpu.memory_used, app.config.base_10_sizes)
+            )
         };
         canvas.text(
             box_x + 1,
             row,
-            &format!("{label} {}", units::bytes(value, app.config.base_10_sizes)),
+            &units::truncate(&value, box_width.saturating_sub(2)),
             theme::MAIN,
         );
     }
@@ -3403,6 +3625,34 @@ fn draw_gpu(canvas: &mut Canvas, area: Rect, app: &AppState, index: usize) {
             theme::BOX,
         );
     }
+}
+
+fn draw_gpu_media_engine(
+    canvas: &mut Canvas,
+    area: Rect,
+    label: &str,
+    power_mw: Option<f64>,
+    bandwidth: Option<(u64, u64)>,
+    base_10: bool,
+) {
+    let mut value = String::new();
+    if let Some(power_mw) = power_mw {
+        value.push_str(&format!(" P{}", compact_media_power(power_mw)));
+    }
+    if let Some((read, write)) = bandwidth {
+        value.push_str(&format!(
+            " R {}/s W {}/s",
+            units::bytes_short(read, base_10),
+            units::bytes_short(write, base_10),
+        ));
+    }
+    canvas.text_bold(area.x + 1, area.y, label, theme::MAIN);
+    canvas.text_bold(
+        area.x + 4,
+        area.y,
+        &units::truncate(&value, area.w.saturating_sub(5)),
+        theme::MAIN,
+    );
 }
 
 fn draw_inline_swap_header(
@@ -4088,7 +4338,9 @@ fn draw_disks_io(
     let disk_offset = app.disk_offset;
     let mut cy = 0usize;
     for disk in disks.into_iter().skip(disk_offset) {
-        if cy + graph_height + 1 >= area.h - 1 {
+        // The divider starts at relative row `cy + 1`; the final graph row is
+        // `cy + graph_height + 2`. Keep that row above the bottom border.
+        if cy.saturating_add(graph_height).saturating_add(2) > area.h.saturating_sub(2) {
             break;
         }
         let y = area.y + 1 + cy;
@@ -4620,8 +4872,10 @@ fn posix_regex_matches(pattern: &str, value: &str, whole: bool) -> bool {
         fn regfree(regex: *mut c_void);
     }
 
+    // REG_NOSUB has different numeric values on Darwin and glibc. Passing
+    // nmatch=0 to regexec already avoids match storage, so only request the
+    // portable extended-regex behavior here.
     const REG_EXTENDED: c_int = 1;
-    const REG_NOSUB: c_int = 4;
     let pattern = if whole {
         format!("^({pattern})$")
     } else {
@@ -4632,7 +4886,7 @@ fn posix_regex_matches(pattern: &str, value: &str, whole: bool) -> bool {
     };
     let mut regex = std::mem::MaybeUninit::<PosixRegexStorage>::zeroed();
     let regex_ptr = regex.as_mut_ptr().cast::<c_void>();
-    if unsafe { regcomp(regex_ptr, pattern.as_ptr(), REG_EXTENDED | REG_NOSUB) } != 0 {
+    if unsafe { regcomp(regex_ptr, pattern.as_ptr(), REG_EXTENDED) } != 0 {
         return false;
     }
     let matched = unsafe { regexec(regex_ptr, value.as_ptr(), 0, std::ptr::null_mut(), 0) == 0 };
@@ -4882,7 +5136,7 @@ fn draw_process_details(
     for (row, letter) in ['C', 'M', 'D'].iter().enumerate() {
         canvas.put_bold(details_x + 1, area.y + 5 + row, *letter, theme::TITLE);
     }
-    let command = sanitize_ascii_control(&process.command);
+    let command = sanitize_control(&process.command);
     let command_width = details_width.saturating_sub(5).max(1);
     let command_lines = units::display_width(&command)
         .div_ceil(command_width)
@@ -5124,15 +5378,19 @@ fn draw_processes(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
         );
         return;
     }
-    let parent_pids: HashSet<u32> = processes
-        .iter()
-        .filter(|process| {
-            processes.iter().any(|candidate| {
-                candidate.parent == process.pid && candidate.pid != candidate.parent
-            })
-        })
-        .map(|process| process.pid)
-        .collect();
+    let parent_pids: HashSet<u32> = if app.config.process_tree {
+        let pids = processes
+            .iter()
+            .map(|process| process.pid)
+            .collect::<HashSet<_>>();
+        processes
+            .iter()
+            .filter(|process| process.pid != process.parent && pids.contains(&process.parent))
+            .map(|process| process.parent)
+            .collect()
+    } else {
+        HashSet::new()
+    };
     let listed = if app.config.process_tree {
         tree_processes(
             processes,
@@ -5316,7 +5574,7 @@ fn draw_processes(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
         });
         let program_prefix = format!("{tree_prefix}{} ", process.pid);
         let program_name = process.name.clone();
-        let sanitized_command = sanitize_ascii_control(&process.command);
+        let sanitized_command = sanitize_control(&process.command);
         let short_command = sanitized_command
             .split_whitespace()
             .next()
@@ -5712,10 +5970,10 @@ fn source_center_x(total: usize, width: usize) -> usize {
         .saturating_sub(width.saturating_div(2) + 1)
 }
 
-fn sanitize_ascii_control(text: &str) -> String {
+fn sanitize_control(text: &str) -> String {
     text.chars()
         .map(|character| {
-            if character.is_ascii_control() {
+            if character.is_control() {
                 ' '
             } else {
                 character
@@ -5819,7 +6077,7 @@ fn draw_banner(canvas: &mut Canvas, y: usize) {
         "██████╔╝   ██║   ╚██████╔╝██║         ██║  ██║███████║",
         "╚═════╝    ╚═╝    ╚═════╝ ╚═╝         ╚═╝  ╚═╝╚══════╝",
     ];
-    const VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"), " (based on BTOP++ v1.4.7)");
+    const VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
     let width = BANNER
         .iter()
         .map(|line| units::display_width(line))
@@ -7613,54 +7871,73 @@ fn aggregate_tree_resources(
         pid: u32,
         by_pid: &HashMap<u32, ProcessSample>,
         children: &HashMap<u32, Vec<u32>>,
-        visiting: &mut HashSet<u32>,
         memo: &mut HashMap<u32, ProcessResources>,
     ) -> ProcessResources {
         if let Some(total) = memo.get(&pid) {
             return *total;
         }
-        let Some(process) = by_pid.get(&pid) else {
-            return ProcessResources::default();
-        };
-        if !visiting.insert(pid) {
-            return ProcessResources::default();
-        }
-        let mut resources = ProcessResources {
-            cpu: process.cpu,
-            cumulative_cpu: process.cumulative_cpu,
-            memory: process.memory,
-            threads: process.threads,
-        };
-        if let Some(group) = children.get(&pid) {
-            for child_pid in group {
-                if by_pid
-                    .get(child_pid)
-                    .is_some_and(|child| child.state == 'X')
-                {
-                    continue;
+        let mut visiting = HashSet::new();
+        let mut pending = vec![(pid, false)];
+        while let Some((current, expanded)) = pending.pop() {
+            if memo.contains_key(&current) {
+                continue;
+            }
+            let Some(process) = by_pid.get(&current) else {
+                memo.insert(current, ProcessResources::default());
+                continue;
+            };
+            if expanded {
+                visiting.remove(&current);
+                let mut resources = ProcessResources {
+                    cpu: process.cpu,
+                    cumulative_cpu: process.cumulative_cpu,
+                    memory: process.memory,
+                    threads: process.threads,
+                };
+                if let Some(group) = children.get(&current) {
+                    for child_pid in group {
+                        if by_pid
+                            .get(child_pid)
+                            .is_some_and(|child| child.state == 'X')
+                        {
+                            continue;
+                        }
+                        if let Some(child) = memo.get(child_pid) {
+                            resources.cpu += child.cpu;
+                            resources.cumulative_cpu += child.cumulative_cpu;
+                            resources.memory = resources.memory.saturating_add(child.memory);
+                            resources.threads = resources.threads.saturating_add(child.threads);
+                        }
+                    }
                 }
-                let child = total(*child_pid, by_pid, children, visiting, memo);
-                resources.cpu += child.cpu;
-                resources.cumulative_cpu += child.cumulative_cpu;
-                resources.memory = resources.memory.saturating_add(child.memory);
-                resources.threads = resources.threads.saturating_add(child.threads);
+                memo.insert(current, resources);
+                continue;
+            }
+            if !visiting.insert(current) {
+                continue;
+            }
+            pending.push((current, true));
+            if let Some(group) = children.get(&current) {
+                for child_pid in group.iter().rev() {
+                    if memo.contains_key(child_pid)
+                        || visiting.contains(child_pid)
+                        || by_pid
+                            .get(child_pid)
+                            .is_some_and(|child| child.state == 'X')
+                    {
+                        continue;
+                    }
+                    pending.push((*child_pid, false));
+                }
             }
         }
-        visiting.remove(&pid);
-        memo.insert(pid, resources);
-        resources
+        memo.get(&pid).copied().unwrap_or_default()
     }
 
     let mut memo = HashMap::new();
     for process in processes.iter_mut() {
         if aggregate_all || collapsed.contains(&process.pid) {
-            let resources = total(
-                process.pid,
-                &by_pid,
-                &children,
-                &mut HashSet::new(),
-                &mut memo,
-            );
+            let resources = total(process.pid, &by_pid, &children, &mut memo);
             process.cpu = resources.cpu;
             process.cumulative_cpu = resources.cumulative_cpu;
             process.memory = resources.memory;
@@ -7698,17 +7975,20 @@ fn tree_processes<'a>(
         visited: &mut HashSet<u32>,
         output: &mut Vec<(&'a ProcessSample, usize)>,
     ) {
-        if !visited.insert(process.pid) {
-            return;
-        }
-        output.push((process, depth));
-        if collapsed.contains(&process.pid) {
-            mark_descendants(process.pid, children, visited);
-            return;
-        }
-        if let Some(group) = children.get(&process.pid) {
-            for child in group {
-                append(child, depth + 1, children, collapsed, visited, output);
+        let mut pending = vec![(process, depth)];
+        while let Some((current, current_depth)) = pending.pop() {
+            if !visited.insert(current.pid) {
+                continue;
+            }
+            output.push((current, current_depth));
+            if collapsed.contains(&current.pid) {
+                mark_descendants(current.pid, children, visited);
+                continue;
+            }
+            if let Some(group) = children.get(&current.pid) {
+                for child in group.iter().rev() {
+                    pending.push((*child, current_depth + 1));
+                }
             }
         }
     }
@@ -7718,10 +7998,13 @@ fn tree_processes<'a>(
         children: &HashMap<u32, Vec<&ProcessSample>>,
         visited: &mut HashSet<u32>,
     ) {
-        if let Some(group) = children.get(&pid) {
-            for child in group {
-                if visited.insert(child.pid) {
-                    mark_descendants(child.pid, children, visited);
+        let mut pending = vec![pid];
+        while let Some(parent) = pending.pop() {
+            if let Some(group) = children.get(&parent) {
+                for child in group {
+                    if visited.insert(child.pid) {
+                        pending.push(child.pid);
+                    }
                 }
             }
         }
@@ -8122,6 +8405,7 @@ impl Canvas {
     }
     fn put(&mut self, x: usize, y: usize, ch: char, style: theme::Style) {
         if x < self.width && y < self.height {
+            let ch = if ch.is_control() { ' ' } else { ch };
             self.clear_wide_overlap(x, y);
             self.cells[y * self.width + x] = Cell {
                 ch,
@@ -8137,6 +8421,7 @@ impl Canvas {
     }
     fn put_bold(&mut self, x: usize, y: usize, ch: char, style: theme::Style) {
         if x < self.width && y < self.height {
+            let ch = if ch.is_control() { ' ' } else { ch };
             self.clear_wide_overlap(x, y);
             self.cells[y * self.width + x] = Cell {
                 ch,
@@ -8289,7 +8574,7 @@ impl Canvas {
         }
     }
     fn append_combining(&mut self, x: usize, y: usize, ch: char) {
-        if x == 0 || x > self.width || y >= self.height {
+        if ch.is_control() || x == 0 || x > self.width || y >= self.height {
             return;
         }
         let mut index = y * self.width + x - 1;
@@ -8603,6 +8888,25 @@ mod tests {
     }
 
     #[test]
+    fn terminal_controls_from_rendered_text_are_discarded() {
+        let mut canvas = Canvas::new(80, 2);
+        canvas.text_bold(0, 0, "safe\x1b]52;c;SGVsbG8=\x07\u{009b}tail", theme::MAIN);
+        canvas.control_title(
+            0,
+            1,
+            "safe\x1b]52;c;SGVsbG8=\x07\u{009b}tail",
+            &[],
+            true,
+            theme::MAIN,
+        );
+
+        let output = canvas.finish();
+        assert!(!output.contains("\x1b]52;"));
+        assert!(!output.contains('\x07'));
+        assert!(!output.contains('\u{009b}'));
+    }
+
+    #[test]
     fn deterministic_full_frames_cover_reference_terminal_layouts() {
         let cases = [
             (Size { cols: 80, rows: 24 }, "cpu"),
@@ -8838,7 +9142,7 @@ mod tests {
 
         let mut canvas = Canvas::new(180, 7);
         draw_banner(&mut canvas, 0);
-        let version_text = concat!("v", env!("CARGO_PKG_VERSION"), " (based on BTOP++ v1.4.7)");
+        let version_text = concat!("v", env!("CARGO_PKG_VERSION"));
         let version = canvas.cells[6 * 180..7 * 180]
             .iter()
             .position(|cell| cell.ch == 'v')
@@ -8950,7 +9254,7 @@ mod tests {
         gpu.support.power = true;
         gpu.support.memory_total = true;
         gpu.support.memory_used = true;
-        assert_eq!(minimum_size(&config, &[gpu]), Size { cols: 41, rows: 9 });
+        assert_eq!(minimum_size(&config, &[gpu]), Size { cols: 41, rows: 11 });
     }
 
     #[test]
@@ -9014,6 +9318,171 @@ mod tests {
         assert!(canvas.cells[7 * 100 + 95].bold);
         assert_eq!(canvas.cells[7 * 100 + 97].style, theme::MAIN);
         assert!(canvas.cells[7 * 100 + 97].bold);
+    }
+
+    #[test]
+    fn unified_gpu_uses_uma_label_and_does_not_invent_a_power_limit() {
+        let mut app = app();
+        let mut gpu = GpuSample {
+            name: "Apple A18 Pro 5-core GPU".into(),
+            power_mw: 430,
+            power_limit_mw: 0,
+            power_state: 3,
+            memory_total: 8 * 1024 * 1024 * 1024,
+            memory_used: 700 * 1024 * 1024,
+            ..GpuSample::default()
+        };
+        gpu.support.power = true;
+        gpu.support.power_state = true;
+        gpu.support.memory_total = true;
+        gpu.support.memory_used = true;
+        gpu.support.unified_memory = true;
+        app.sample.gpus.push(gpu);
+        app.gpu_histories.push(GpuHistory::default());
+        let mut canvas = Canvas::new(100, 12);
+
+        draw_gpu(&mut canvas, Rect::new(0, 0, 100, 12), &app, 0);
+
+        let rows = (0..12)
+            .map(|row| canvas_row(&canvas, row))
+            .collect::<Vec<_>>();
+        assert!(
+            rows.iter()
+                .any(|row| row.to_ascii_lowercase().contains("uma"))
+        );
+        assert!(rows.iter().any(|row| row.contains("Used:")));
+        assert!(rows.iter().any(|row| row.contains("700 MiB")));
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("PWR  0.43W P-state:  P3"))
+        );
+    }
+
+    #[test]
+    fn apple_media_counts_share_the_bold_right_aligned_power_row() {
+        let mut app = app();
+        let mut gpu = GpuSample {
+            name: "Apple GPU".into(),
+            power_mw: 180,
+            power_limit_mw: 0,
+            power_state: 1,
+            encoder_sessions: 0,
+            decoder_sessions: 1,
+            ..GpuSample::default()
+        };
+        gpu.support.power = true;
+        gpu.support.power_state = true;
+        gpu.support.encoder_sessions = true;
+        gpu.support.decoder_sessions = true;
+        app.sample.gpus.push(gpu);
+        app.gpu_histories.push(GpuHistory::default());
+        let mut canvas = Canvas::new(100, 8);
+
+        draw_gpu(&mut canvas, Rect::new(0, 0, 100, 8), &app, 0);
+
+        let (row, text) = (0..8)
+            .map(|row| (row, canvas_row(&canvas, row)))
+            .find(|(_, text)| text.contains("ENC 0 │ DEC 1"))
+            .unwrap();
+        assert!(text.contains("P-state: P1  0.18W"));
+        let enc = text.find("ENC").unwrap();
+        let power = text.find("P-state:").unwrap();
+        assert!(canvas.cells[row * 100 + enc].bold);
+        assert!(canvas.cells[row * 100 + power].bold);
+        assert!(!text.contains("PWR"));
+        assert!(!canvas_text(&canvas).contains("ENC P~"));
+        assert!(!canvas_text(&canvas).contains("DEC P~"));
+    }
+
+    #[test]
+    fn constrained_gpu_panel_keeps_both_uma_used_and_total_values() {
+        let mut app = app();
+        let mut gpu = GpuSample {
+            name: "Apple GPU".into(),
+            memory_total: 8 * 1024 * 1024 * 1024,
+            memory_used: 700 * 1024 * 1024,
+            ..GpuSample::default()
+        };
+        gpu.support.memory_total = true;
+        gpu.support.memory_used = true;
+        gpu.support.unified_memory = true;
+        app.sample.gpus.push(gpu);
+        app.gpu_histories.push(GpuHistory::default());
+        let mut canvas = Canvas::new(60, 5);
+
+        draw_gpu(&mut canvas, Rect::new(0, 0, 60, 5), &app, 0);
+
+        let rows = (0..5)
+            .map(|row| canvas_row(&canvas, row))
+            .collect::<Vec<_>>();
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("UMA: 700 MiB / 8.00 GiB"))
+        );
+    }
+
+    #[test]
+    fn gpu_media_sessions_and_unit_bearing_metrics_are_rendered_without_percentages() {
+        let mut app = app();
+        let mut gpu = GpuSample {
+            name: "Apple A18 Pro 5-core GPU".into(),
+            encoder_power_mw: 120.0,
+            decoder_power_mw: 50.0,
+            encoder_read_bps: 1024 * 1024,
+            encoder_write_bps: 2 * 1024 * 1024,
+            decoder_read_bps: 3 * 1024 * 1024,
+            decoder_write_bps: 4 * 1024 * 1024,
+            encoder_sessions: 1,
+            decoder_sessions: 2,
+            ..GpuSample::default()
+        };
+        gpu.support.encoder_power = true;
+        gpu.support.decoder_power = true;
+        gpu.support.encoder_bandwidth = true;
+        gpu.support.decoder_bandwidth = true;
+        gpu.support.encoder_sessions = true;
+        gpu.support.decoder_sessions = true;
+        app.sample.gpus.push(gpu);
+        app.gpu_histories.push(GpuHistory::default());
+        let mut canvas = Canvas::new(100, 15);
+
+        draw_gpu(&mut canvas, Rect::new(0, 0, 100, 15), &app, 0);
+
+        let rows = (0..15)
+            .map(|row| canvas_row(&canvas, row))
+            .collect::<Vec<_>>();
+        assert!(rows.iter().any(|row| row.contains("ENC 1 │ DEC 2")));
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("ENC P~0.12W R ") && row.contains("/s W "))
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("DEC P~0.05W R ") && row.contains("/s W "))
+        );
+        assert!(!rows.iter().any(|row| row.contains("ENC %")));
+    }
+
+    #[test]
+    fn tiny_media_power_uses_milliwatts_and_bold_text() {
+        let mut canvas = Canvas::new(40, 1);
+
+        draw_gpu_media_engine(
+            &mut canvas,
+            Rect::new(0, 0, 40, 1),
+            "ENC",
+            Some(3.0),
+            None,
+            false,
+        );
+
+        assert!(canvas_row(&canvas, 0).contains("ENC P~3.00mW"));
+        assert!(
+            canvas.cells[..10]
+                .iter()
+                .filter(|cell| cell.ch != ' ')
+                .all(|cell| cell.bold)
+        );
     }
 
     #[test]
@@ -9298,6 +9767,22 @@ mod tests {
                 "column {x} lost the row's bold rendition"
             );
         }
+    }
+
+    #[test]
+    fn battery_status_symbol_is_separated_from_its_label() {
+        let mut app = app();
+        app.sample.cpu.battery = Some(crate::collect::BatterySample {
+            percent: 100,
+            status: "full".into(),
+            ..crate::collect::BatterySample::default()
+        });
+        let mut canvas = Canvas::new(100, 12);
+
+        draw_cpu(&mut canvas, Rect::new(0, 0, 100, 12), &mut app);
+
+        assert!(canvas_row(&canvas, 0).contains("BAT ■ 100%"));
+        assert!(!canvas_row(&canvas, 0).contains("BAT■"));
     }
 
     #[test]
@@ -10022,6 +10507,34 @@ mod tests {
     }
 
     #[test]
+    fn disk_io_mode_keeps_the_last_write_row_above_the_bottom_border() {
+        let mut app = app();
+        app.config.set_value("io_mode", "true");
+        app.sample.memory.disks = (0..2)
+            .map(|index| DiskSample {
+                mount: format!("/io-{index}"),
+                total: 1024 * 1024 * 1024,
+                used: 512 * 1024 * 1024,
+                free: 512 * 1024 * 1024,
+                io_supported: true,
+                ..DiskSample::default()
+            })
+            .collect();
+        for index in 0..2 {
+            app.disk_histories
+                .insert(format!("/io-{index}"), DiskHistory::default());
+        }
+        let mut canvas = Canvas::new(80, 9);
+
+        draw_memory(&mut canvas, Rect::new(0, 0, 80, 9), &mut app);
+
+        assert!(canvas_text(&canvas).contains("io-0"));
+        assert!(!canvas_text(&canvas).contains("io-1"));
+        assert!(!canvas_row(&canvas, 8).contains('W'));
+        assert_eq!(app.disk_scrollbar.unwrap().maximum_offset, 1);
+    }
+
+    #[test]
     fn narrow_disks_use_btop_labels_units_meters_and_mount_order() {
         let mut app = app();
         app.sample.memory.swap_total = 2 * 1024 * 1024 * 1024;
@@ -10197,9 +10710,14 @@ mod tests {
         assert!(!matches_process_filter(&process, "!--namespace"));
         assert!(matches_process_filter(&process, "!.*--namespace.*"));
         assert!(!matches_process_filter(&process, "!["));
+        assert!(posix_regex_matches(
+            "^first.second$",
+            "first\nsecond",
+            false
+        ));
         assert_eq!(clip_text("systemd-timesyncd", 7), "systemd");
         assert_eq!(clip_text_with_plus("systemd-timesync", 5), "syst+");
-        assert_eq!(sanitize_ascii_control("one\ntwo\tthree"), "one two three");
+        assert_eq!(sanitize_control("one\ntwo\tthree"), "one two three");
     }
 
     #[test]
@@ -10339,6 +10857,38 @@ mod tests {
 
         aggregate_tree_resources(&mut processes, true, &HashSet::new());
         assert_eq!(processes[1].memory, 500);
+    }
+
+    #[test]
+    fn deep_process_trees_do_not_use_the_call_stack() {
+        const DEPTH: u32 = 10_000;
+        let mut processes = (1..=DEPTH)
+            .map(|pid| ProcessSample {
+                pid,
+                parent: if pid == 1 { 1 } else { pid - 1 },
+                cpu: 1.0,
+                cumulative_cpu: 1.0,
+                memory: 1,
+                threads: 1,
+                ..ProcessSample::default()
+            })
+            .collect::<Vec<_>>();
+
+        aggregate_tree_resources(&mut processes, false, &HashSet::from([1]));
+        assert_eq!(processes[0].memory, u64::from(DEPTH));
+        assert_eq!(processes[0].threads, DEPTH);
+
+        let listed = tree_processes(
+            processes.iter().collect(),
+            ProcessSort::Pid,
+            false,
+            &HashSet::new(),
+        );
+        assert_eq!(listed.len(), DEPTH as usize);
+        assert_eq!(
+            listed.last().map(|(_, depth)| *depth),
+            Some(DEPTH as usize - 1)
+        );
     }
 
     #[test]

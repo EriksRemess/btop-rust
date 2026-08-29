@@ -94,10 +94,7 @@ fn next_value(args: &mut impl Iterator<Item = String>, name: &str) -> Result<Str
 }
 
 pub fn print_version(verbose: bool) {
-    println!(
-        "btoprs \x1b[1mv{}\x1b[0m (based on BTOP++ v1.4.7)",
-        env!("CARGO_PKG_VERSION")
-    );
+    println!("btoprs \x1b[1mv{}\x1b[0m", env!("CARGO_PKG_VERSION"));
     if verbose {
         println!("Compiled with: {}", env!("BTOPRS_RUSTC_VERSION"));
         println!(
@@ -108,7 +105,7 @@ pub fn print_version(verbose: bool) {
 }
 
 pub fn print_usage() {
-    println!("\x1b[1;4mUsage:\x1b[0m \x1b[1mbtop\x1b[0m [OPTIONS]");
+    println!("\x1b[1;4mUsage:\x1b[0m \x1b[1mbtoprs\x1b[0m [OPTIONS]");
     println!();
     println!("\x1b[1;4mOptions:\x1b[0m");
     println!("  \x1b[1m-c, --config\x1b[0m <file>     Path to a config file");
