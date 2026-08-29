@@ -734,6 +734,7 @@ mod tests {
             values.get("color_theme").map(String::as_str),
             Some("Default")
         );
+        assert_eq!(values.get("freq_mode").map(String::as_str), Some("highest"));
         assert!(values.contains_key("custom_gpu_name5"));
     }
 

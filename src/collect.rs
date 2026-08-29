@@ -19,6 +19,7 @@ pub struct CpuSample {
     pub cores: Vec<f64>,
     pub load: [f64; 3],
     pub frequency: String,
+    pub core_frequencies_mhz: Vec<u32>,
     pub temperature: Option<f64>,
     pub temperature_max: f64,
     pub core_temperatures: Vec<Option<f64>>,
@@ -138,6 +139,8 @@ pub struct Collector {
     cpu_name: String,
     users: HashMap<u32, String>,
     gpus: GpuCollector,
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    apple_cpu_frequency: Option<crate::gpu::macos::AppleCpuFrequencyCollector>,
     rapl_previous: Option<(u64, Instant)>,
     container_engine: Option<String>,
 }
@@ -164,6 +167,8 @@ impl Collector {
             },
             users: read_users(),
             gpus: GpuCollector::new(config),
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            apple_cpu_frequency: crate::gpu::macos::AppleCpuFrequencyCollector::new(),
             rapl_previous: None,
             container_engine: detect_container(),
         })
@@ -318,7 +323,8 @@ impl Collector {
                 fields,
                 cores: percentages.into_iter().skip(1).collect(),
                 load,
-                frequency: read_frequency(config.value("freq_mode").unwrap_or("first")),
+                frequency: read_frequency(config.value("freq_mode").unwrap_or("highest")),
+                core_frequencies_mhz: Vec::new(),
                 temperature: (temperature > 0.0).then_some(temperature),
                 temperature_max,
                 core_temperatures: read_core_temperatures(core_count, config),
@@ -1940,10 +1946,10 @@ mod tests {
     #[test]
     fn cpu_frequency_modes_match_btop_labels() {
         let frequencies = [2_000.0, 3_500.0, 4_000.0];
-        assert_eq!(calculate_frequency("first", &frequencies), "2.0 GHz");
         assert_eq!(calculate_frequency("lowest", &frequencies), "2.0 GHz");
         assert_eq!(calculate_frequency("highest", &frequencies), "4.0 GHz");
         assert_eq!(calculate_frequency("average", &frequencies), "3.2 GHz");
+        assert_eq!(calculate_frequency("first", &frequencies), "2.0 GHz");
         assert_eq!(
             calculate_frequency("range", &frequencies),
             "2.0 GHz - 4.0 GHz"

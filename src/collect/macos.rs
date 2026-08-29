@@ -87,17 +87,20 @@ pub(super) fn collect_cpu(
     }
     let core_count = percentages.len().saturating_sub(1);
     let (temperature, core_temperatures) = cpu_temperatures(config.check_temperature, core_count);
+    let (frequency, core_frequencies_mhz) = if config.show_cpu_frequency {
+        read_frequency(collector, config.value("freq_mode").unwrap_or("highest"))
+            .unwrap_or_default()
+    } else {
+        (String::new(), Vec::new())
+    };
     Ok((
         CpuSample {
             total: percentages.first().copied().unwrap_or(0.0),
             fields,
             cores: percentages.into_iter().skip(1).collect(),
             load,
-            frequency: config
-                .show_cpu_frequency
-                .then(read_frequency)
-                .flatten()
-                .unwrap_or_default(),
+            frequency,
+            core_frequencies_mhz,
             temperature,
             temperature_max: 95.0,
             core_temperatures,
@@ -204,9 +207,31 @@ fn percent(value: u64, total: u64) -> f64 {
     }
 }
 
-fn read_frequency() -> Option<String> {
+fn read_frequency(collector: &mut Collector, mode: &str) -> Option<(String, Vec<u32>)> {
+    #[cfg(target_arch = "aarch64")]
+    if collector.apple_cpu_frequency.is_none() {
+        collector.apple_cpu_frequency = crate::gpu::macos::AppleCpuFrequencyCollector::new();
+    }
+    #[cfg(target_arch = "aarch64")]
+    if let Some(frequencies) = collector
+        .apple_cpu_frequency
+        .as_mut()
+        .map(crate::gpu::macos::AppleCpuFrequencyCollector::collect_mhz)
+        .filter(|frequencies| !frequencies.is_empty())
+    {
+        let summary = super::calculate_frequency(mode, &frequencies);
+        let cores = frequencies
+            .into_iter()
+            .map(|frequency| frequency.round() as u32)
+            .collect();
+        return Some((summary, cores));
+    }
+
     let hz = sysctl_value::<u64>("hw.cpufrequency")?;
-    Some(super::normalize_frequency(hz as f64 / 1_000_000.0))
+    Some((
+        super::normalize_frequency(hz as f64 / 1_000_000.0),
+        Vec::new(),
+    ))
 }
 
 fn read_uptime() -> u64 {
@@ -1659,6 +1684,7 @@ mod tests {
         let sample = collector.collect(&config, None).unwrap();
 
         assert!(!sample.cpu.name.is_empty());
+        assert!(!sample.cpu.frequency.is_empty());
         assert!(!sample.cpu.cores.is_empty());
         assert!(sample.memory.total > 0);
         assert!(sample.memory.disks.iter().any(|disk| disk.mount == "/"));

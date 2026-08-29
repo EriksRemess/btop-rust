@@ -2286,27 +2286,35 @@ fn draw_cpu(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
     let dedicated_gpus = shown_gpu_panels(&app.config, &app.sample.gpus);
     let inline_gpus = inline_gpu_panels(&app.config, &app.sample.gpus, &dedicated_gpus);
     let show_temps = app.config.check_temperature && cpu.temperature.is_some();
+    let show_core_frequencies = app.config.show_cpu_frequency
+        && cpu
+            .core_frequencies_mhz
+            .iter()
+            .any(|frequency| *frequency > 0);
+    let core_frequency_width = 9 * usize::from(show_core_frequencies);
     let core_count = cpu.cores.len().max(1);
     let available_rows = area.h.saturating_sub(5 + inline_gpus.len()).max(1);
     let mut columns = core_count.saturating_add(1).div_ceil(available_rows).max(2);
     let right_space = area.w.saturating_sub(area.w / 3);
     let column_size;
-    if columns * (21 + 12 * usize::from(show_temps)) < right_space {
+    if columns * (21 + 12 * usize::from(show_temps) + core_frequency_width) < right_space {
         column_size = 2;
-    } else if columns * (15 + 6 * usize::from(show_temps)) < right_space {
+    } else if columns * (15 + 6 * usize::from(show_temps) + core_frequency_width) < right_space {
         column_size = 1;
-    } else if columns * (8 + 6 * usize::from(show_temps)) < right_space {
+    } else if columns * (8 + 6 * usize::from(show_temps) + core_frequency_width) < right_space {
         column_size = 0;
     } else {
-        columns = (right_space / (8 + 6 * usize::from(show_temps))).max(1);
+        columns = (right_space / (8 + 6 * usize::from(show_temps) + core_frequency_width)).max(1);
         column_size = 0;
     }
     let box_width = if column_size == 0 {
-        (8 + 6 * usize::from(show_temps)) * columns + 1
+        (8 + 6 * usize::from(show_temps) + core_frequency_width) * columns + 1
     } else if column_size == 1 {
-        (15 + 6 * usize::from(show_temps)) * columns - columns.saturating_sub(1)
+        (15 + 6 * usize::from(show_temps) + core_frequency_width) * columns
+            - columns.saturating_sub(1)
     } else {
-        (21 + 12 * usize::from(show_temps)) * columns - columns.saturating_sub(1)
+        (21 + 12 * usize::from(show_temps) + core_frequency_width) * columns
+            - columns.saturating_sub(1)
     }
     .min(area.w.saturating_sub(4));
     let box_height =
@@ -2668,6 +2676,13 @@ fn draw_cpu(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
             core_style,
         );
         cursor += percent_width + 1;
+        if show_core_frequencies
+            && let Some(frequency) = cpu.core_frequencies_mhz.get(index).copied()
+            && frequency > 0
+        {
+            canvas.text_bold(cursor, y, &format_core_frequency(frequency), core_style);
+            cursor += 9;
+        }
         if show_temps
             && app.config.show_core_temperature
             && let Some(temp) = cpu.core_temperatures.get(index).copied().flatten()
@@ -2945,6 +2960,10 @@ fn battery_duration(seconds: u64) -> String {
     } else {
         format!("{hours:02}:{minutes:02}")
     }
+}
+
+fn format_core_frequency(mhz: u32) -> String {
+    format!(" {:>4.2} GHz", f64::from(mhz) / 1_000.0)
 }
 
 fn converted_temperature(celsius: f64, config: &Config) -> (f64, &'static str) {
@@ -6972,6 +6991,9 @@ fn option_description(option: &str) -> &'static [&'static str] {
         "show_cpu_freq" => &[
             "Show CPU frequency.",
             "",
+            "On supported CPUs, live clocks are also",
+            "shown beside the individual cores.",
+            "",
             "Can cause slowdowns on systems with many",
             "cores and certain kernel versions.",
         ],
@@ -9768,6 +9790,38 @@ mod tests {
                 canvas.cells[row + x].bold,
                 "column {x} lost the row's bold rendition"
             );
+        }
+    }
+
+    #[test]
+    fn apple_core_frequencies_are_shown_beside_each_core() {
+        let mut app = app();
+        app.sample.cpu.cores = vec![25.0, 50.0];
+        app.sample.cpu.core_frequencies_mhz = vec![816, 4_044];
+        app.sample.cpu.temperature = Some(50.0);
+        app.sample.cpu.core_temperatures = vec![Some(48.0), Some(52.0)];
+        app.core_histories = vec![VecDeque::from([25.0]), VecDeque::from([50.0])];
+        app.core_temperature_histories = vec![VecDeque::from([48.0]), VecDeque::from([52.0])];
+        let mut canvas = Canvas::new(120, 14);
+
+        draw_cpu(&mut canvas, Rect::new(0, 0, 120, 14), &mut app);
+
+        let output = (0..canvas.height)
+            .map(|row| canvas_row(&canvas, row))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for frequency in ["0.82 GHz", "4.04 GHz"] {
+            assert!(output.contains(frequency));
+            let needle = frequency.chars().collect::<Vec<_>>();
+            let cells = canvas
+                .cells
+                .chunks(canvas.width)
+                .find_map(|row| {
+                    row.windows(needle.len())
+                        .find(|window| window.iter().map(|cell| cell.ch).eq(needle.iter().copied()))
+                })
+                .expect("rendered frequency cells");
+            assert!(cells.iter().all(|cell| cell.bold));
         }
     }
 

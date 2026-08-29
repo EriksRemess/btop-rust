@@ -10,11 +10,15 @@ collector supports both Apple silicon and the Intel Macs supported by macOS 26.
 Apple GPU and thermal metrics are optional Apple-silicon features; metrics that
 the running OS does not expose are hidden.
 
-On Apple silicon, the GPU collector dynamically resolves IOReport and thermal
-interfaces and reads AGX registry snapshots. On macOS 26 and 27 it can report
-GPU activity, weighted clock, dominant performance state, estimated power,
-temperature, core count, resident unified-memory use, and GPU memory-bandwidth
-activity from the AGX DCS histogram. Unified memory is
+On Apple silicon, the collectors dynamically resolve IOReport and thermal
+interfaces and read power-manager and AGX registry snapshots. CPU frequency is
+derived from per-core performance-state residency and the SoC's frequency
+tables when the legacy CPU-frequency sysctl is unavailable. Available live
+clocks are shown beside the individual CPU cores. On macOS 26 and 27 the GPU
+collector can report activity, weighted
+clock, dominant performance state, estimated power, temperature, core count,
+resident unified-memory use, and GPU memory-bandwidth activity from the AGX DCS
+histogram. Unified memory is
 labeled UMA rather than VRAM. AVE encoder and AVD decoder session counts are
 shown directly. Estimated media-engine power and DCS read/write traffic are
 shown with their units when the current interval produces usable counters; no

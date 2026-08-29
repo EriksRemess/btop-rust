@@ -179,6 +179,142 @@ pub(crate) struct AppleGpuCollector {
     smc: Option<AppleSmc>,
 }
 
+pub(crate) struct AppleCpuFrequencyCollector {
+    api: IoReportApi,
+    subscription: IoReportSubscription,
+    channels: CfRef,
+    previous: CfRef,
+    efficiency_frequencies_mhz: Vec<u32>,
+    performance_frequencies_mhz: Vec<u32>,
+}
+
+impl AppleCpuFrequencyCollector {
+    pub(crate) fn new() -> Option<Self> {
+        let api = IoReportApi::load()?;
+        let group = cf_string("CPU Stats")?;
+        let subgroup = cf_string("CPU Core Performance States")?;
+        let source = unsafe { (api.copy_channels)(group, subgroup, 0, 0, 0) };
+        unsafe {
+            CFRelease(group);
+            CFRelease(subgroup);
+        }
+        if unsafe { !cf_is_type(source, CFDictionaryGetTypeID()) } {
+            if !source.is_null() {
+                unsafe { CFRelease(source) };
+            }
+            return None;
+        }
+        let channels = unsafe {
+            CFDictionaryCreateMutableCopy(ptr::null(), CFDictionaryGetCount(source), source)
+        };
+        unsafe { CFRelease(source) };
+        if channels.is_null() {
+            return None;
+        }
+        let mut subscribed_channels = ptr::null();
+        let subscription = unsafe {
+            (api.create_subscription)(
+                ptr::null_mut(),
+                channels,
+                &mut subscribed_channels,
+                0,
+                ptr::null(),
+            )
+        };
+        if !subscribed_channels.is_null() {
+            unsafe { CFRelease(subscribed_channels) };
+        }
+        if subscription.is_null() {
+            unsafe { CFRelease(channels) };
+            return None;
+        }
+        let previous = unsafe { (api.create_samples)(subscription, channels, ptr::null()) };
+        if previous.is_null() {
+            unsafe {
+                CFRelease(subscription);
+                CFRelease(channels);
+            }
+            return None;
+        }
+        let (efficiency_frequencies_mhz, performance_frequencies_mhz) = cpu_frequencies();
+        if efficiency_frequencies_mhz.is_empty() || performance_frequencies_mhz.is_empty() {
+            unsafe {
+                CFRelease(previous);
+                CFRelease(subscription);
+                CFRelease(channels);
+            }
+            return None;
+        }
+        Some(Self {
+            api,
+            subscription,
+            channels,
+            previous,
+            efficiency_frequencies_mhz,
+            performance_frequencies_mhz,
+        })
+    }
+
+    pub(crate) fn collect_mhz(&mut self) -> Vec<f64> {
+        let current =
+            unsafe { (self.api.create_samples)(self.subscription, self.channels, ptr::null()) };
+        if current.is_null() {
+            return Vec::new();
+        }
+        let delta = unsafe { (self.api.create_samples_delta)(self.previous, current, ptr::null()) };
+        unsafe { CFRelease(self.previous) };
+        self.previous = current;
+        if unsafe { !cf_is_type(delta, CFDictionaryGetTypeID()) } {
+            if !delta.is_null() {
+                unsafe { CFRelease(delta) };
+            }
+            return Vec::new();
+        }
+        let Some(key) = cf_string("IOReportChannels") else {
+            unsafe { CFRelease(delta) };
+            return Vec::new();
+        };
+        let items = unsafe { CFDictionaryGetValue(delta, key) };
+        unsafe { CFRelease(key) };
+        if unsafe { !cf_is_type(items, CFArrayGetTypeID()) } {
+            unsafe { CFRelease(delta) };
+            return Vec::new();
+        }
+        let mut frequencies = Vec::new();
+        for index in 0..unsafe { CFArrayGetCount(items) } {
+            let item = unsafe { CFArrayGetValueAtIndex(items, index) };
+            let channel = cf_string_value(unsafe { (self.api.channel_name)(item) });
+            let table = if channel.contains("PCPU") {
+                &self.performance_frequencies_mhz
+            } else if channel.contains("ECPU") || channel.contains("MCPU") {
+                &self.efficiency_frequencies_mhz
+            } else {
+                continue;
+            };
+            if let Some(frequency) = residency_weighted_frequency(item, table, &self.api) {
+                let tier = usize::from(channel.contains("PCPU"));
+                frequencies.push((tier, channel, frequency));
+            }
+        }
+        unsafe { CFRelease(delta) };
+        frequencies.sort_unstable_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+        frequencies
+            .into_iter()
+            .map(|(_, _, frequency)| frequency)
+            .collect()
+    }
+}
+
+impl Drop for AppleCpuFrequencyCollector {
+    fn drop(&mut self) {
+        unsafe {
+            CFRelease(self.previous);
+            CFRelease(self.channels);
+            CFRelease(self.subscription);
+        }
+    }
+}
+
 #[derive(Default)]
 struct GpuDelta {
     utilization: u32,
@@ -972,6 +1108,156 @@ fn average(values: &[f64]) -> Option<f64> {
     (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
 }
 
+fn residency_weighted_frequency(
+    item: CfRef,
+    frequencies_mhz: &[u32],
+    api: &IoReportApi,
+) -> Option<f64> {
+    let states = unsafe { (api.state_count)(item) }.max(0);
+    let active_start = (0..states).find(|state| {
+        let name = cf_string_value(unsafe { (api.state_name)(item, *state) });
+        !matches!(name.as_str(), "IDLE" | "DOWN" | "OFF")
+    })?;
+    let count = (states - active_start).min(frequencies_mhz.len() as i32);
+    if count <= 0 {
+        return None;
+    }
+    let residencies = (0..count)
+        .map(|offset| unsafe { (api.state_residency)(item, active_start + offset) }.max(0) as u64)
+        .collect::<Vec<_>>();
+    weighted_frequency_from_residencies(&residencies, frequencies_mhz)
+}
+
+fn weighted_frequency_from_residencies(
+    residencies: &[u64],
+    frequencies_mhz: &[u32],
+) -> Option<f64> {
+    let minimum = frequencies_mhz
+        .iter()
+        .copied()
+        .find(|frequency| *frequency > 0)?;
+    let (active, weighted) = residencies.iter().zip(frequencies_mhz).fold(
+        (0_u128, 0_u128),
+        |(active, weighted), (residency, frequency)| {
+            let residency = u128::from(*residency);
+            (
+                active.saturating_add(residency),
+                weighted.saturating_add(residency.saturating_mul(u128::from(*frequency))),
+            )
+        },
+    );
+    Some(if active > 0 && weighted > 0 {
+        weighted as f64 / active as f64
+    } else {
+        f64::from(minimum)
+    })
+}
+
+fn cpu_frequencies() -> (Vec<u32>, Vec<u32>) {
+    let Ok(class) = CString::new("AppleARMIODevice") else {
+        return (Vec::new(), Vec::new());
+    };
+    let mut iterator = 0_u32;
+    let matching = unsafe { IOServiceMatching(class.as_ptr()) };
+    if matching.is_null()
+        || unsafe { IOServiceGetMatchingServices(0, matching, &mut iterator) } != 0
+    {
+        return (Vec::new(), Vec::new());
+    }
+    let mut tables = (Vec::new(), Vec::new());
+    loop {
+        let entry = unsafe { IOIteratorNext(iterator) };
+        if entry == 0 {
+            break;
+        }
+        let mut name = [0_i8; 128];
+        let is_pmgr = unsafe { IORegistryEntryGetName(entry, name.as_mut_ptr()) } == 0
+            && unsafe { CStr::from_ptr(name.as_ptr()) }.to_bytes() == b"pmgr";
+        if is_pmgr {
+            let mut properties = ptr::null();
+            if unsafe { IORegistryEntryCreateCFProperties(entry, &mut properties, ptr::null(), 0) }
+                == 0
+                && unsafe { cf_is_type(properties, CFDictionaryGetTypeID()) }
+            {
+                let keys = cpu_frequency_property_keys(properties).unwrap_or_else(|| {
+                    ("voltage-states1-sram".into(), "voltage-states5-sram".into())
+                });
+                tables.0 = dvfs_frequencies(properties, &keys.0);
+                tables.1 = dvfs_frequencies(properties, &keys.1);
+            }
+            if !properties.is_null() {
+                unsafe { CFRelease(properties) };
+            }
+        }
+        unsafe { IOObjectRelease(entry) };
+        if !tables.0.is_empty() && !tables.1.is_empty() {
+            break;
+        }
+    }
+    unsafe { IOObjectRelease(iterator) };
+    tables
+}
+
+fn cpu_frequency_property_keys(properties: CfRef) -> Option<(String, String)> {
+    if property_data(properties, "voltage-states1-sram").is_some()
+        && property_data(properties, "voltage-states5-sram").is_some()
+    {
+        return Some(("voltage-states1-sram".into(), "voltage-states5-sram".into()));
+    }
+    cpu_frequency_keys_from_clusters(&property_data(properties, "acc-clusters")?)
+}
+
+fn cpu_frequency_keys_from_clusters(data: &[u8]) -> Option<(String, String)> {
+    let mut clusters = data
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|entry| (entry[1], entry[0]))
+        .collect::<Vec<_>>();
+    clusters.sort_unstable();
+    let efficiency = clusters.get(clusters.len().checked_sub(2)?)?.1;
+    let performance = clusters.last()?.1;
+    Some((
+        format!("voltage-states{efficiency}-sram"),
+        format!("voltage-states{performance}-sram"),
+    ))
+}
+
+fn dvfs_frequencies(properties: CfRef, name: &str) -> Vec<u32> {
+    let Some(data) = property_data(properties, name) else {
+        return Vec::new();
+    };
+    let raw = data
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|entry| u32::from_le_bytes(entry[..4].try_into().unwrap()))
+        .collect::<Vec<_>>();
+    normalize_dvfs_frequencies(raw)
+}
+
+fn normalize_dvfs_frequencies(raw: Vec<u32>) -> Vec<u32> {
+    let maximum = raw.iter().copied().max().unwrap_or(0);
+    let scale = if maximum >= 100_000_000 {
+        1_000_000
+    } else {
+        1_000
+    };
+    raw.into_iter().map(|frequency| frequency / scale).collect()
+}
+
+fn property_data(properties: CfRef, name: &str) -> Option<Vec<u8>> {
+    let key = cf_string(name)?;
+    let data = unsafe { CFDictionaryGetValue(properties, key) };
+    unsafe { CFRelease(key) };
+    if unsafe { !cf_is_type(data, CFDataGetTypeID()) } {
+        return None;
+    }
+    let length = unsafe { CFDataGetLength(data) }.max(0) as usize;
+    let bytes = unsafe { CFDataGetBytePtr(data) };
+    (!bytes.is_null()).then(|| unsafe { std::slice::from_raw_parts(bytes, length) }.to_vec())
+}
+
 fn gpu_frequencies() -> Vec<u32> {
     let Ok(class) = CString::new("AppleARMIODevice") else {
         return Vec::new();
@@ -1077,6 +1363,24 @@ fn sysctl_u64(name: &str) -> Option<u64> {
         )
     } == 0
         && size == mem::size_of::<u64>())
+    .then_some(value)
+}
+
+#[cfg(test)]
+fn sysctl_u32(name: &str) -> Option<u32> {
+    let name = CString::new(name).ok()?;
+    let mut value = 0_u32;
+    let mut size = mem::size_of::<u32>();
+    (unsafe {
+        sysctlbyname(
+            name.as_ptr(),
+            (&mut value as *mut u32).cast(),
+            &mut size,
+            ptr::null_mut(),
+            0,
+        )
+    } == 0
+        && size == mem::size_of::<u32>())
     .then_some(value)
 }
 
@@ -1264,6 +1568,54 @@ unsafe extern "C" {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn apple_cpu_frequency_tables_handle_hz_khz_and_dynamic_cluster_keys() {
+        assert_eq!(
+            normalize_dvfs_frequencies(vec![744_000_000, 1_020_000_000]),
+            vec![744, 1_020]
+        );
+        assert_eq!(
+            normalize_dvfs_frequencies(vec![744_000, 1_020_000]),
+            vec![744, 1_020]
+        );
+        let mut clusters = Vec::new();
+        clusters.extend_from_slice(&[23, 1, 0, 0, 0, 0, 0, 0]);
+        clusters.extend_from_slice(&[5, 2, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            cpu_frequency_keys_from_clusters(&clusters),
+            Some((
+                "voltage-states23-sram".into(),
+                "voltage-states5-sram".into()
+            ))
+        );
+        assert_eq!(
+            weighted_frequency_from_residencies(&[1, 3], &[600, 1_200]),
+            Some(1_050.0)
+        );
+        assert_eq!(
+            weighted_frequency_from_residencies(&[0, 0], &[600, 1_200]),
+            Some(600.0)
+        );
+    }
+
+    #[test]
+    #[ignore = "requires live Apple-silicon IOReport and IORegistry data"]
+    fn collects_live_apple_cpu_frequency() {
+        let mut collector = AppleCpuFrequencyCollector::new().expect("CPU frequency support");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let frequencies = collector.collect_mhz();
+        assert!(!frequencies.is_empty());
+        assert_eq!(
+            frequencies.len(),
+            sysctl_u32("hw.physicalcpu").expect("physical CPU count") as usize
+        );
+        assert!(
+            frequencies
+                .iter()
+                .all(|frequency| (100.0..10_000.0).contains(frequency))
+        );
+    }
 
     #[test]
     fn apple_smc_layout_and_a18_float_temperature_match_the_native_abi() {

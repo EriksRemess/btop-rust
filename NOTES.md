@@ -28,10 +28,13 @@ not installed on macOS.
 
 The general macOS collectors use Mach, libproc, sysctl, getifaddrs,
 SystemConfiguration, CoreFoundation, and IOKit. Public interfaces are preferred
-where they provide the metric. Apple-silicon GPU details additionally use
-private IOReport interfaces resolved at runtime, plus AGX registry data, HID
-thermal sensors, and an SMC fallback. Private metrics are capability-checked so
-missing or renamed channels do not prevent startup.
+where they provide the metric. Apple-silicon CPU and GPU details additionally
+use private IOReport interfaces resolved at runtime, plus power-manager and AGX
+registry data, HID thermal sensors, and an SMC fallback. The CPU clock is
+residency-weighted from per-core performance states and the matching DVFS
+frequency tables and is shown per core when available; the legacy
+`hw.cpufrequency` sysctl remains the Intel and fallback path. Private metrics
+are capability-checked so missing or renamed channels do not prevent startup.
 
 The Apple GPU panel can show interval activity, residency-weighted frequency,
 the dominant P-state, estimated power, temperature, hardware core count,
