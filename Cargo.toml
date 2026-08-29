@@ -1,12 +1,13 @@
 [package]
 name = "btoprs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "A dependency-free terminal resource monitor"
 readme = "README.md"
-homepage = "https://github.com/EriksRemess/btop-rust"
 repository = "https://github.com/EriksRemess/btop-rust"
+keywords = ["system-monitor", "terminal", "tui", "linux", "macos"]
+categories = ["command-line-utilities"]
 
 [[bin]]
 name = "btoprs"
