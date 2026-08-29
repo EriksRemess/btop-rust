@@ -68,30 +68,10 @@ impl Palette {
             return Ok(Self::default());
         }
         let requested = Path::new(name);
-        let requested_file = requested.file_name();
-        let requested_stem = requested.file_stem();
-        let mut theme_path = requested.is_file().then(|| requested.to_path_buf());
-        'directories: for directory in theme_directories(custom_dir) {
-            if theme_path.is_some() {
-                break;
-            }
-            let Ok(files) = fs::read_dir(directory) else {
-                continue;
-            };
-            for file in files.flatten() {
-                let path = file.path();
-                if path
-                    .extension()
-                    .is_some_and(|extension| extension == "theme")
-                    && (path == requested
-                        || path.file_name() == requested_file
-                        || path.file_stem() == requested_stem)
-                {
-                    theme_path = Some(path);
-                    break 'directories;
-                }
-            }
-        }
+        let theme_path = requested
+            .is_file()
+            .then(|| requested.to_path_buf())
+            .or_else(|| find_theme(requested, theme_directories(custom_dir)));
         let Some(theme_path) = theme_path else {
             return Ok(Self::default());
         };
@@ -141,9 +121,13 @@ impl Palette {
 }
 
 pub fn available_themes(custom_dir: Option<&Path>) -> Vec<String> {
+    available_themes_in(theme_directories(custom_dir))
+}
+
+fn available_themes_in(directories: impl IntoIterator<Item = PathBuf>) -> Vec<String> {
     let mut themes = vec!["Default".to_string(), "TTY".to_string()];
     let mut names = std::collections::HashSet::new();
-    for directory in theme_directories(custom_dir) {
+    for directory in directories {
         let Ok(entries) = fs::read_dir(directory) else {
             continue;
         };
@@ -163,28 +147,58 @@ pub fn available_themes(custom_dir: Option<&Path>) -> Vec<String> {
     themes
 }
 
+fn find_theme(requested: &Path, directories: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+    let requested_file = requested.file_name();
+    let requested_stem = requested.file_stem();
+    for directory in directories {
+        let Ok(files) = fs::read_dir(directory) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let path = file.path();
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "theme")
+                && (path == requested
+                    || path.file_name() == requested_file
+                    || path.file_stem() == requested_stem)
+            {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
 fn theme_directories(custom_dir: Option<&Path>) -> Vec<PathBuf> {
     let mut directories = Vec::new();
     if let Some(directory) = custom_dir {
         directories.push(directory.to_path_buf());
     }
     if let Some(config_home) = std::env::var_os("XDG_CONFIG_HOME") {
+        directories.push(Path::new(&config_home).join("btoprs/themes"));
         directories.push(Path::new(&config_home).join("btop/themes"));
     } else if let Some(home) = std::env::var_os("HOME") {
+        directories.push(Path::new(&home).join(".config/btoprs/themes"));
         directories.push(Path::new(&home).join(".config/btop/themes"));
     }
     if let Some(data_home) = std::env::var_os("XDG_DATA_HOME") {
+        directories.push(Path::new(&data_home).join("btoprs/themes"));
         directories.push(Path::new(&data_home).join("btop/themes"));
     } else if let Some(home) = std::env::var_os("HOME") {
+        directories.push(Path::new(&home).join(".local/share/btoprs/themes"));
         directories.push(Path::new(&home).join(".local/share/btop/themes"));
     }
     if let Ok(executable) = std::env::current_exe()
         && let Some(prefix) = executable.parent().and_then(Path::parent)
     {
+        directories.push(prefix.join("share/btoprs/themes"));
         directories.push(prefix.join("share/btop/themes"));
     }
     directories.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("themes"));
+    directories.push("/usr/local/share/btoprs/themes".into());
     directories.push("/usr/local/share/btop/themes".into());
+    directories.push("/usr/share/btoprs/themes".into());
     directories.push("/usr/share/btop/themes".into());
     directories
 }
@@ -625,13 +639,47 @@ mod tests {
     fn bundled_themes_are_discovered_and_loaded() {
         let themes = available_themes(None);
         assert!(themes.iter().any(|name| name == "dracula.theme"));
+        for name in [
+            "catppuccin-frappe.theme",
+            "catppuccin-latte.theme",
+            "catppuccin-macchiato.theme",
+            "catppuccin-mocha.theme",
+        ] {
+            assert!(themes.iter().any(|candidate| candidate == name));
+        }
 
         let palette = Palette::load("dracula.theme", None).expect("load bundled theme");
         assert_eq!(palette.color("hi_fg", (0, 0, 0)), (0x62, 0x72, 0xa4));
     }
 
     #[test]
-    fn every_upstream_theme_parses_its_core_palette() {
+    fn duplicate_legacy_theme_is_listed_once_and_btoprs_copy_wins() {
+        let root =
+            std::env::temp_dir().join(format!("btoprs-theme-dedup-test-{}", std::process::id()));
+        let primary = root.join("btoprs/themes");
+        let legacy = root.join("btop/themes");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&primary).unwrap();
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(primary.join("shared.theme"), "theme[hi_fg]=\"#112233\"\n").unwrap();
+        fs::write(legacy.join("shared.theme"), "theme[hi_fg]=\"#aabbcc\"\n").unwrap();
+
+        let directories = vec![primary.clone(), legacy];
+        let themes = available_themes_in(directories.clone());
+        assert_eq!(
+            themes.iter().filter(|name| *name == "shared.theme").count(),
+            1
+        );
+        assert_eq!(
+            find_theme(Path::new("shared.theme"), directories),
+            Some(primary.join("shared.theme"))
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn every_bundled_theme_parses_its_core_palette() {
         let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("themes");
         let mut paths: Vec<PathBuf> = fs::read_dir(directory)
             .expect("read bundled themes")
@@ -643,7 +691,7 @@ mod tests {
             })
             .collect();
         paths.sort();
-        assert_eq!(paths.len(), 41);
+        assert_eq!(paths.len(), 45);
 
         for path in paths {
             let palette = Palette::load(path.to_str().expect("UTF-8 theme path"), None)

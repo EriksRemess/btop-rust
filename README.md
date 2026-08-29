@@ -32,6 +32,10 @@ The terminal UI exits cleanly with `q` or `Ctrl-C`; `Esc` opens the main menu. R
 See the [project notes](NOTES.md) for platform decisions, known limitations,
 and verification guidance.
 
+`btoprs` supports btop-compatible `.theme` files. Its own themes are installed
+under `share/btoprs/themes` and can be added to `~/.config/btoprs/themes`;
+legacy btop theme directories are also searched for compatibility.
+
 Install the executable, documentation, themes, and man page under `~/.local`
 with:
 

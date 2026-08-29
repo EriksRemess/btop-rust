@@ -6257,7 +6257,7 @@ fn draw_help(canvas: &mut Canvas, page: usize) {
         ("Selected N", "Select new nice value for selected process."),
         ("", " "),
         ("", "For bug reporting and project updates, visit:"),
-        ("", "https://github.com/aristocratos/btop"),
+        ("", "https://github.com/EriksRemess/btop-rust"),
     ];
     let panel_width = 78.min(canvas.width.saturating_sub(2));
     let height = canvas.height.saturating_sub(6).min(HELP.len() + 3);
@@ -6643,15 +6643,17 @@ fn option_description(option: &str) -> &'static [&'static str] {
         "color_theme" => &[
             "Set color theme.",
             "",
-            "Choose from all theme files in (usually)",
-            "\"/usr/[local/]share/btop/themes\" and",
-            "\"~/.config/btop/themes\".",
+            "btoprs supports btop-compatible .theme files.",
+            "Install them in (usually)",
+            "\"/usr/[local/]share/btoprs/themes\" or",
+            "\"~/.config/btoprs/themes\".",
+            "Legacy btop theme directories are also searched.",
             "",
             "\"Default\" for builtin default theme.",
             "\"TTY\" for builtin 16-color theme.",
             "",
-            "For theme updates see:",
-            "https://github.com/aristocratos/btop",
+            "Project updates:",
+            "https://github.com/EriksRemess/btop-rust",
         ],
         "theme_background" => &[
             "If the theme set background should be shown.",
@@ -9207,7 +9209,7 @@ mod tests {
         draw_help(&mut canvas, 0);
         assert_eq!(canvas.cells[8 * 180 + 50].ch, '╭');
         assert_eq!(canvas.cells[56 * 180 + 50].ch, '╰');
-        assert!(canvas_row(&canvas, 55).contains("https://github.com/aristocratos/btop"));
+        assert!(canvas_row(&canvas, 55).contains("https://github.com/EriksRemess/btop-rust"));
     }
 
     #[test]
