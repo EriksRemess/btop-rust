@@ -1316,7 +1316,7 @@ mod tests {
         drop(file);
         let file = fs::File::open(&path).unwrap();
         fs::remove_file(&path).unwrap();
-        let mut collector = IntelPmu {
+        let mut collector = IntelGpu {
             name: "test".into(),
             busy: Vec::new(),
             energy: None,
@@ -1326,6 +1326,7 @@ mod tests {
                 previous: 1000,
                 scale: 1.0,
             }),
+            sysfs_frequency: None,
             last_sample: Instant::now() - Duration::from_secs(2),
         };
         let sample = collector.collect();

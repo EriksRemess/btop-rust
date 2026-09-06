@@ -2760,29 +2760,34 @@ fn draw_cpu(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
         } else {
             usize::from(app.sample.gpus.len() > 1)
         };
+        let gpu_fixed_width = 10
+            + gpu_index_width
+            + if show_temps && gpu.support.temperature {
+                11
+            } else {
+                0
+            }
+            + if columns > 1 && gpu.support.memory_used && gpu.support.memory_total {
+                5
+            } else {
+                0
+            }
+            + if gpu.support.memory_used { 5 } else { 0 }
+            + if gpu.support.memory_total { 6 } else { 0 }
+            + if gpu.support.power { 6 } else { 0 };
         let gpu_clock = gpu
             .support
             .gpu_clock
-            .then(|| format!("{} MHz", gpu.gpu_clock_mhz));
+            .then(|| format!("{} MHz", gpu.gpu_clock_mhz))
+            .filter(|clock| {
+                units::display_width(clock) < box_width.saturating_sub(gpu_fixed_width)
+            });
         let mut gpu_meter_width = box_width.saturating_sub(
-            10 + gpu_index_width
+            gpu_fixed_width
                 + gpu_clock
                     .as_deref()
                     .map(|clock| units::display_width(clock) + 1)
-                    .unwrap_or(0)
-                + if show_temps && gpu.support.temperature {
-                    11
-                } else {
-                    0
-                }
-                + if columns > 1 && gpu.support.memory_used && gpu.support.memory_total {
-                    5
-                } else {
-                    0
-                }
-                + if gpu.support.memory_used { 5 } else { 0 }
-                + if gpu.support.memory_total { 6 } else { 0 }
-                + if gpu.support.power { 6 } else { 0 },
+                    .unwrap_or(0),
         );
         if columns <= 1 {
             gpu_meter_width = 0;
@@ -10045,6 +10050,48 @@ mod tests {
                 .any(|line| line.contains("GPU Intel Skylake (Gen9) 350 MHz"))
         );
         assert!(!output.contains("gpu-totals"));
+    }
+
+    #[test]
+    fn inline_gpu_only_shows_clock_when_other_metrics_fit() {
+        for width in [80, 95, 120, 160] {
+            let mut app = app();
+            app.sample.cpu.temperature = Some(42.0);
+            app.sample.gpus.push(GpuSample {
+                utilization: 12,
+                gpu_clock_mhz: 1500,
+                memory_used: 6_400_000_000,
+                memory_total: 8_000_000_000,
+                temperature_c: 42,
+                power_mw: 50,
+                support: crate::gpu::GpuSupport {
+                    utilization: true,
+                    gpu_clock: true,
+                    memory_used: true,
+                    memory_total: true,
+                    temperature: true,
+                    power: true,
+                    ..Default::default()
+                },
+                ..GpuSample::default()
+            });
+            app.gpu_histories.push(GpuHistory::default());
+            let mut canvas = Canvas::new(width, 20);
+
+            draw_cpu(&mut canvas, Rect::new(0, 0, width, 20), &mut app);
+
+            let output = canvas_text(&canvas);
+            let gpu_row = output.lines().find(|line| line.contains("GPU")).unwrap();
+            for metric in ["12%", "6.0G/7.5G", "42°C", "0.05W"] {
+                assert!(gpu_row.contains(metric), "width {width}: {gpu_row}");
+            }
+            assert!(gpu_row.ends_with("││"), "width {width}: {gpu_row}");
+            assert_eq!(
+                gpu_row.contains("1500 MHz"),
+                width >= 120,
+                "width {width}: {gpu_row}"
+            );
+        }
     }
 
     #[test]
