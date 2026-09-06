@@ -55,6 +55,8 @@ pub const SELECTED: Style = Style::Selected;
 pub const FOLLOWED: Style = Style::Followed;
 pub const METER_BG: Style = Style::MeterBg;
 
+include!(concat!(env!("OUT_DIR"), "/bundled_themes.rs"));
+
 #[derive(Clone, Default)]
 pub struct Palette {
     overrides: HashMap<String, Rgb>,
@@ -64,6 +66,10 @@ pub struct Palette {
 
 impl Palette {
     pub fn load(name: &str, custom_dir: Option<&Path>) -> Result<Self, String> {
+        Self::load_in(name, theme_directories(custom_dir))
+    }
+
+    fn load_in(name: &str, directories: impl IntoIterator<Item = PathBuf>) -> Result<Self, String> {
         if name.is_empty() || name.eq_ignore_ascii_case("default") {
             return Ok(Self::default());
         }
@@ -71,12 +77,29 @@ impl Palette {
         let theme_path = requested
             .is_file()
             .then(|| requested.to_path_buf())
-            .or_else(|| find_theme(requested, theme_directories(custom_dir)));
-        let Some(theme_path) = theme_path else {
+            .or_else(|| find_theme(requested, directories));
+        let text = if let Some(theme_path) = theme_path {
+            match fs::read_to_string(&theme_path) {
+                Ok(text) => text,
+                Err(error) => match bundled_theme(requested) {
+                    Some(text) => text.to_string(),
+                    None => {
+                        return Err(format!(
+                            "could not read theme {}: {error}",
+                            theme_path.display()
+                        ));
+                    }
+                },
+            }
+        } else if let Some(text) = bundled_theme(requested) {
+            text.to_string()
+        } else {
             return Ok(Self::default());
         };
-        let text = fs::read_to_string(&theme_path)
-            .map_err(|error| format!("could not read theme {}: {error}", theme_path.display()))?;
+        Ok(Self::parse(&text))
+    }
+
+    fn parse(text: &str) -> Self {
         let mut overrides = HashMap::new();
         let mut empty = HashSet::new();
         for line in text.lines().map(str::trim) {
@@ -93,11 +116,11 @@ impl Palette {
                 overrides.insert(key.to_string(), rgb);
             }
         }
-        Ok(Self {
+        Self {
             overrides,
             empty,
             custom: true,
-        })
+        }
     }
 
     fn color(&self, name: &str, fallback: Rgb) -> Rgb {
@@ -143,6 +166,11 @@ fn available_themes_in(directories: impl IntoIterator<Item = PathBuf>) -> Vec<St
             }
         }
     }
+    for (name, _) in BUNDLED_THEMES {
+        if names.insert(name.to_string()) {
+            themes.push(name.to_string());
+        }
+    }
     themes[2..].sort();
     themes
 }
@@ -170,16 +198,99 @@ fn find_theme(requested: &Path, directories: impl IntoIterator<Item = PathBuf>) 
     None
 }
 
+fn bundled_theme(requested: &Path) -> Option<&'static str> {
+    BUNDLED_THEMES.iter().find_map(|(name, contents)| {
+        let path = Path::new(name);
+        (path.file_name() == requested.file_name() || path.file_stem() == requested.file_stem())
+            .then_some(*contents)
+    })
+}
+
+fn user_theme_directory() -> Option<PathBuf> {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|path| !path.is_empty())
+                .map(|home| PathBuf::from(home).join(".config"))
+        })
+        .map(|directory| directory.join("btoprs/themes"))
+}
+
+pub fn install_missing_themes(custom_dir: Option<&Path>) -> std::io::Result<()> {
+    if let Some(directory) = user_theme_directory() {
+        install_missing_themes_in(&directory, &theme_directories(custom_dir))?;
+    }
+    Ok(())
+}
+
+fn install_missing_themes_in(directory: &Path, search_dirs: &[PathBuf]) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_STAGING: AtomicU64 = AtomicU64::new(0);
+
+    let mut missing = Vec::new();
+    for &(name, contents) in BUNDLED_THEMES {
+        match fs::symlink_metadata(directory.join(name)) {
+            Ok(_) => {} // Preserve user files, including symlinks.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // Creating a higher-priority user copy would shadow an existing
+                // theme from a custom, legacy, data, or system directory.
+                if !search_dirs
+                    .iter()
+                    .any(|path| fs::symlink_metadata(path.join(name)).is_ok())
+                {
+                    missing.push((name, contents));
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+    fs::create_dir_all(directory)?;
+    // Publish complete files without replacing an existing destination, even
+    // when two instances start together. Keep staging on the same filesystem.
+    struct Staging(PathBuf);
+    impl Drop for Staging {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let staging = loop {
+        let sequence = NEXT_STAGING.fetch_add(1, Ordering::Relaxed);
+        let path = directory.join(format!(".btoprs-themes-{}-{sequence}", std::process::id()));
+        match fs::DirBuilder::new().mode(0o700).create(&path) {
+            Ok(()) => break Staging(path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    };
+    for (name, contents) in missing {
+        let source = staging.0.join(name);
+        fs::write(&source, contents)?;
+        match fs::hard_link(&source, directory.join(name)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 fn theme_directories(custom_dir: Option<&Path>) -> Vec<PathBuf> {
     let mut directories = Vec::new();
     if let Some(directory) = custom_dir {
         directories.push(directory.to_path_buf());
     }
-    if let Some(config_home) = std::env::var_os("XDG_CONFIG_HOME") {
-        directories.push(Path::new(&config_home).join("btoprs/themes"));
+    if let Some(directory) = user_theme_directory() {
+        directories.push(directory);
+    }
+    if let Some(config_home) = std::env::var_os("XDG_CONFIG_HOME").filter(|path| !path.is_empty()) {
         directories.push(Path::new(&config_home).join("btop/themes"));
     } else if let Some(home) = std::env::var_os("HOME") {
-        directories.push(Path::new(&home).join(".config/btoprs/themes"));
         directories.push(Path::new(&home).join(".config/btop/themes"));
     }
     if let Some(data_home) = std::env::var_os("XDG_DATA_HOME") {
@@ -195,7 +306,6 @@ fn theme_directories(custom_dir: Option<&Path>) -> Vec<PathBuf> {
         directories.push(prefix.join("share/btoprs/themes"));
         directories.push(prefix.join("share/btop/themes"));
     }
-    directories.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("themes"));
     directories.push("/usr/local/share/btoprs/themes".into());
     directories.push("/usr/local/share/btop/themes".into());
     directories.push("/usr/share/btoprs/themes".into());
@@ -571,6 +681,9 @@ fn tty_escape(style: Style) -> &'static str {
 
 fn parse_hex(value: &str) -> Option<Rgb> {
     let value = value.strip_prefix('#')?;
+    if !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
     match value.len() {
         2 => {
             let channel = u8::from_str_radix(value, 16).ok()?;
@@ -636,6 +749,166 @@ mod tests {
     use super::*;
 
     #[test]
+    fn installing_themes_does_not_shadow_other_search_directories() {
+        let root = std::env::temp_dir().join(format!(
+            "btoprs-theme-search-install-{}",
+            std::process::id()
+        ));
+        for location in ["legacy", "data", "system", "custom"] {
+            let directory = root.join(location).join("user/themes");
+            let existing = root.join(location).join("existing/themes");
+            fs::create_dir_all(&existing).unwrap();
+            let text = "theme[hi_fg]=\"#112233\"\n";
+            fs::write(existing.join("dracula.theme"), text).unwrap();
+            let search_dirs = if location == "custom" {
+                vec![existing.clone(), directory.clone()]
+            } else {
+                vec![directory.clone(), existing.clone()]
+            };
+            let before = Palette::load_in("dracula", search_dirs.clone()).unwrap();
+            install_missing_themes_in(&directory, &search_dirs).unwrap();
+            install_missing_themes_in(&directory, &search_dirs).unwrap();
+            assert!(!directory.join("dracula.theme").exists());
+            assert_eq!(
+                fs::read_to_string(existing.join("dracula.theme")).unwrap(),
+                text
+            );
+            let after = Palette::load_in("dracula", search_dirs).unwrap();
+            assert_eq!(before.color("hi_fg", (0, 0, 0)), (0x11, 0x22, 0x33));
+            assert_eq!(after.color("hi_fg", (0, 0, 0)), (0x11, 0x22, 0x33));
+            assert!(directory.join("ayu.theme").is_file());
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unreadable_bundled_theme_files_use_embedded_palette() {
+        use std::os::unix::fs::symlink;
+        let root =
+            std::env::temp_dir().join(format!("btoprs-theme-read-fallback-{}", std::process::id()));
+        for failure in ["dangling-symlink", "invalid-utf8", "directory"] {
+            let directory = root.join(failure);
+            fs::create_dir_all(&directory).unwrap();
+            let path = directory.join("dracula.theme");
+            match failure {
+                "dangling-symlink" => symlink(root.join("missing"), &path).unwrap(),
+                "invalid-utf8" => fs::write(&path, [0xff]).unwrap(),
+                _ => fs::create_dir(&path).unwrap(),
+            }
+            install_missing_themes_in(&directory, &[]).unwrap();
+            for name in ["dracula", "dracula.theme"] {
+                let palette = Palette::load_in(name, [directory.clone()]).unwrap();
+                assert_eq!(
+                    palette.color("hi_fg", (0, 0, 0)),
+                    (0x62, 0x72, 0xa4),
+                    "{failure}"
+                );
+            }
+            // No embedded copy exists for an unrelated custom theme: retain
+            // the read error instead of silently pretending it loaded.
+            fs::rename(&path, directory.join("my-custom.theme")).unwrap();
+            assert!(Palette::load_in("my-custom", [directory]).is_err());
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn embedded_themes_work_without_any_installed_files() {
+        let themes = available_themes_in([]);
+        assert_eq!(themes.len(), BUNDLED_THEMES.len() + 2);
+        assert_eq!(&themes[..2], ["Default", "TTY"]);
+        for name in ["dracula", "dracula.theme"] {
+            let palette = Palette::load_in(name, []).unwrap();
+            assert_eq!(palette.color("hi_fg", (0, 0, 0)), (0x62, 0x72, 0xa4));
+        }
+        assert!(
+            !Palette::load_in("missing-unknown-theme", [])
+                .unwrap()
+                .custom
+        );
+    }
+
+    #[test]
+    fn installs_missing_themes_preserving_edits_and_symlinks() {
+        use std::os::unix::fs::symlink;
+        let root =
+            std::env::temp_dir().join(format!("btoprs-theme-install-{}", std::process::id()));
+        let directory = root.join("themes");
+        fs::create_dir_all(&directory).unwrap();
+        let edited = directory.join("dracula.theme");
+        let custom = "theme[hi_fg]=\"#112233\"\n";
+        fs::write(&edited, custom).unwrap();
+        let missing_target = root.join("not-created");
+        symlink(&missing_target, directory.join("nord.theme")).unwrap();
+        install_missing_themes_in(&directory, &[]).unwrap();
+        assert_eq!(fs::read_to_string(&edited).unwrap(), custom);
+        assert_eq!(
+            fs::read_link(directory.join("nord.theme")).unwrap(),
+            missing_target
+        );
+        assert!(!missing_target.exists());
+        let palette = Palette::load_in("dracula", [directory.clone()]).unwrap();
+        assert_eq!(palette.color("hi_fg", (0, 0, 0)), (0x11, 0x22, 0x33));
+        for &(name, contents) in BUNDLED_THEMES {
+            if name != "dracula.theme" && name != "nord.theme" {
+                assert_eq!(fs::read_to_string(directory.join(name)).unwrap(), contents);
+            }
+        }
+        fs::remove_file(directory.join("ayu.theme")).unwrap();
+        install_missing_themes_in(&directory, &[]).unwrap();
+        assert_eq!(
+            fs::read_to_string(directory.join("ayu.theme")).unwrap(),
+            bundled_theme(Path::new("ayu")).unwrap()
+        );
+        assert_eq!(fs::read_to_string(edited).unwrap(), custom);
+        assert_eq!(
+            fs::read_dir(&directory).unwrap().count(),
+            BUNDLED_THEMES.len()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn concurrent_theme_installation_publishes_complete_files() {
+        let directory =
+            std::env::temp_dir().join(format!("btoprs-theme-concurrent-{}", std::process::id()));
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let directory = &directory;
+                scope.spawn(move || install_missing_themes_in(directory, &[]).unwrap());
+            }
+        });
+        for &(name, contents) in BUNDLED_THEMES {
+            assert_eq!(fs::read_to_string(directory.join(name)).unwrap(), contents);
+        }
+        assert_eq!(
+            fs::read_dir(&directory).unwrap().count(),
+            BUNDLED_THEMES.len()
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn installation_failure_does_not_disable_embedded_themes() {
+        let root =
+            std::env::temp_dir().join(format!("btoprs-theme-unwritable-{}", std::process::id()));
+        fs::write(&root, "file instead of directory").unwrap();
+        assert!(install_missing_themes_in(&root.join("themes"), &[]).is_err());
+        let palette = Palette::load_in("dracula", [root.join("themes")]).unwrap();
+        assert_eq!(palette.color("hi_fg", (0, 0, 0)), (0x62, 0x72, 0xa4));
+        fs::remove_file(root).unwrap();
+    }
+
+    #[test]
+    fn malformed_unicode_colors_are_ignored() {
+        for value in ["#€aaa", "#€", "#éa", "#aé", "#abéef", "#zzzzzz"] {
+            assert_eq!(parse_hex(value), None, "{value}");
+        }
+        assert_eq!(parse_hex("#aBc"), Some((0xaa, 0xbb, 0xcc)));
+        assert_eq!(parse_hex("#12AbEF"), Some((0x12, 0xab, 0xef)));
+    }
+
+    #[test]
     fn bundled_themes_are_discovered_and_loaded() {
         let themes = available_themes(None);
         assert!(themes.iter().any(|name| name == "dracula.theme"));
@@ -680,29 +953,16 @@ mod tests {
 
     #[test]
     fn every_bundled_theme_parses_its_core_palette() {
-        let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("themes");
-        let mut paths: Vec<PathBuf> = fs::read_dir(directory)
-            .expect("read bundled themes")
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.extension()
-                    .is_some_and(|extension| extension == "theme")
-            })
-            .collect();
-        paths.sort();
-        assert_eq!(paths.len(), 45);
-
-        for path in paths {
-            let palette = Palette::load(path.to_str().expect("UTF-8 theme path"), None)
-                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        assert_eq!(BUNDLED_THEMES.len(), 45);
+        for &(name, contents) in BUNDLED_THEMES {
+            let palette = Palette::parse(contents);
             for key in [
                 "main_fg", "title", "hi_fg", "cpu_box", "mem_box", "net_box", "proc_box",
             ] {
                 assert!(
                     palette.overrides.contains_key(key),
                     "{} is missing {key}",
-                    path.display()
+                    name
                 );
             }
         }

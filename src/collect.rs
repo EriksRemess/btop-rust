@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::fs;
-use std::os::raw::{c_char, c_int, c_uint, c_ulong};
+use std::os::raw::{c_char, c_int, c_long, c_uint, c_ulong};
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::time::Instant;
@@ -744,6 +744,22 @@ fn collect_disks(
     let mounts = fs::read_to_string("/etc/mtab")
         .or_else(|_| fs::read_to_string("/proc/self/mounts"))
         .unwrap_or_default();
+    collect_disks_for_mounts(
+        config,
+        previous_disks,
+        elapsed,
+        &mounts,
+        Path::new("/sys/class/block"),
+    )
+}
+
+fn collect_disks_for_mounts(
+    config: &Config,
+    previous_disks: &mut HashMap<String, DiskCounters>,
+    elapsed: f64,
+    mounts: &str,
+    block_root: &Path,
+) -> Vec<DiskSample> {
     let use_fstab = config.bool_value("use_fstab").unwrap_or(false);
     let only_physical = config.bool_value("only_physical").unwrap_or(true) && !use_fstab;
     let free_priv = config.bool_value("disk_free_priv").unwrap_or(false);
@@ -753,6 +769,7 @@ fn collect_disks(
         disk_filters(config.value("disks_filter").unwrap_or_default());
     let mut seen = HashSet::new();
     let mut disks = Vec::new();
+    let mut current_disks = HashMap::new();
     for line in mounts.lines() {
         let mut parts = line.split_whitespace();
         let device = decode_mount_field(parts.next().unwrap_or(""));
@@ -776,27 +793,26 @@ fn collect_disks(
                 .and_then(|name| name.to_str())
                 .unwrap_or("")
                 .to_string();
-            let (counters, block_size) = if filesystem == "zfs" {
-                (
-                    read_zfs_counters(Path::new("/proc/spl/kstat/zfs"), &device, hide_zfs_datasets),
-                    1,
-                )
-            } else {
-                (
-                    (!device_name.is_empty())
-                        .then(|| {
-                            fs::read_to_string(format!("/sys/class/block/{device_name}/stat")).ok()
-                        })
-                        .flatten()
-                        .and_then(|text| parse_disk_stat(&text)),
-                    512,
-                )
-            };
             let counter_key = if filesystem == "zfs" {
                 format!("zfs:{device}")
             } else {
                 device_name.clone()
             };
+            // Read each device once, but compare every mount with the previous
+            // interval. Bind mounts and subvolumes share the same device history.
+            let counters = *current_disks.entry(counter_key.clone()).or_insert_with(|| {
+                if filesystem == "zfs" {
+                    read_zfs_counters(Path::new("/proc/spl/kstat/zfs"), &device, hide_zfs_datasets)
+                } else {
+                    (!device_name.is_empty())
+                        .then(|| {
+                            fs::read_to_string(block_root.join(&device_name).join("stat")).ok()
+                        })
+                        .flatten()
+                        .and_then(|text| parse_disk_stat(&text))
+                }
+            });
+            let block_size = if filesystem == "zfs" { 1 } else { 512 };
             let old = counters.and_then(|_| previous_disks.get(&counter_key).copied());
             let (read_per_second, write_per_second, io_activity) = old
                 .zip(counters)
@@ -804,9 +820,6 @@ fn collect_disks(
                     disk_counter_delta(old, now, block_size, filesystem == "zfs", elapsed)
                 })
                 .unwrap_or_default();
-            if let Some(counters) = counters {
-                previous_disks.insert(counter_key, counters);
-            }
             disks.push(DiskSample {
                 mount,
                 total,
@@ -819,6 +832,10 @@ fn collect_disks(
             });
         }
     }
+    *previous_disks = current_disks
+        .into_iter()
+        .filter_map(|(device, counters)| counters.map(|counters| (device, counters)))
+        .collect();
     if let Some(root) = disks.iter().position(|disk| disk.mount == "/") {
         let root = disks.remove(root);
         disks.insert(0, root);
@@ -1764,26 +1781,69 @@ fn read_uptime() -> f64 {
         .unwrap_or(0.0)
 }
 
-fn system_value(name: c_int) -> i64 {
+fn system_value(name: c_int) -> c_long {
     unsafe { sysconf(name) }
 }
+
+// musl uses 64-bit filesystem counters even with a 32-bit unsigned long.
+#[cfg(target_env = "musl")]
+type FsCount = u64;
+#[cfg(not(target_env = "musl"))]
+type FsCount = c_ulong;
 
 #[repr(C)]
 #[derive(Default)]
 struct StatVfs {
     block_size: c_ulong,
     fragment_size: c_ulong,
-    blocks: c_ulong,
-    blocks_free: c_ulong,
-    blocks_available: c_ulong,
-    files: c_ulong,
-    files_free: c_ulong,
-    files_available: c_ulong,
+    blocks: FsCount,
+    blocks_free: FsCount,
+    blocks_available: FsCount,
+    files: FsCount,
+    files_free: FsCount,
+    files_available: FsCount,
+    #[cfg(all(
+        target_pointer_width = "32",
+        target_env = "musl",
+        target_endian = "big"
+    ))]
+    fsid_padding_before: c_int,
     filesystem_id: c_ulong,
+    #[cfg(all(
+        target_pointer_width = "32",
+        any(
+            all(target_env = "musl", target_endian = "little"),
+            all(not(target_env = "musl"), not(target_arch = "x86_64"))
+        )
+    ))]
+    fsid_padding_after: c_int,
     mount_flags: c_ulong,
     name_max: c_ulong,
     spare: [c_int; 6],
 }
+
+// Check these at compile time as cross-target binaries may not be runnable on
+// the build host. Sizes/offsets follow the native glibc and musl statvfs ABI.
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+const _: () = {
+    assert!(std::mem::size_of::<StatVfs>() == 112);
+    assert!(std::mem::offset_of!(StatVfs, mount_flags) == 72);
+};
+#[cfg(all(target_os = "linux", target_pointer_width = "32", target_env = "musl"))]
+const _: () = {
+    assert!(std::mem::size_of::<StatVfs>() == 96);
+    assert!(std::mem::offset_of!(StatVfs, mount_flags) == 64);
+};
+#[cfg(all(
+    target_os = "linux",
+    target_pointer_width = "32",
+    target_env = "gnu",
+    not(target_arch = "x86_64")
+))]
+const _: () = {
+    assert!(std::mem::size_of::<StatVfs>() == 72);
+    assert!(std::mem::offset_of!(StatVfs, mount_flags) == 40);
+};
 
 // getifaddrs uses platform-specific sockaddr layouts; the macOS collector has
 // its own declaration and never calls this Linux-layout version on Darwin.
@@ -1792,7 +1852,7 @@ unsafe extern "C" {
     fn statvfs(path: *const c_char, buf: *mut StatVfs) -> c_int;
     fn getifaddrs(addresses: *mut *mut IfAddrs) -> c_int;
     fn freeifaddrs(addresses: *mut IfAddrs);
-    fn sysconf(name: c_int) -> i64;
+    fn sysconf(name: c_int) -> c_long;
 }
 
 const AF_INET: u16 = 2;
@@ -1842,6 +1902,45 @@ fn stat_vfs(path: &Path) -> Option<(u64, u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shared_device_mounts_keep_the_same_interval_io_rates() {
+        let directory =
+            std::env::temp_dir().join(format!("btoprs-mount-io-{}", std::process::id()));
+        let device = directory.join("btoprs_test_device");
+        fs::create_dir_all(&device).unwrap();
+        let mounts = format!(
+            "/dev/btoprs_test_device {} ext4 rw 0 0\n/dev/btoprs_test_device {} ext4 rw 0 0\n",
+            directory.display(),
+            device.display()
+        );
+        let mut config = Config::default();
+        // The fixture filesystem need not be loaded by the host kernel.
+        config.set_value("only_physical", "False");
+        config.set_value("use_fstab", "False");
+        let mut previous = HashMap::new();
+        fs::write(device.join("stat"), "0 0 100 0 0 0 200 0 0 1000 0").unwrap();
+        let first = collect_disks_for_mounts(&config, &mut previous, 2.0, &mounts, &directory);
+        assert_eq!(first.len(), 2);
+        assert!(first.iter().all(|disk| disk.read_per_second == 0));
+        fs::write(device.join("stat"), "0 0 110 0 0 0 220 0 0 1500 0").unwrap();
+        let second = collect_disks_for_mounts(&config, &mut previous, 2.0, &mounts, &directory);
+        assert_eq!(second.len(), 2);
+        for disk in &second {
+            assert_eq!(
+                (
+                    disk.read_per_second,
+                    disk.write_per_second,
+                    disk.io_activity
+                ),
+                (2560, 5120, 25.0)
+            );
+        }
+        collect_disks_for_mounts(&config, &mut previous, 2.0, "", &directory);
+        assert!(previous.is_empty());
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn cpu_stat_preserves_missing_logical_cpu_slots() {

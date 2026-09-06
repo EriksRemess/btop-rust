@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::cli::Cli;
 
@@ -472,11 +474,7 @@ impl Config {
             fs::create_dir_all(parent)
                 .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
         }
-        let temporary = path.with_extension("conf.tmp");
-        fs::write(&temporary, output)
-            .map_err(|error| format!("could not write {}: {error}", temporary.display()))?;
-        fs::rename(&temporary, path)
-            .map_err(|error| format!("could not replace {}: {error}", path.display()))
+        write_config_atomically(path, output.as_bytes())
     }
 
     fn set_read_only_from(&mut self, path: &Path) {
@@ -527,6 +525,44 @@ impl Config {
         set("cpu_invert_lower", self.cpu_invert_lower.to_string());
         set("clock_format", self.clock_format.clone());
     }
+}
+
+fn write_config_atomically(path: &Path, output: &[u8]) -> Result<(), String> {
+    static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
+    // Exclusive creation rejects existing files and symlinks. Each writer owns
+    // its file until rename, so concurrent saves cannot truncate one another.
+    for _ in 0..128 {
+        let sequence = NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed);
+        let mut name = path.file_name().unwrap_or_default().to_os_string();
+        name.push(format!(".{}.{}.tmp", std::process::id(), sequence));
+        let temporary = path.with_file_name(name);
+        let mut file = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("could not create {}: {error}", temporary.display())),
+        };
+        let result = (|| -> std::io::Result<()> {
+            file.write_all(output)?;
+            if let Ok(metadata) = fs::metadata(path) {
+                file.set_permissions(metadata.permissions())?;
+            }
+            file.sync_all()?;
+            fs::rename(&temporary, path)
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        return result.map_err(|error| format!("could not save {}: {error}", path.display()));
+    }
+    Err(format!(
+        "could not create a unique temporary file for {}",
+        path.display()
+    ))
 }
 
 fn default_path() -> Option<PathBuf> {
@@ -725,6 +761,63 @@ fn valid_preset(preset: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saves_ignore_existing_temporary_symlinks_and_preserve_permissions() {
+        use std::os::unix::fs::symlink;
+        let directory =
+            std::env::temp_dir().join(format!("btoprs-safe-save-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("test.conf");
+        let victim = directory.join("unrelated.txt");
+        fs::write(&victim, "keep this text").unwrap();
+        symlink(&victim, path.with_extension("conf.tmp")).unwrap();
+        fs::write(&path, "update_ms = 1700\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        let mut config = Config::load(Some(&path)).unwrap();
+        config.update_ms = 3100;
+        config.save().unwrap();
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "keep this text");
+        assert!(!path.is_symlink());
+        assert_eq!(Config::load(Some(&path)).unwrap().update_ms, 3100);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn concurrent_config_saves_publish_complete_files_and_clean_up_failures() {
+        let directory =
+            std::env::temp_dir().join(format!("btoprs-concurrent-save-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("test.conf");
+        let payloads: Vec<Vec<u8>> = (0..8).map(|value| vec![b'a' + value; 128 * 1024]).collect();
+        let barrier = std::sync::Barrier::new(payloads.len());
+        let barrier = &barrier;
+        // All writers start together, targeting the same destination.
+        std::thread::scope(|scope| {
+            for payload in &payloads {
+                let path = &path;
+                scope.spawn(move || {
+                    barrier.wait();
+                    write_config_atomically(path, payload).unwrap();
+                });
+            }
+        });
+        assert!(payloads.contains(&fs::read(&path).unwrap()));
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+        let invalid = directory.join("directory.conf");
+        fs::create_dir(&invalid).unwrap();
+        assert!(write_config_atomically(&invalid, b"data").is_err());
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 2);
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn default_contract_contains_all_reference_keys() {

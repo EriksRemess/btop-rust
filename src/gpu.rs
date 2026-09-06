@@ -1098,7 +1098,8 @@ impl IntelPmu {
         let gpu_clock_mhz = self
             .frequency
             .as_mut()
-            .map(|counter| (counter.delta() as f64 / 1e9 / elapsed).round() as u32)
+            // i915 integrates MHz over seconds; only busy counters use nanoseconds.
+            .map(|counter| (counter.delta() as f64 / elapsed).round() as u32)
             .unwrap_or(0);
         let power_mw = self
             .energy
@@ -1235,6 +1236,40 @@ unsafe extern "C" {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn intel_frequency_counter_is_integrated_mhz() {
+        use std::io::Write;
+        use std::os::fd::IntoRawFd;
+        let path =
+            std::env::temp_dir().join(format!("btoprs-pmu-frequency-{}", std::process::id()));
+        let mut file = fs::File::create(&path).unwrap();
+        file.write_all(&3000_u64.to_ne_bytes()).unwrap();
+        drop(file);
+        let file = fs::File::open(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        let mut collector = IntelPmu {
+            name: "test".into(),
+            busy: Vec::new(),
+            energy: None,
+            max_power_mw: 0,
+            frequency: Some(PmuCounter {
+                fd: file.into_raw_fd(),
+                previous: 1000,
+                scale: 1.0,
+            }),
+            last_sample: Instant::now() - Duration::from_secs(2),
+        };
+        let sample = collector.collect();
+        assert!(sample.support.gpu_clock);
+        assert!(
+            (990..=1000).contains(&sample.gpu_clock_mhz),
+            "{}",
+            sample.gpu_clock_mhz
+        );
+    }
+
     use std::os::unix::fs::symlink;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

@@ -36,9 +36,17 @@ The terminal UI exits cleanly with `q` or `Ctrl-C`; `Esc` opens the main menu. R
 See the [project notes](NOTES.md) for platform decisions, known limitations,
 and verification guidance.
 
-`btoprs` supports btop-compatible `.theme` files. Its own themes are installed
-under `share/btoprs/themes` and can be added to `~/.config/btoprs/themes`;
-legacy btop theme directories are also searched for compatibility.
+`btoprs` supports btop-compatible `.theme` files. All bundled themes are embedded
+in the executable, including Cargo installations. On startup, missing themes
+are installed into `$XDG_CONFIG_HOME/btoprs/themes` (normally
+`~/.config/btoprs/themes`). Themes already present in any search directory are
+left in place, so your edits survive upgrades. Deleted bundled themes are restored
+on the next startup if no other copy exists.
+
+Readable theme files take precedence over embedded copies. If a bundled theme's
+file cannot be read, or the theme directory cannot be written, the embedded copy
+remains available directly from the executable.
+Legacy btop theme directories are also searched for compatibility.
 
 Install the executable, documentation, themes, and man page under `~/.local`
 with:
@@ -54,7 +62,8 @@ override it with `INSTALL_PLATFORM`.
 Remove the installed files with `make uninstall`.
 
 Use `PREFIX` and `DESTDIR` for another installation root. `cargo install --path
-.` remains available when only the `btoprs` executable is wanted.
+.` installs the executable with all bundled themes embedded; desktop files and
+the man page are installed by `make install`.
 
 ## License
 

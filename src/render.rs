@@ -7383,55 +7383,121 @@ fn option_description(option: &str) -> &'static [&'static str] {
     }
 }
 
+#[cfg(target_os = "linux")]
+const SIGNALS: [&str; 32] = [
+    "0",
+    "SIGHUP",
+    "SIGINT",
+    "SIGQUIT",
+    "SIGILL",
+    "SIGTRAP",
+    "SIGABRT",
+    "SIGBUS",
+    "SIGFPE",
+    "SIGKILL",
+    "SIGUSR1",
+    "SIGSEGV",
+    "SIGUSR2",
+    "SIGPIPE",
+    "SIGALRM",
+    "SIGTERM",
+    "SIGSTKFLT",
+    "SIGCHLD",
+    "SIGCONT",
+    "SIGSTOP",
+    "SIGTSTP",
+    "SIGTTIN",
+    "SIGTTOU",
+    "SIGURG",
+    "SIGXCPU",
+    "SIGXFSZ",
+    "SIGVTALRM",
+    "SIGPROF",
+    "SIGWINCH",
+    "SIGIO",
+    "SIGPWR",
+    "SIGSYS",
+];
+
+#[cfg(target_os = "macos")]
+const SIGNALS: [&str; 32] = [
+    "0",
+    "SIGHUP",
+    "SIGINT",
+    "SIGQUIT",
+    "SIGILL",
+    "SIGTRAP",
+    "SIGABRT",
+    "SIGEMT",
+    "SIGFPE",
+    "SIGKILL",
+    "SIGBUS",
+    "SIGSEGV",
+    "SIGSYS",
+    "SIGPIPE",
+    "SIGALRM",
+    "SIGTERM",
+    "SIGURG",
+    "SIGSTOP",
+    "SIGTSTP",
+    "SIGCONT",
+    "SIGCHLD",
+    "SIGTTIN",
+    "SIGTTOU",
+    "SIGIO",
+    "SIGXCPU",
+    "SIGXFSZ",
+    "SIGVTALRM",
+    "SIGPROF",
+    "SIGWINCH",
+    "SIGINFO",
+    "SIGUSR1",
+    "SIGUSR2",
+];
+
+fn selectable_signals() -> impl Iterator<Item = (usize, &'static str)> {
+    SIGNALS
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(number, name)| *number != 0 && *name != "SIGSTKFLT")
+}
+
 fn move_signal_horizontal(selected: u8, right: bool) -> u8 {
-    let mut next = i32::from(selected);
-    if right {
-        next += 1;
-        if next > 31 {
-            next = 1;
-        } else if next == 16 {
-            next = 17;
-        }
-    } else {
-        next -= 1;
-        if next < 1 {
-            next = 31;
-        } else if next == 16 {
-            next = 15;
-        }
-    }
-    next as u8
+    move_signal_selection(selected, right, false)
 }
 
 fn move_signal_vertical(selected: u8, down: bool) -> u8 {
-    let mut next = i32::from(selected);
-    if down {
-        if next == 31 || next < 1 || next == 16 {
-            next = 1;
-        } else if next > 26 {
-            next -= 25;
-        } else {
-            let below_gap = next < 16;
-            next += 5;
-            if next >= 16 && below_gap {
-                next += 1;
+    move_signal_selection(selected, down, true)
+}
+
+fn move_signal_selection(selected: u8, forward: bool, vertical: bool) -> u8 {
+    let signals: Vec<usize> = selectable_signals().map(|(number, _)| number).collect();
+    let count = signals.len();
+    let Some(index) = signals
+        .iter()
+        .position(|number| *number == usize::from(selected))
+    else {
+        return signals[if forward { 0 } else { count - 1 }] as u8;
+    };
+    let next = if vertical {
+        if forward {
+            if index + 5 < count {
+                index + 5
+            } else {
+                index % 5
             }
-            next = next.min(31);
-        }
-    } else if next != 16 {
-        if next == 1 {
-            next = 31;
-        } else if next < 6 {
-            next += 25;
+        } else if index >= 5 {
+            index - 5
         } else {
-            let above_gap = next > 16;
-            next -= 5;
-            if next <= 16 && above_gap {
-                next -= 1;
-            }
+            index + (count - 1 - index) / 5 * 5
         }
-    }
-    next as u8
+    } else if forward {
+        (index + 1) % count
+    } else {
+        (index + count - 1) % count
+    };
+    signals[next] as u8
 }
 
 fn draw_signal(canvas: &mut Canvas, app: &mut AppState, pid: u32, signal: i32) {
@@ -7503,40 +7569,6 @@ fn draw_dialog_button(canvas: &mut Canvas, area: Rect, label: &str, selected: bo
 
 fn draw_signal_chooser(canvas: &mut Canvas, app: &mut AppState, pid: u32, selected: u8) {
     app.signal_choice_hitboxes.clear();
-    const SIGNALS: [&str; 32] = [
-        "0",
-        "SIGHUP",
-        "SIGINT",
-        "SIGQUIT",
-        "SIGILL",
-        "SIGTRAP",
-        "SIGABRT",
-        "SIGBUS",
-        "SIGFPE",
-        "SIGKILL",
-        "SIGUSR1",
-        "SIGSEGV",
-        "SIGUSR2",
-        "SIGPIPE",
-        "SIGALRM",
-        "SIGTERM",
-        "SIGSTKFLT",
-        "SIGCHLD",
-        "SIGCONT",
-        "SIGSTOP",
-        "SIGTSTP",
-        "SIGTTIN",
-        "SIGTTOU",
-        "SIGURG",
-        "SIGXCPU",
-        "SIGXFSZ",
-        "SIGVTALRM",
-        "SIGPROF",
-        "SIGWINCH",
-        "SIGIO",
-        "SIGPWR",
-        "SIGSYS",
-    ];
     let width = 78.min(canvas.width.saturating_sub(4));
     let height = 19.min(canvas.height.saturating_sub(2));
     let area = Rect::new(
@@ -7582,12 +7614,7 @@ fn draw_signal_chooser(canvas: &mut Canvas, app: &mut AppState, pid: u32, select
         '█',
         theme::MAIN,
     );
-    for (ordinal, (index, signal)) in SIGNALS
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| *index != 0 && *index != 16)
-        .enumerate()
-    {
+    for (ordinal, (index, signal)) in selectable_signals().enumerate() {
         let column = ordinal % 5;
         let row = ordinal / 5;
         let x = area.x + 2 + column * 15;
@@ -8862,6 +8889,33 @@ impl Canvas {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signal_picker_names_and_navigation_use_native_numbers() {
+        assert_eq!(SIGNALS[crate::SIGBUS as usize], "SIGBUS");
+        assert_eq!(SIGNALS[crate::SIGUSR1 as usize], "SIGUSR1");
+        assert_eq!(SIGNALS[crate::SIGUSR2 as usize], "SIGUSR2");
+        assert_eq!(SIGNALS[crate::SIGSTOP as usize], "SIGSTOP");
+        assert_eq!(SIGNALS[crate::SIGCONT as usize], "SIGCONT");
+        let numbers: Vec<_> = selectable_signals()
+            .map(|(number, _)| number as u8)
+            .collect();
+        let mut selected = 0;
+        for &number in &numbers {
+            selected = move_signal_horizontal(selected, true);
+            assert_eq!(selected, number);
+            assert!(numbers.contains(&move_signal_vertical(selected, true)));
+            assert!(numbers.contains(&move_signal_vertical(selected, false)));
+        }
+        assert_eq!(move_signal_horizontal(selected, true), numbers[0]);
+        for &number in numbers.iter().rev().skip(1) {
+            selected = move_signal_horizontal(selected, false);
+            assert_eq!(selected, number);
+        }
+        #[cfg(target_os = "macos")]
+        assert!(numbers.contains(&16)); // SIGURG is a real Darwin signal.
+    }
+
     use crate::collect::DiskSample;
 
     fn app() -> AppState {

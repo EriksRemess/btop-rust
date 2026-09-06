@@ -1,6 +1,10 @@
 use std::process::Command;
+use std::{fs, path::PathBuf};
 
 fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=themes");
+    embed_themes();
     let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
     let version = Command::new(&rustc)
         .arg("--version")
@@ -17,4 +21,30 @@ fn main() {
     println!(
         "cargo:rustc-env=BTOPRS_BUILD_CONFIGURATION=profile={profile} target={target} no-external-crates"
     );
+}
+
+fn embed_themes() {
+    let root = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("manifest directory"));
+    let mut paths: Vec<_> = fs::read_dir(root.join("themes"))
+        .expect("read bundled themes")
+        .map(|entry| entry.expect("read theme entry").path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "theme")
+        })
+        .collect();
+    paths.sort();
+    assert!(!paths.is_empty(), "no bundled themes found");
+    let mut source = String::from("const BUNDLED_THEMES: &[(&str, &str)] = &[\n");
+    for path in paths {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("UTF-8 theme name");
+        let contents = fs::read_to_string(&path).expect("read theme contents");
+        source.push_str(&format!("({name:?}, {contents:?}),\n"));
+    }
+    source.push_str("];\n");
+    let output = PathBuf::from(std::env::var_os("OUT_DIR").expect("build output directory"));
+    fs::write(output.join("bundled_themes.rs"), source).expect("write embedded themes");
 }

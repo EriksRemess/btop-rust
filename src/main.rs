@@ -29,7 +29,9 @@ const SIGNAL_REDRAW: u32 = 1 << 2;
 const SIGNAL_RELOAD: u32 = 1 << 3;
 static PENDING_SIGNALS: AtomicU32 = AtomicU32::new(0);
 
+const SIGHUP: i32 = 1;
 const SIGINT: i32 = 2;
+const SIGTERM: i32 = 15;
 const SIGILL: i32 = 4;
 const SIGTRAP: i32 = 5;
 const SIGABRT: i32 = 6;
@@ -100,7 +102,7 @@ impl CollectionClock {
 
 extern "C" fn signal_handler(signal: i32) {
     let flag = match signal {
-        SIGINT => SIGNAL_QUIT,
+        SIGHUP | SIGINT | SIGTERM => SIGNAL_QUIT,
         SIGTSTP => SIGNAL_SUSPEND,
         SIGCONT | SIGWINCH => SIGNAL_REDRAW,
         SIGUSR2 => SIGNAL_RELOAD,
@@ -134,7 +136,9 @@ unsafe fn raise_signal(signal_number: i32) -> i32 {
 }
 
 fn install_signal_handlers() -> Result<(), String> {
-    for signal_number in [SIGINT, SIGTSTP, SIGCONT, SIGWINCH, SIGUSR1, SIGUSR2] {
+    for signal_number in [
+        SIGHUP, SIGINT, SIGTERM, SIGTSTP, SIGCONT, SIGWINCH, SIGUSR1, SIGUSR2,
+    ] {
         if unsafe { set_signal_handler(signal_number, signal_handler as *const () as usize) }
             == usize::MAX
         {
@@ -239,6 +243,9 @@ fn run() -> Result<u8, String> {
     }
     ensure_utf8_locale(cli.force_utf)?;
     install_signal_handlers()?;
+    if let Err(error) = theme::install_missing_themes(config.themes_dir.as_deref()) {
+        logger::warning(&format!("Could not install bundled themes: {error}"));
+    }
     let mut terminal = Terminal::enter(!config.disable_mouse, config.terminal_sync)?;
     if let Some(tty_name) = tty_name.as_deref() {
         logger::info(&format!("Running on {tty_name}"));
@@ -353,7 +360,10 @@ fn ensure_utf8_locale(force: bool) -> Result<(), String> {
             locale: *const std::os::raw::c_char,
         ) -> *mut std::os::raw::c_char;
     }
+    #[cfg(target_os = "linux")]
     const LC_ALL: i32 = 6;
+    #[cfg(target_os = "macos")]
+    const LC_ALL: i32 = 0;
     let set = |locale: &str| -> Option<String> {
         let locale = CString::new(locale).ok()?;
         let selected = unsafe { setlocale(LC_ALL, locale.as_ptr()) };
@@ -441,6 +451,53 @@ fn suspend_process() -> Result<(), String> {
 mod tests {
     use super::{CollectionClock, auto_tty_mode, locale_is_utf8};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn initializes_all_locale_categories() {
+        // setlocale is process-global, so test it in a child with no other tests.
+        if std::env::var_os("BTOPRS_LOCALE_TEST_CHILD").is_some() {
+            super::ensure_utf8_locale(false).unwrap();
+            unsafe extern "C" {
+                fn setlocale(
+                    category: i32,
+                    locale: *const std::ffi::c_char,
+                ) -> *mut std::ffi::c_char;
+            }
+            #[cfg(target_os = "linux")]
+            let categories = [0, 2]; // LC_CTYPE, LC_TIME
+            #[cfg(target_os = "macos")]
+            let categories = [2, 5];
+            for category in categories {
+                let value = unsafe { setlocale(category, std::ptr::null()) };
+                assert!(!value.is_null());
+                let locale = unsafe { std::ffi::CStr::from_ptr(value) }.to_str().unwrap();
+                assert!(locale_is_utf8(locale), "category {category}: {locale}");
+            }
+            return;
+        }
+        let locale = if cfg!(target_os = "macos") {
+            "en_US.UTF-8"
+        } else {
+            "C.UTF-8"
+        };
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::initializes_all_locale_categories",
+                "--nocapture",
+            ])
+            .env("BTOPRS_LOCALE_TEST_CHILD", "1")
+            .env("LC_ALL", locale)
+            .env("LANG", locale)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[test]
     fn recognizes_the_utf8_locale_spellings_used_by_btop() {
