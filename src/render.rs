@@ -2015,12 +2015,16 @@ impl Renderer {
                     )
                 }
             } else {
-                let gpu_divisor = shown_gpus.len() + 1;
+                let expanded_gpus = shown_gpus
+                    .iter()
+                    .filter(|index| gpu_height_offset(&app.sample.gpus[**index]) > 0)
+                    .count();
+                let gpu_divisor = expanded_gpus + 1;
                 // Draw::calcSizes performs the division in the integer
                 // percentage expression before applying ceil(). This differs
                 // from treating 32 / divisor as a fraction once three or more
                 // dedicated GPU panels are visible.
-                let percentage = 32 / gpu_divisor + 5 * usize::from(!shown_gpus.is_empty());
+                let percentage = 32 / gpu_divisor + 5 * usize::from(expanded_gpus > 0);
                 (height * percentage)
                     .div_ceil(100)
                     .saturating_add(inline_gpus.len())
@@ -2441,10 +2445,13 @@ fn draw_cpu(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
     let lower_field = if configured_lower == "Auto"
         || cpu_graph_history(app, configured_lower, &inline_gpus).is_none()
     {
-        if inline_gpus.is_empty() {
-            upper_field
-        } else {
+        if inline_gpus
+            .iter()
+            .any(|index| app.sample.gpus[*index].support.utilization)
+        {
             "gpu-totals"
+        } else {
+            upper_field
         }
     } else {
         configured_lower
@@ -2753,8 +2760,16 @@ fn draw_cpu(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
         } else {
             usize::from(app.sample.gpus.len() > 1)
         };
+        let gpu_clock = gpu
+            .support
+            .gpu_clock
+            .then(|| format!("{} MHz", gpu.gpu_clock_mhz));
         let mut gpu_meter_width = box_width.saturating_sub(
             10 + gpu_index_width
+                + gpu_clock
+                    .as_deref()
+                    .map(|clock| units::display_width(clock) + 1)
+                    .unwrap_or(0)
                 + if show_temps && gpu.support.temperature {
                     11
                 } else {
@@ -2774,6 +2789,12 @@ fn draw_cpu(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
         }
         canvas.text_bold(box_x + 1, y, &prefix, theme::MAIN);
         let mut x = box_x + 1 + prefix.len();
+        let frequency_only = gpu.support.gpu_clock
+            && !gpu.support.utilization
+            && !gpu.support.memory_used
+            && !gpu.support.memory_total
+            && !(show_temps && gpu.support.temperature)
+            && !gpu.support.power;
         if gpu.support.utilization {
             if gpu_meter_width > 0 {
                 meter_bold(
@@ -2796,6 +2817,21 @@ fn draw_cpu(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
                 theme::MAIN,
             );
             x += 4;
+        }
+        if frequency_only && let Some(clock) = &gpu_clock {
+            let available =
+                (box_x + box_width - 1).saturating_sub(x + units::display_width(clock) + 2);
+            if available > 0 {
+                let name = units::truncate(&gpu.name, available);
+                if !name.is_empty() {
+                    canvas.text_bold(x + 1, y, &name, theme::MAIN);
+                    x += units::display_width(&name) + 1;
+                }
+            }
+        }
+        if let Some(clock) = &gpu_clock {
+            canvas.text_bold(x + 1, y, clock, theme::MAIN);
+            x += units::display_width(clock) + 1;
         }
         if gpu.support.memory_used {
             if columns > 1 && gpu.support.memory_total {
@@ -3142,6 +3178,11 @@ fn gpu_panel_height(
     terminal_height: usize,
     total_gpus: usize,
 ) -> usize {
+    if gpu_height_offset(gpu) == 0 {
+        // A clock-only GPU has no history that can fill a graph panel. Keep
+        // its dedicated view to a compact identity/frequency strip.
+        return 4.min(remaining_height);
+    }
     let mut base = if cpu_height > 0 && lower_visible {
         cpu_height
     } else if cpu_height == 0 && !lower_visible {
@@ -9298,7 +9339,8 @@ mod tests {
 
     #[test]
     fn multi_gpu_heights_use_calc_sizes_integer_order() {
-        let gpu = GpuSample::default();
+        let mut gpu = GpuSample::default();
+        gpu.support.utilization = true;
         assert_eq!(gpu_panel_height(&gpu, 0, true, 20, 2, 20, 2), 8);
         assert_eq!(gpu_panel_height(&gpu, 9, true, 10, 1, 19, 1), 10);
 
@@ -9316,6 +9358,13 @@ mod tests {
             &mut app,
         );
         assert_eq!(app.cpu_area.map(|area| area.h), Some(13));
+    }
+
+    #[test]
+    fn frequency_only_dedicated_gpu_uses_a_compact_strip() {
+        let mut gpu = GpuSample::default();
+        gpu.support.gpu_clock = true;
+        assert_eq!(gpu_panel_height(&gpu, 20, true, 40, 1, 60, 1), 4);
     }
 
     #[test]
@@ -9972,6 +10021,30 @@ mod tests {
         draw_cpu(&mut canvas, Rect::new(0, 0, 120, 20), &mut app);
 
         assert!(canvas_text(&canvas).contains("total ▲▼ gpu-totals"));
+    }
+
+    #[test]
+    fn frequency_only_inline_gpu_shows_clock_without_empty_usage_graph() {
+        let mut app = app();
+        let mut gpu = GpuSample {
+            name: "Intel Skylake (Gen9)".into(),
+            gpu_clock_mhz: 350,
+            ..GpuSample::default()
+        };
+        gpu.support.gpu_clock = true;
+        app.sample.gpus.push(gpu);
+        app.gpu_histories.push(GpuHistory::default());
+        let mut canvas = Canvas::new(120, 20);
+
+        draw_cpu(&mut canvas, Rect::new(0, 0, 120, 20), &mut app);
+
+        let output = canvas_text(&canvas);
+        assert!(
+            output
+                .lines()
+                .any(|line| line.contains("GPU Intel Skylake (Gen9) 350 MHz"))
+        );
+        assert!(!output.contains("gpu-totals"));
     }
 
     #[test]

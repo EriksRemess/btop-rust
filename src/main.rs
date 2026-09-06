@@ -212,6 +212,11 @@ fn run() -> Result<u8, String> {
             print!("{}", Config::default_file());
             return Ok(0);
         }
+        Some(Action::Diagnostics) => {
+            print!("{}", collect::diagnostics());
+            print!("{}", gpu::diagnostics());
+            return Ok(0);
+        }
         None => {}
     }
 

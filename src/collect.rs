@@ -8,6 +8,7 @@ use std::time::Instant;
 
 use crate::config::Config;
 use crate::gpu::{GpuCollector, GpuSample};
+use crate::logger;
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -130,6 +131,116 @@ struct NetworkCounters {
     transmit_rollover: u64,
 }
 
+struct RaplReader {
+    energy_path: PathBuf,
+    max_energy_uj: u64,
+    previous: Option<(u64, Instant)>,
+    warned: bool,
+}
+
+impl RaplReader {
+    fn read_watts(&mut self) -> Option<f64> {
+        let energy = match fs::read_to_string(&self.energy_path).and_then(|value| {
+            value
+                .trim()
+                .parse::<u64>()
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+        }) {
+            Ok(energy) => energy,
+            Err(error) => {
+                if !self.warned {
+                    logger::debug(&format!(
+                        "CPU package power unavailable from {}: {error}",
+                        self.energy_path.display()
+                    ));
+                    self.warned = true;
+                }
+                return None;
+            }
+        };
+        let now = Instant::now();
+        let watts = self.previous.and_then(|(previous, timestamp)| {
+            let micros = now.duration_since(timestamp).as_micros() as f64;
+            let delta = rapl_energy_delta(previous, energy, self.max_energy_uj)?;
+            (micros > 0.0).then_some(delta as f64 / micros)
+        });
+        self.previous = Some((energy, now));
+        Some(watts.unwrap_or(0.0))
+    }
+}
+
+fn discover_rapl(root: &Path) -> Option<RaplReader> {
+    let entries = fs::read_dir(root).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = fs::read_to_string(path.join("name")).unwrap_or_default();
+        if !name.trim().starts_with("package-") || !path.join("energy_uj").exists() {
+            continue;
+        }
+        let max_energy_uj = fs::read_to_string(path.join("max_energy_range_uj"))
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(0);
+        return Some(RaplReader {
+            energy_path: path.join("energy_uj"),
+            max_energy_uj,
+            previous: None,
+            warned: false,
+        });
+    }
+    None
+}
+
+fn rapl_energy_delta(previous: u64, current: u64, maximum: u64) -> Option<u64> {
+    if current >= previous {
+        Some(current - previous)
+    } else if maximum >= previous {
+        Some(maximum - previous + current)
+    } else {
+        None
+    }
+}
+
+pub fn diagnostics() -> String {
+    #[cfg(target_os = "linux")]
+    {
+        let policy_count = fs::read_dir("/sys/devices/system/cpu/cpufreq")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("policy"))
+            .filter(|entry| entry.path().join("scaling_cur_freq").exists())
+            .count();
+        let temperature_count = available_temperature_sensors().len();
+        let rapl = discover_rapl(Path::new("/sys/class/powercap"));
+        let power = match rapl {
+            Some(reader) => match fs::read_to_string(&reader.energy_path) {
+                Ok(_) => format!("available ({})", reader.energy_path.display()),
+                Err(error) => format!("unavailable ({}, {error})", reader.energy_path.display()),
+            },
+            None => "unsupported (no package RAPL energy source)".into(),
+        };
+        format!(
+            "btoprs collector diagnostics\n\nCPU\n  frequency: {}\n  temperatures: {}\n  package power: {}\n",
+            if policy_count > 0 {
+                format!("available ({policy_count} policies)")
+            } else {
+                "fallback to /proc/cpuinfo".into()
+            },
+            if temperature_count > 0 {
+                format!("available ({temperature_count} sensors)")
+            } else {
+                "unavailable".into()
+            },
+            power
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        "btoprs collector diagnostics\n\nCPU\n  native platform collectors enabled\n".into()
+    }
+}
+
 pub struct Collector {
     previous_cpu: Vec<CpuTicks>,
     previous_processes: HashMap<u32, u64>,
@@ -141,7 +252,7 @@ pub struct Collector {
     gpus: GpuCollector,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     apple_cpu_frequency: Option<crate::gpu::macos::AppleCpuFrequencyCollector>,
-    rapl_previous: Option<(u64, Instant)>,
+    rapl: Option<RaplReader>,
     container_engine: Option<String>,
 }
 
@@ -169,7 +280,7 @@ impl Collector {
             gpus: GpuCollector::new(config),
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             apple_cpu_frequency: crate::gpu::macos::AppleCpuFrequencyCollector::new(),
-            rapl_previous: None,
+            rapl: discover_rapl(Path::new("/sys/class/powercap")),
             container_engine: detect_container(),
         })
     }
@@ -345,18 +456,7 @@ impl Collector {
     }
 
     fn read_cpu_watts(&mut self) -> Option<f64> {
-        let energy = fs::read_to_string("/sys/class/powercap/intel-rapl:0/energy_uj")
-            .ok()?
-            .trim()
-            .parse::<u64>()
-            .ok()?;
-        let now = Instant::now();
-        let watts = self.rapl_previous.and_then(|(previous, timestamp)| {
-            let micros = now.duration_since(timestamp).as_micros() as f64;
-            (micros > 0.0 && energy >= previous).then(|| (energy - previous) as f64 / micros)
-        });
-        self.rapl_previous = Some((energy, now));
-        Some(watts.unwrap_or(0.0))
+        self.rapl.as_mut()?.read_watts()
     }
 
     fn collect_network(&mut self, config: &Config, elapsed: f64) -> Result<NetworkSample, String> {
@@ -1940,6 +2040,29 @@ mod tests {
         collect_disks_for_mounts(&config, &mut previous, 2.0, "", &directory);
         assert!(previous.is_empty());
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn rapl_delta_handles_energy_counter_wraparound() {
+        assert_eq!(rapl_energy_delta(900, 950, 1_000), Some(50));
+        assert_eq!(rapl_energy_delta(950, 25, 1_000), Some(75));
+        assert_eq!(rapl_energy_delta(1_100, 25, 1_000), None);
+    }
+
+    #[test]
+    fn discovers_package_rapl_without_assuming_its_index() {
+        let root = std::env::temp_dir().join(format!("btop-rust-rapl-test-{}", std::process::id()));
+        let package = root.join("intel-rapl:7");
+        fs::create_dir_all(&package).unwrap();
+        fs::write(package.join("name"), "package-1\n").unwrap();
+        fs::write(package.join("energy_uj"), "42\n").unwrap();
+        fs::write(package.join("max_energy_range_uj"), "1000\n").unwrap();
+
+        let reader = discover_rapl(&root).unwrap();
+        assert_eq!(reader.energy_path, package.join("energy_uj"));
+        assert_eq!(reader.max_energy_uj, 1_000);
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

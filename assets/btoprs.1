@@ -7,7 +7,7 @@ btoprs - dependency-free terminal resource monitor.
 .LP
 \fBbtoprs\fR [\fB-c\fR \fIfile\fR] [\fB-d\fR] [\fB-f\fR \fIfilter\fR] [\fB-l\fR] [\fB-p\fR \fIid\fR] [\fB-t\fR] [\fB-u\fR \fIms\fR] [\fB--force-utf\fR] [\fB--themes-dir\fR \fIdir\fR]
 .PP
-\fBbtoprs\fR [\fB--default-config\fR | {\fB-h\fR | \fB--help\fR} | {\fB-V\fR | \fB--version\fR}]
+\fBbtoprs\fR [\fB--default-config\fR | \fB--diagnostics\fR | {\fB-h\fR | \fB--help\fR} | {\fB-V\fR | \fB--version\fR}]
 .SH DESCRIPTION
 .LP
 \fBbtoprs\fR shows usage and statistics for processors, GPUs, memory, disks, network interfaces, and processes.
@@ -45,6 +45,9 @@ Set an initial update rate in milliseconds.
 .TP 3
 \fB--default-config\fR
 Print the default config to standard output.
+.TP 3
+\fB--diagnostics\fR
+Report collector capabilities, available telemetry, and access failures.
 .TP 3
 \fB-h\fR, \fB--help\fR
 Show summary of options.

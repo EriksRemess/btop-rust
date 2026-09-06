@@ -8,6 +8,7 @@ pub enum Action {
     Help,
     Version { verbose: bool },
     DefaultConfig,
+    Diagnostics,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -31,6 +32,7 @@ impl Cli {
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--default-config" => cli.action = Some(Action::DefaultConfig),
+                "--diagnostics" => cli.action = Some(Action::Diagnostics),
                 "-h" | "--help" => cli.action = Some(Action::Help),
                 "-v" | "-V" => cli.action = Some(Action::Version { verbose: false }),
                 "--version" => cli.action = Some(Action::Version { verbose: true }),
@@ -123,6 +125,7 @@ pub fn print_usage() {
     println!("  \x1b[1m    --no-tty\x1b[0m            Force disable tty mode");
     println!("  \x1b[1m-u, --update\x1b[0m <ms>       Set an initial update rate in milliseconds");
     println!("  \x1b[1m    --default-config\x1b[0m    Print default config to standard output");
+    println!("  \x1b[1m    --diagnostics\x1b[0m       Report collector capabilities and access");
     println!("  \x1b[1m-h, --help\x1b[0m              Show this help message and exit");
     println!(
         "  \x1b[1m-V, --version\x1b[0m           Show a version message and exit (more with --version)"
@@ -140,5 +143,11 @@ mod tests {
 
         let maximum = Cli::parse(["--update".into(), u64::MAX.to_string()]).unwrap();
         assert_eq!(maximum.update_ms, Some(MAX_UPDATE_MS));
+    }
+
+    #[test]
+    fn diagnostics_is_a_non_interactive_action() {
+        let cli = Cli::parse(["--diagnostics".into()]).unwrap();
+        assert!(matches!(cli.action, Some(Action::Diagnostics)));
     }
 }

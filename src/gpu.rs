@@ -7,6 +7,7 @@ use std::ptr;
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
+use crate::logger;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) mod macos;
@@ -99,7 +100,7 @@ pub struct GpuCollector {
     nvml: Option<Nvml>,
     rsmi: Option<Rsmi>,
     amd_sysfs: Vec<AmdSysfsDevice>,
-    intel: Option<IntelPmu>,
+    intel: Option<IntelGpu>,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     apple: Option<macos::AppleGpuCollector>,
     shown: String,
@@ -123,7 +124,7 @@ impl GpuCollector {
         } else {
             Vec::new()
         };
-        let intel = shown.contains("intel").then(IntelPmu::load).flatten();
+        let intel = shown.contains("intel").then(IntelGpu::load).flatten();
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         let apple = shown
             .contains("apple")
@@ -211,7 +212,7 @@ impl GpuCollector {
                 }
             }
             if shown.contains("intel") && self.intel.is_none() {
-                self.intel = IntelPmu::load();
+                self.intel = IntelGpu::load();
             }
         }
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1044,41 +1045,67 @@ impl Drop for PmuCounter {
     }
 }
 
-struct IntelPmu {
+struct IntelGpu {
     name: String,
     busy: Vec<PmuCounter>,
     frequency: Option<PmuCounter>,
+    sysfs_frequency: Option<PathBuf>,
     energy: Option<PmuCounter>,
     last_sample: Instant,
     max_power_mw: u64,
 }
 
-impl IntelPmu {
+impl IntelGpu {
     fn load() -> Option<Self> {
-        let root = Path::new("/sys/bus/event_source/devices/i915");
-        let pmu_type = read_trimmed(root.join("type"))?.parse().ok()?;
-        let events = root.join("events");
+        Self::load_at(
+            Path::new("/sys/class/drm"),
+            Path::new("/sys/bus/event_source/devices/i915"),
+        )
+    }
+
+    fn load_at(drm_root: &Path, pmu_root: &Path) -> Option<Self> {
+        let (name, card) = discover_intel_device(drm_root)?;
+        // `gt_act_freq_mhz` commonly reads zero while an integrated GPU is
+        // idle. Prefer the current requested clock so a frequency-only panel
+        // remains informative even without PMU access.
+        let sysfs_frequency = ["gt_cur_freq_mhz", "gt_act_freq_mhz"]
+            .into_iter()
+            .map(|name| card.join(name))
+            .find(|path| read_integer(path).is_some());
+        let pmu_type = read_trimmed(pmu_root.join("type")).and_then(|value| value.parse().ok());
+        let events = pmu_root.join("events");
         let mut busy = Vec::new();
-        for entry in fs::read_dir(&events).ok()?.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.ends_with("-busy")
-                && let Some(counter) = PmuCounter::open(pmu_type, &entry.path(), 1.0)
-            {
-                busy.push(counter);
+        if let Some(pmu_type) = pmu_type {
+            for entry in fs::read_dir(&events).into_iter().flatten().flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.ends_with("-busy")
+                    && let Some(counter) = PmuCounter::open(pmu_type, &entry.path(), 1.0)
+                {
+                    busy.push(counter);
+                }
             }
         }
-        if busy.is_empty() {
-            return None;
-        }
-        let frequency = PmuCounter::open(pmu_type, &events.join("actual-frequency"), 1.0);
+        let frequency =
+            pmu_type.and_then(|kind| PmuCounter::open(kind, &events.join("actual-frequency"), 1.0));
         let energy_scale = read_trimmed(events.join("energy-gpu.scale"))
             .and_then(|value| value.parse().ok())
             .unwrap_or(1.0);
-        let energy = PmuCounter::open(pmu_type, &events.join("energy-gpu"), energy_scale);
+        let energy = pmu_type
+            .and_then(|kind| PmuCounter::open(kind, &events.join("energy-gpu"), energy_scale));
+        if busy.is_empty() && frequency.is_none() && sysfs_frequency.is_none() && energy.is_none() {
+            return None;
+        }
+        if busy.is_empty() && pmu_type.is_some() {
+            logger::debug(
+                "Intel GPU detected, but i915 utilization counters could not be opened; \
+                 check kernel.perf_event_paranoid or CAP_PERFMON",
+            );
+        }
         Some(Self {
-            name: discover_intel_name(),
+            name,
             busy,
             frequency,
+            sysfs_frequency,
             energy,
             last_sample: Instant::now(),
             max_power_mw: 10_000,
@@ -1100,6 +1127,12 @@ impl IntelPmu {
             .as_mut()
             // i915 integrates MHz over seconds; only busy counters use nanoseconds.
             .map(|counter| (counter.delta() as f64 / elapsed).round() as u32)
+            .or_else(|| {
+                self.sysfs_frequency
+                    .as_ref()
+                    .and_then(read_integer)
+                    .and_then(|value| u32::try_from(value).ok())
+            })
             .unwrap_or(0);
         let power_mw = self
             .energy
@@ -1114,8 +1147,8 @@ impl IntelPmu {
             power_mw,
             power_limit_mw: self.max_power_mw,
             support: GpuSupport {
-                utilization: true,
-                gpu_clock: self.frequency.is_some(),
+                utilization: !self.busy.is_empty(),
+                gpu_clock: self.frequency.is_some() || self.sysfs_frequency.is_some(),
                 power: self.energy.is_some(),
                 ..GpuSupport::default()
             },
@@ -1124,10 +1157,8 @@ impl IntelPmu {
     }
 }
 
-fn discover_intel_name() -> String {
-    let Ok(entries) = fs::read_dir("/sys/class/drm") else {
-        return "Intel GPU".into();
-    };
+fn discover_intel_device(root: &Path) -> Option<(String, PathBuf)> {
+    let entries = fs::read_dir(root).ok()?;
     for entry in entries.flatten() {
         let card = entry.file_name().to_string_lossy().into_owned();
         if !is_card_node(&card) {
@@ -1139,12 +1170,48 @@ fn discover_intel_name() -> String {
             if let Ok(device_id) = u16::from_str_radix(id.trim_start_matches("0x"), 16)
                 && let Some(name) = intel_device_name(device_id)
             {
-                return name;
+                return Some((name, entry.path()));
             }
-            return format!("Intel GPU (8086:{})", id.trim_start_matches("0x"));
+            return Some((
+                format!("Intel GPU (8086:{})", id.trim_start_matches("0x")),
+                entry.path(),
+            ));
         }
     }
-    "Intel GPU".into()
+    None
+}
+
+pub fn diagnostics() -> String {
+    #[cfg(target_os = "linux")]
+    {
+        let Some(mut intel) = IntelGpu::load() else {
+            return "\nGPU\n  Intel GPU: not detected or no readable telemetry\n".into();
+        };
+        let sample = intel.collect();
+        format!(
+            "\nGPU\n  device: {}\n  frequency: {}\n  utilization: {}\n  power: {}\n",
+            sample.name,
+            if sample.support.gpu_clock {
+                format!("available ({} MHz)", sample.gpu_clock_mhz)
+            } else {
+                "unavailable".into()
+            },
+            if sample.support.utilization {
+                "available"
+            } else {
+                "unavailable (i915 PMU access denied or unsupported)"
+            },
+            if sample.support.power {
+                "available"
+            } else {
+                "unsupported (no accessible i915 energy event)"
+            }
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        String::new()
+    }
 }
 
 fn intel_device_name(device_id: u16) -> Option<String> {
@@ -1350,6 +1417,29 @@ mod tests {
             Some("Intel Battlemage (Gen20)")
         );
         assert_eq!(intel_device_name(0xffff), None);
+    }
+
+    #[test]
+    fn intel_gpu_survives_without_privileged_pmu_counters() {
+        let root =
+            std::env::temp_dir().join(format!("btop-rust-intel-test-{}", std::process::id()));
+        let drm = root.join("drm");
+        let card = drm.join("card1");
+        let device = card.join("device");
+        fs::create_dir_all(&device).unwrap();
+        fs::write(device.join("vendor"), "0x8086\n").unwrap();
+        fs::write(device.join("device"), "0x1912\n").unwrap();
+        fs::write(card.join("gt_cur_freq_mhz"), "350\n").unwrap();
+
+        let mut intel = IntelGpu::load_at(&drm, &root.join("missing-pmu")).unwrap();
+        let sample = intel.collect();
+        assert!(sample.name.contains("Skylake"));
+        assert_eq!(sample.gpu_clock_mhz, 350);
+        assert!(sample.support.gpu_clock);
+        assert!(!sample.support.utilization);
+        assert!(!sample.support.power);
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
