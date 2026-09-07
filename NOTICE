@@ -9,3 +9,12 @@ This product contains material derived from btop++:
 
 btop++ is licensed under the Apache License, Version 2.0. Additional
 attribution notices for bundled themes are retained in the theme files.
+
+The Vulkan ABI declarations in src/gpu/vulkan.rs are derived from:
+
+    Vulkan-Headers
+    Copyright 2015-2026 The Khronos Group Inc.
+    https://github.com/KhronosGroup/Vulkan-Headers
+
+Vulkan-Headers is licensed under Apache-2.0 OR MIT; these declarations
+are used under the Apache License, Version 2.0.

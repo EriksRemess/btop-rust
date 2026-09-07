@@ -3231,6 +3231,30 @@ fn memory_panel_height(
         .min(lower_height)
 }
 
+fn gpu_title_name(name: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let cleaned = name
+        .replace(['™', '®'], "")
+        .replace("(TM)", "")
+        .replace("(R)", "");
+    let cleaned = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    let truncated = units::truncate(&cleaned, width);
+    if units::display_width(&cleaned) <= width {
+        return cleaned;
+    }
+    let prefix = truncated.trim_end_matches('…');
+    // Keep complete words where possible; a single long identifier still
+    // needs column-based truncation to stay within the panel.
+    let boundary = if cleaned[prefix.len()..].starts_with(char::is_whitespace) {
+        prefix.len()
+    } else {
+        prefix.rfind(char::is_whitespace).unwrap_or(prefix.len())
+    };
+    format!("{}…", prefix[..boundary].trim_end())
+}
+
 fn draw_gpu(canvas: &mut Canvas, area: Rect, app: &AppState, index: usize) {
     if area.h < 4 || area.w < 41 {
         return;
@@ -3243,7 +3267,7 @@ fn draw_gpu(canvas: &mut Canvas, area: Rect, app: &AppState, index: usize) {
         .unwrap_or("");
     canvas.panel(area, &format!("{key}gpu{index}"), theme::CPU_BOX, None);
 
-    let box_width = (area.w / 2).clamp(41, 65);
+    let box_width = (area.w / 2).clamp(41, 65).min(area.w - 2);
     let box_height = (gpu_height_offset(gpu) + 2).min(area.h.saturating_sub(2));
     let box_x = area.x + area.w - box_width - 1;
     let box_y = area.y + (area.h.saturating_sub(2 + box_height)).div_ceil(2) + 1;
@@ -3252,9 +3276,18 @@ fn draw_gpu(canvas: &mut Canvas, area: Rect, app: &AppState, index: usize) {
         .value(&format!("custom_gpu_name{index}"))
         .filter(|name| !name.is_empty())
         .unwrap_or(&gpu.name);
+    let clock = gpu
+        .support
+        .gpu_clock
+        .then(|| format!("{} MHz", gpu.gpu_clock_mhz));
+    let name_width = box_width.saturating_sub(
+        5 + clock
+            .as_ref()
+            .map_or(0, |clock| units::display_width(clock) + 3),
+    );
     canvas.panel(
         Rect::new(box_x, box_y, box_width, box_height),
-        &units::truncate(custom_name, box_width.saturating_sub(5)),
+        &gpu_title_name(custom_name, name_width),
         theme::BOX,
         None,
     );
@@ -3295,8 +3328,7 @@ fn draw_gpu(canvas: &mut Canvas, area: Rect, app: &AppState, index: usize) {
         }
     }
 
-    if gpu.support.gpu_clock {
-        let clock = format!("{} MHz", gpu.gpu_clock_mhz);
+    if let Some(clock) = clock {
         canvas.title(
             box_x + box_width.saturating_sub(clock.len() + 3),
             box_y,
@@ -3576,6 +3608,7 @@ fn draw_gpu(canvas: &mut Canvas, area: Rect, app: &AppState, index: usize) {
             canvas.put(middle, y, '│', theme::BOX);
             canvas.put(right, y, '│', theme::BOX);
         }
+        canvas.put(middle, box_y + box_height - 1, '┴', theme::BOX);
         let total = units::bytes(gpu.memory_total, app.config.base_10_sizes);
         canvas.text_bold(box_x + 2, row + 1, "Total:", theme::MAIN);
         canvas.text_bold(
@@ -3586,12 +3619,7 @@ fn draw_gpu(canvas: &mut Canvas, area: Rect, app: &AppState, index: usize) {
         );
         draw_graph(
             canvas,
-            Rect::new(
-                middle + 1,
-                row + 1,
-                box_width / 2 - 2,
-                2 + 2 * usize::from(gpu.support.memory_utilization),
-            ),
+            Rect::new(middle + 1, row + 1, box_width / 2 - 2, 4),
             &history.memory_used,
             100.0,
             theme::Style::Used(100),
@@ -3688,6 +3716,14 @@ fn draw_gpu(canvas: &mut Canvas, area: Rect, app: &AppState, index: usize) {
             bottom,
             &rx,
             theme::BOX,
+        );
+    }
+    if let Some(label) = &gpu.driver_label {
+        canvas.footer(
+            area.x + 2,
+            area.bottom() - 1,
+            &gpu_title_name(label, area.w.saturating_sub(6)),
+            theme::CPU_BOX,
         );
     }
 }
@@ -4165,7 +4201,7 @@ fn draw_disks_capacity(
     let meter_width = if big_disk {
         disks_width.saturating_sub(21)
     } else {
-        disks_width.saturating_sub(7)
+        disks_width.saturating_sub(8)
     };
     let mut cy = 0usize;
     let swap = crate::collect::DiskSample {
@@ -4218,7 +4254,6 @@ fn draw_disks_capacity(
         let y = area.y + 1 + cy;
         draw_disk_divider(canvas, area, divider, y);
         let name = disk_name(&disk.mount);
-        canvas.text_bold(divider + 2, y, &name, theme::TITLE);
         let total = if big_disk {
             units::bytes_spaced(disk.total, app.config.base_10_sizes)
         } else {
@@ -4230,20 +4265,32 @@ fn draw_disks_capacity(
             &total,
             theme::TITLE,
         );
+        let total_x = area.x + area.w.saturating_sub(total.len() + 2);
         let io_label = disk_io_label(
             disk.read_per_second,
             disk.write_per_second,
             app.config.base_10_sizes,
         );
-        if big_disk && let Some(label) = &io_label {
+        let label = io_label
+            .as_ref()
+            .filter(|label| total_x.saturating_sub(divider + 2) >= units::display_width(label) + 5);
+        let name_end = if let Some(label) = label {
+            let width = units::display_width(label);
             let center = divider + 1 + disks_width / 2;
-            canvas.text_preserve_spaces(
-                center.saturating_sub(units::display_width(label).div_ceil(2)),
-                y,
-                label,
-                theme::MAIN,
-            );
-        }
+            let x = center
+                .saturating_sub(width.div_ceil(2))
+                .min(total_x.saturating_sub(width + 1));
+            canvas.text(x, y, label, theme::MAIN);
+            x.saturating_sub(1)
+        } else {
+            total_x.saturating_sub(1)
+        };
+        canvas.text_bold(
+            divider + 2,
+            y,
+            &units::truncate(&name, name_end.saturating_sub(divider + 2)),
+            theme::TITLE,
+        );
         let mut row = y + 1;
         if io_row == 1 {
             if let Some(history) = app.disk_histories.get(&disk.mount) {
@@ -4267,17 +4314,6 @@ fn draw_disks_capacity(
                 if big_disk { " IO%" } else { " IO" },
                 theme::MAIN,
             );
-            if !big_disk && io_label.is_some() {
-                canvas.text(
-                    divider + 1,
-                    row,
-                    &units::bytes_short(
-                        disk.read_per_second.saturating_add(disk.write_per_second),
-                        app.config.base_10_sizes,
-                    ),
-                    theme::MAIN,
-                );
-            }
             row += 1;
         }
         let used = ratio(disk.used, disk.total);
@@ -4290,11 +4326,11 @@ fn draw_disks_capacity(
                 theme::MAIN,
             );
         } else {
-            canvas.text(divider + 1, row, "U", theme::MAIN);
+            canvas.text(divider + 2, row, "U", theme::MAIN);
         }
         meter(
             canvas,
-            divider + if big_disk { 12 } else { 3 },
+            divider + if big_disk { 12 } else { 4 },
             row,
             meter_width,
             used,
@@ -4321,11 +4357,11 @@ fn draw_disks_capacity(
                     theme::MAIN,
                 );
             } else {
-                canvas.text(divider + 1, row, "F", theme::MAIN);
+                canvas.text(divider + 2, row, "F", theme::MAIN);
             }
             meter(
                 canvas,
-                divider + if big_disk { 12 } else { 3 },
+                divider + if big_disk { 12 } else { 4 },
                 row,
                 meter_width,
                 free,
@@ -4362,7 +4398,10 @@ fn disk_io_label(read_per_second: u64, write_per_second: u64, base_10: bool) -> 
         (false, true) => " ▲",
         (false, false) => unreachable!(),
     };
-    Some(format!("{direction}{}", units::bytes_short(total, base_10)))
+    Some(format!(
+        "{direction} {}",
+        units::bytes_short(total, base_10)
+    ))
 }
 
 fn draw_disks_io(
@@ -4410,19 +4449,57 @@ fn draw_disks_io(
         }
         let y = area.y + 1 + cy;
         draw_disk_divider(canvas, area, divider, y);
-        canvas.text_bold(divider + 2, y, &disk_name(&disk.mount), theme::TITLE);
-        let total = units::bytes_spaced(disk.total, app.config.base_10_sizes);
-        canvas.text_preserve_spaces_bold(
-            area.x + area.w.saturating_sub(total.len() + 2),
+        let total = if disks_width >= 25 {
+            units::bytes_spaced(disk.total, app.config.base_10_sizes)
+        } else {
+            units::bytes_short(disk.total, app.config.base_10_sizes)
+        };
+        let total_x = area.x + area.w.saturating_sub(total.len() + 2);
+        canvas.text_preserve_spaces_bold(total_x, y, &total, theme::TITLE);
+        let used = format!("{:.0}%", ratio(disk.used, disk.total));
+        let rates = disk_io_label(
+            disk.read_per_second,
+            disk.write_per_second,
+            app.config.base_10_sizes,
+        );
+        let header = if let Some(rates) = &rates {
+            format!("{used} {}", rates.trim_start())
+        } else {
+            used.clone()
+        };
+        let header_width = units::display_width(&header);
+        let name_x = divider + 2;
+        // Keep rates in the header at every width. Drop the less essential
+        // used percentage before sacrificing the rate or moving it onto a graph.
+        let available = total_x.saturating_sub(name_x + 6);
+        let statistics = if header_width <= available {
+            Some(header.as_str())
+        } else if let Some(rates) = rates.as_deref().map(str::trim_start)
+            && units::display_width(rates) <= available
+        {
+            Some(rates)
+        } else if used.len() <= available {
+            Some(used.as_str())
+        } else {
+            None
+        };
+        let name_end = if let Some(statistics) = statistics {
+            let width = units::display_width(statistics);
+            let x = (divider + disks_width / 2)
+                .saturating_sub(width / 2)
+                .max(name_x + 5)
+                .min(total_x.saturating_sub(width + 1));
+            canvas.text(x, y, statistics, theme::MAIN);
+            x.saturating_sub(1)
+        } else {
+            total_x.saturating_sub(1)
+        };
+        canvas.text_bold(
+            name_x,
             y,
-            &total,
+            &units::truncate(&disk_name(&disk.mount), name_end.saturating_sub(name_x)),
             theme::TITLE,
         );
-        if disks_width >= 25 {
-            let used = format!("{:.0}%", ratio(disk.used, disk.total));
-            let center = divider + disks_width / 2;
-            canvas.text(center.saturating_sub(used.len() / 2), y, &used, theme::MAIN);
-        }
         let activity_y = y + 1;
         if let Some(history) = app.disk_histories.get(&disk.mount) {
             draw_graph_background(
@@ -4460,18 +4537,6 @@ fn draw_disks_io(
                     false,
                     true,
                 );
-                let value = disk.read_per_second.saturating_add(disk.write_per_second);
-                let label = if value == 0 {
-                    "RW".to_string()
-                } else {
-                    format!(
-                        "{}{} {}",
-                        if disk.write_per_second > 0 { "▼" } else { "" },
-                        if disk.read_per_second > 0 { "▲" } else { "" },
-                        units::bytes_short(value, app.config.base_10_sizes)
-                    )
-                };
-                canvas.text(divider + 2, graph_y, &label, theme::MAIN);
             } else {
                 draw_graph_options(
                     canvas,
@@ -4495,29 +4560,6 @@ fn draw_disks_io(
                     theme::Style::Used(100),
                     true,
                     true,
-                );
-                let read = if disk.read_per_second == 0 {
-                    "R".to_string()
-                } else {
-                    format!(
-                        "▲{}",
-                        units::bytes_short(disk.read_per_second, app.config.base_10_sizes)
-                    )
-                };
-                let write = if disk.write_per_second == 0 {
-                    "W".to_string()
-                } else {
-                    format!(
-                        "▼{}",
-                        units::bytes_short(disk.write_per_second, app.config.base_10_sizes)
-                    )
-                };
-                canvas.text(divider + 2, graph_y, &read, theme::MAIN);
-                canvas.text(
-                    divider + 2,
-                    graph_y + graph_height.saturating_sub(1),
-                    &write,
-                    theme::MAIN,
                 );
             }
         }
@@ -9648,6 +9690,86 @@ mod tests {
     }
 
     #[test]
+    fn gpu_driver_footer_fits_without_covering_live_metrics() {
+        let mut app = app();
+        app.sample.gpus.push(GpuSample {
+            name: "Driver GPU".into(),
+            driver_label: Some("Example Driver | Vulkan 1.3.7".into()),
+            utilization: 37,
+            support: crate::gpu::GpuSupport {
+                utilization: true,
+                ..Default::default()
+            },
+            ..GpuSample::default()
+        });
+        app.gpu_histories.push(GpuHistory::default());
+        for width in [41, 60, 100] {
+            let mut canvas = Canvas::new(width, 12);
+            draw_gpu(&mut canvas, Rect::new(0, 0, width, 12), &app, 0);
+            let output = canvas_text(&canvas);
+            assert!(output.contains("37%"));
+            assert!(canvas_row(&canvas, 11).contains("Vulkan 1.3.7"));
+            assert_eq!(canvas.cells[11 * width].ch, '╰');
+            assert_eq!(canvas.cells[12 * width - 1].ch, '╯');
+        }
+    }
+
+    #[test]
+    fn gpu_titles_shorten_driver_text_without_model_substitutions() {
+        assert_eq!(
+            gpu_title_name("AMD Radeon(TM) Graphics", 40),
+            "AMD Radeon Graphics"
+        );
+        assert_eq!(
+            gpu_title_name("AMD   Radeon RX 7900 XTX", 40),
+            "AMD Radeon RX 7900 XTX"
+        );
+        assert_eq!(gpu_title_name("AMD Radeon Graphics", 15), "AMD Radeon…");
+        assert_eq!(gpu_title_name("AMD Radeon Graphics", 11), "AMD Radeon…");
+        assert_eq!(gpu_title_name("LongIdentifier", 5), "Long…");
+    }
+
+    #[test]
+    fn gpu_name_clock_and_vram_graph_fit_without_memory_utilization() {
+        let mut app = app();
+        let mut gpu = GpuSample {
+            name: "AMD Cezanne [Radeon Vega Series / Radeon Vega Mobile Series]".into(),
+            gpu_clock_mhz: 400,
+            memory_total: 512 * 1024 * 1024,
+            memory_used: 51 * 1024 * 1024,
+            ..GpuSample::default()
+        };
+        gpu.support.gpu_clock = true;
+        gpu.support.memory_total = true;
+        gpu.support.memory_used = true;
+        app.sample.gpus.push(gpu);
+        app.gpu_histories.push(GpuHistory {
+            memory_used: VecDeque::from([10.0; 100]),
+            ..GpuHistory::default()
+        });
+        for width in [41, 65, 100, 140] {
+            let mut canvas = Canvas::new(width, 12);
+            draw_gpu(&mut canvas, Rect::new(0, 0, width, 12), &app, 0);
+            let title = (0..12)
+                .find(|&y| canvas_row(&canvas, y).contains("400 MHz"))
+                .unwrap();
+            assert!(canvas_row(&canvas, title).contains("AMD"));
+            assert!(canvas_row(&canvas, title).contains('…'));
+            let bottom = title + 6;
+            assert!(canvas_row(&canvas, bottom).contains('┴'));
+            assert!(
+                canvas.cells[(bottom - 1) * width..bottom * width]
+                    .iter()
+                    .any(|cell| { matches!(cell.style, theme::Style::Used(_)) && cell.ch != ' ' })
+            );
+            for y in 1..11 {
+                assert_eq!(canvas.cells[y * width].ch, '│');
+                assert_eq!(canvas.cells[y * width + width - 1].ch, '│');
+            }
+        }
+    }
+
+    #[test]
     fn gpu_vram_percentages_use_the_normal_foreground() {
         let mut app = app();
         let mut gpu = GpuSample {
@@ -10466,14 +10588,64 @@ mod tests {
                 activity: VecDeque::from([0.0, 25.0]),
             },
         );
-        let mut canvas = Canvas::new(80, 30);
+        for width in [44, 48, 52, 60, 80, 100, 140] {
+            for combined in [false, true] {
+                app.config
+                    .set_value("io_graph_combined", if combined { "true" } else { "false" });
+                let mut canvas = Canvas::new(width, 30);
+                draw_memory(&mut canvas, Rect::new(0, 0, width, 30), &mut app);
+                let output = canvas_text(&canvas);
+                assert!(output.contains("IO%"));
+                assert!(output.contains("▼▲ 3.0M"));
+                assert!(!output.contains("▲ 1.0M"));
+                assert!(!output.contains("▼ 2.0M"));
+                let header_y = (0..30)
+                    .find(|&y| canvas_row(&canvas, y).contains("root"))
+                    .unwrap();
+                let header = canvas_row(&canvas, header_y);
+                assert!(header.contains("▼▲ 3.0M"), "width {width}: {header}");
+                if width >= 100 {
+                    assert!(header.contains("50% ▼▲ 3.0M"), "{header}");
+                    assert!(header.contains("2.00─GiB"), "{header}");
+                }
+                for y in header_y + 1..29 {
+                    let row = canvas_row(&canvas, y);
+                    assert!(
+                        !row.contains('▲') && !row.contains('▼'),
+                        "width {width}: {row}"
+                    );
+                }
+            }
+        }
+    }
 
-        draw_memory(&mut canvas, Rect::new(0, 0, 80, 30), &mut app);
-
-        let output = canvas_text(&canvas);
-        assert!(output.contains("▲1.0M"));
-        assert!(output.contains("▼2.0M"));
-        assert!(output.contains("IO%"));
+    #[test]
+    fn disk_io_header_hides_idle_rates_and_inactive_directions() {
+        let mut app = app();
+        app.config.set_value("io_mode", "true");
+        app.sample.memory.disks.push(DiskSample {
+            mount: "/".into(),
+            total: 1024 * 1024,
+            used: 256 * 1024,
+            io_supported: true,
+            ..DiskSample::default()
+        });
+        for (read, write, expected) in [
+            (0, 0, "25%"),
+            (0, 12 * 1024, "25% ▼ 12K"),
+            (12 * 1024, 0, "25% ▲ 12K"),
+        ] {
+            app.sample.memory.disks[0].read_per_second = read;
+            app.sample.memory.disks[0].write_per_second = write;
+            let mut canvas = Canvas::new(100, 20);
+            draw_memory(&mut canvas, Rect::new(0, 0, 100, 20), &mut app);
+            let output = canvas_text(&canvas);
+            let header = output.lines().find(|row| row.contains("root")).unwrap();
+            assert!(header.contains(expected), "{header}");
+            assert!(!header.contains("0B"), "{header}");
+            assert_eq!(output.contains('▲'), read > 0);
+            assert_eq!(output.contains('▼'), write > 0);
+        }
     }
 
     #[test]
@@ -10545,7 +10717,7 @@ mod tests {
 
         draw_memory(&mut canvas, Rect::new(0, 0, 80, 20), &mut app);
 
-        assert!(canvas_text(&canvas).contains("▼▲3.0M"));
+        assert!(canvas_text(&canvas).contains("▼▲ 3.0M"));
     }
 
     #[test]
@@ -10597,9 +10769,9 @@ mod tests {
         let read = disk_io_label(3 * 1024 * 1024, 0, false).unwrap();
         let write = disk_io_label(0, 3 * 1024 * 1024, false).unwrap();
         let both = disk_io_label(1024 * 1024, 2 * 1024 * 1024, false).unwrap();
-        assert_eq!(read, " ▲3.0M");
-        assert_eq!(write, " ▼3.0M");
-        assert_eq!(both, "▼▲3.0M");
+        assert_eq!(read, " ▲ 3.0M");
+        assert_eq!(write, " ▼ 3.0M");
+        assert_eq!(both, "▼▲ 3.0M");
         assert_eq!(units::display_width(&read), units::display_width(&both));
         assert_eq!(units::display_width(&write), units::display_width(&both));
     }
@@ -10800,17 +10972,68 @@ mod tests {
         let preboot = rows.iter().position(|row| row.contains("Preboot")).unwrap();
         assert!(root < swap && swap < vm && vm < preboot);
         assert!(rows[root].contains("1.0G"));
-        assert!(rows[root + 1].contains("3.0M"));
+        assert!(rows[root].contains("▼▲ 3.0M"));
+        assert!(rows[root + 1].contains("IO"));
+        assert!(!rows[root + 1].contains("3.0M"));
 
         let divider = 24;
-        assert_eq!(canvas.cells[(root + 2) * 50 + divider + 1].ch, 'U');
-        assert_eq!(canvas.cells[(root + 3) * 50 + divider + 1].ch, 'F');
+        assert_eq!(canvas.cells[root * 50 + divider + 2].ch, 'r');
+        assert_eq!(canvas.cells[(root + 1) * 50 + divider + 2].ch, 'I');
+        assert_eq!(canvas.cells[(root + 2) * 50 + divider + 3].ch, ' ');
+        assert_eq!(canvas.cells[(root + 3) * 50 + divider + 3].ch, ' ');
+        assert_eq!(canvas.cells[(root + 2) * 50 + divider + 2].ch, 'U');
+        assert_eq!(canvas.cells[(root + 3) * 50 + divider + 2].ch, 'F');
         assert!(
-            canvas.cells[(root + 2) * 50 + divider + 3..(root + 2) * 50 + divider + 20]
+            canvas.cells[(root + 2) * 50 + divider + 4..(root + 2) * 50 + divider + 20]
                 .iter()
                 .all(|cell| cell.ch == '■')
         );
         assert!(rows[swap].contains("2.0G"));
+    }
+
+    #[test]
+    fn disk_rates_stay_in_headers_in_both_views_at_narrow_widths() {
+        let mut app = app();
+        app.sample.memory.disks.push(DiskSample {
+            mount: "/".into(),
+            total: 1024 * 1024 * 1024,
+            used: 256 * 1024 * 1024,
+            io_supported: true,
+            ..DiskSample::default()
+        });
+        app.disk_histories
+            .insert("/".into(), DiskHistory::default());
+        for width in [44, 46, 48, 50, 52, 60, 80] {
+            for io_mode in [false, true] {
+                app.config
+                    .set_value("io_mode", if io_mode { "true" } else { "false" });
+                for (read, write, rate) in [
+                    (341 * 1024, 0, "▲ 341K"),
+                    (0, 77 * 1024, "▼ 77K"),
+                    (35 * 1024, 77 * 1024, "▼▲ 112K"),
+                    (0, 0, ""),
+                ] {
+                    app.sample.memory.disks[0].read_per_second = read;
+                    app.sample.memory.disks[0].write_per_second = write;
+                    let mut canvas = Canvas::new(width, 20);
+                    draw_memory(&mut canvas, Rect::new(0, 0, width, 20), &mut app);
+                    let output = canvas_text(&canvas);
+                    let header_y = (0..20)
+                        .find(|&y| canvas_row(&canvas, y).contains("root"))
+                        .unwrap();
+                    let header = canvas_row(&canvas, header_y);
+                    assert!(
+                        header.contains(rate),
+                        "width {width}, IO mode {io_mode}: {header}"
+                    );
+                    assert!(canvas_row(&canvas, header_y + 1).contains("IO"));
+                    for y in header_y + 1..20 {
+                        let row = canvas_row(&canvas, y);
+                        assert!(!row.contains('▲') && !row.contains('▼'), "{output}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

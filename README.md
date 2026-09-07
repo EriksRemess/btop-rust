@@ -10,6 +10,15 @@ collector supports both Apple silicon and the Intel Macs supported by macOS 26.
 Apple GPU and thermal metrics are optional Apple-silicon features; metrics that
 the running OS does not expose are hidden.
 
+Linux GPU naming does not require sudo or membership in a graphics-device
+group. Driver-provided names are preferred when accessible; AMD devices fall
+back to the installed `pci.ids` hardware database when driver queries are
+unavailable. Readable sysfs telemetry remains usable without DRM device access.
+When Vulkan is accessible, `--diagnostics` also reports driver details, GPU type,
+API version, and memory heap sizes and access properties. The AMD sysfs GPU
+panel shows a compact driver/API footer. Vulkan heap sizes describe memory
+layout; live usage continues to come from the system collectors.
+
 On Apple silicon, the collectors dynamically resolve IOReport and thermal
 interfaces and read power-manager and AGX registry snapshots. CPU frequency is
 derived from per-core performance-state residency and the SoC's frequency

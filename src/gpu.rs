@@ -12,6 +12,9 @@ use crate::logger;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) mod macos;
 
+#[cfg(target_os = "linux")]
+mod vulkan;
+
 #[derive(Debug, Clone, Default)]
 pub struct GpuSupport {
     pub utilization: bool,
@@ -38,6 +41,7 @@ pub struct GpuSupport {
 #[derive(Debug, Clone)]
 pub struct GpuSample {
     pub name: String,
+    pub driver_label: Option<String>,
     pub utilization: u32,
     pub memory_utilization: u32,
     pub gpu_clock_mhz: u32,
@@ -68,6 +72,7 @@ impl Default for GpuSample {
     fn default() -> Self {
         Self {
             name: String::new(),
+            driver_label: None,
             utilization: 0,
             memory_utilization: 0,
             gpu_clock_mhz: 0,
@@ -880,6 +885,7 @@ const RSMI_CLOCK_MEMORY: c_int = 4;
 
 struct AmdSysfsDevice {
     name: String,
+    driver_label: Option<String>,
     device: PathBuf,
     hwmon: Option<PathBuf>,
     power: Option<PathBuf>,
@@ -904,6 +910,7 @@ impl AmdSysfsDevice {
         self.power_max_mw = self.power_max_mw.max(power_mw);
         GpuSample {
             name: self.name.clone(),
+            driver_label: self.driver_label.clone(),
             utilization: busy.unwrap_or(0).clamp(0, 100) as u32,
             gpu_clock_mhz: clock.unwrap_or(0).max(0) as u32 / 1_000_000,
             power_mw,
@@ -925,8 +932,234 @@ impl AmdSysfsDevice {
     }
 }
 
+fn amd_sysfs_name(device: &Path, id: &str) -> String {
+    read_trimmed(device.join("product_name"))
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| format!("AMD GPU (1002:{id})"))
+}
+
+#[cfg(target_os = "linux")]
+fn amd_drm_name(device: &Path) -> Result<String, String> {
+    use std::os::fd::AsRawFd;
+    type Initialize = unsafe extern "C" fn(c_int, *mut u32, *mut u32, *mut *mut c_void) -> c_int;
+    type Deinitialize = unsafe extern "C" fn(*mut c_void) -> c_int;
+    type MarketingName = unsafe extern "C" fn(*mut c_void) -> *const c_char;
+    struct Handle {
+        raw: *mut c_void,
+        deinitialize: Deinitialize,
+    }
+    impl Drop for Handle {
+        fn drop(&mut self) {
+            unsafe { (self.deinitialize)(self.raw) };
+        }
+    }
+    let library = DynamicLibrary::open(&["libdrm_amdgpu.so.1", "libdrm_amdgpu.so"])
+        .ok_or("libdrm_amdgpu is unavailable")?;
+    let initialize: Initialize = library
+        .symbol(b"amdgpu_device_initialize\0")
+        .ok_or("libdrm_amdgpu lacks device initialization")?;
+    let deinitialize: Deinitialize = library
+        .symbol(b"amdgpu_device_deinitialize\0")
+        .ok_or("libdrm_amdgpu lacks device cleanup")?;
+    let name: MarketingName = library
+        .symbol(b"amdgpu_get_marketing_name\0")
+        .ok_or("libdrm_amdgpu lacks the marketing-name query")?;
+    let entries = fs::read_dir(device.join("drm"))
+        .map_err(|error| format!("DRM nodes unavailable: {error}"))?;
+    let mut nodes: Vec<_> = entries
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        // Render nodes permit queries without DRM master privileges. If the
+        // session cannot open one, use unprivileged system metadata instead.
+        .filter(|name| {
+            name.strip_prefix("renderD").is_some_and(|suffix| {
+                !suffix.is_empty() && suffix.bytes().all(|ch| ch.is_ascii_digit())
+            })
+        })
+        .collect();
+    nodes.sort_by_key(|name| (!name.starts_with("renderD"), name.clone()));
+    let mut failure = "No DRM node is associated with this GPU".to_string();
+    for node in nodes {
+        let path = Path::new("/dev/dri").join(node);
+        let file = match fs::OpenOptions::new().read(true).write(true).open(&path) {
+            Ok(file) => file,
+            Err(error) => {
+                failure = format!("{}: {error}", path.display());
+                continue;
+            }
+        };
+        let mut major = 0;
+        let mut minor = 0;
+        let mut raw = ptr::null_mut();
+        let status = unsafe { initialize(file.as_raw_fd(), &mut major, &mut minor, &mut raw) };
+        if status != 0 || raw.is_null() {
+            failure = format!(
+                "amdgpu_device_initialize on {} failed ({status})",
+                path.display()
+            );
+            continue;
+        }
+        let handle = Handle { raw, deinitialize };
+        let value = unsafe { name(handle.raw) };
+        if !value.is_null() {
+            let value = unsafe { CStr::from_ptr(value) }
+                .to_string_lossy()
+                .trim()
+                .to_string();
+            if !value.is_empty() {
+                return Ok(value);
+            }
+        }
+        return Err("libdrm_amdgpu did not report a marketing name for this device".into());
+    }
+    Err(failure)
+}
+
+fn pci_device_name(database: &str, vendor: u16, device: u16) -> Option<&str> {
+    let mut matching_vendor = false;
+    for line in database.lines() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if !line.starts_with('\t') {
+            matching_vendor = line
+                .split_whitespace()
+                .next()
+                .and_then(|id| u16::from_str_radix(id, 16).ok())
+                == Some(vendor);
+        } else if matching_vendor && !line.starts_with("\t\t") {
+            let Some((id, name)) = line.trim().split_once(char::is_whitespace) else {
+                continue;
+            };
+            if u16::from_str_radix(id, 16).ok() == Some(device) && !name.trim().is_empty() {
+                return Some(name.trim());
+            }
+        }
+    }
+    None
+}
+
+fn amd_database_display_name(description: &str) -> String {
+    let Some((codename, products)) = description
+        .split_once('[')
+        .and_then(|(codename, products)| {
+            products
+                .strip_suffix(']')
+                .map(|products| (codename.trim(), products.trim()))
+        })
+        .filter(|(_, products)| !products.is_empty())
+    else {
+        return format!("AMD {description}");
+    };
+    let alternatives: Vec<Vec<_>> = products
+        .split('/')
+        .map(|name| name.split_whitespace().collect())
+        .collect();
+    if alternatives.len() > 1 {
+        let common = alternatives[0]
+            .iter()
+            .enumerate()
+            .take_while(|(index, word)| {
+                alternatives[1..]
+                    .iter()
+                    .all(|other| other.get(*index) == Some(*word))
+            })
+            .count();
+        // Collapse descriptive variants only. Keep model-number alternatives
+        // intact rather than implying a specific product from a shared PCI ID.
+        if common >= 2
+            && alternatives.iter().all(|words| {
+                words[common..]
+                    .iter()
+                    .all(|word| !word.chars().any(|ch| ch.is_ascii_digit()))
+            })
+        {
+            let family = alternatives[0][..common].join(" ");
+            return if codename.is_empty() {
+                format!("AMD {family}")
+            } else {
+                format!("AMD {family} ({codename})")
+            };
+        }
+    }
+    format!("AMD {products}")
+}
+
+fn apply_amd_database_names(devices: &mut [AmdSysfsDevice], database: &str) {
+    for device in devices {
+        if !device.name.starts_with("AMD GPU (1002:") {
+            continue;
+        }
+        let id = read_trimmed(device.device.join("device"))
+            .and_then(|id| u16::from_str_radix(id.trim_start_matches("0x"), 16).ok());
+        if let Some(description) = id.and_then(|id| pci_device_name(database, 0x1002, id)) {
+            device.name = amd_database_display_name(description);
+        }
+    }
+}
+
+fn system_pci_databases() -> impl Iterator<Item = String> {
+    [
+        "/usr/share/hwdata/pci.ids",
+        "/usr/share/misc/pci.ids",
+        "/usr/share/pci.ids",
+        "/usr/local/share/pciids/pci.ids",
+    ]
+    .into_iter()
+    .filter_map(|path| fs::read_to_string(path).ok())
+}
+
 fn discover_amd_sysfs() -> Vec<AmdSysfsDevice> {
-    discover_amd_sysfs_at(Path::new("/sys/class/drm"))
+    let mut devices = discover_amd_sysfs_at(Path::new("/sys/class/drm"));
+    #[cfg(target_os = "linux")]
+    for device in &mut devices {
+        if device.name.starts_with("AMD GPU (1002:") {
+            match amd_drm_name(&device.device) {
+                Ok(name) => device.name = name,
+                Err(error) => logger::debug(&format!("AMD name query: {error}")),
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    if !devices.is_empty()
+        && let Ok(names) = vulkan::devices()
+            .inspect_err(|error| logger::debug(&format!("GPU name query: {error}")))
+    {
+        for device in &mut devices {
+            let id = read_trimmed(device.device.join("device"))
+                .and_then(|id| u32::from_str_radix(id.trim_start_matches("0x"), 16).ok());
+            let pci = fs::canonicalize(&device.device).ok();
+            if let (Some(id), Some(address)) = (
+                id,
+                pci.as_ref()
+                    .and_then(|path| path.file_name())
+                    .and_then(|name| name.to_str()),
+            ) && let Some(info) = vulkan::info_for_device(&names, 0x1002, id, address)
+            {
+                if device.name.starts_with("AMD GPU (1002:") {
+                    device.name.clone_from(&info.name);
+                }
+                device.driver_label = Some(if let Some(driver) = &info.driver_name {
+                    format!(
+                        "{driver} | Vulkan {}",
+                        vulkan::api_version(info.api_version)
+                    )
+                } else {
+                    format!("Vulkan {}", vulkan::api_version(info.api_version))
+                });
+            }
+        }
+    }
+    for database in system_pci_databases() {
+        if !devices
+            .iter()
+            .any(|device| device.name.starts_with("AMD GPU (1002:"))
+        {
+            break;
+        }
+        apply_amd_database_names(&mut devices, &database);
+    }
+    devices
 }
 
 fn discover_amd_sysfs_at(root: &Path) -> Vec<AmdSysfsDevice> {
@@ -971,7 +1204,8 @@ fn discover_amd_sysfs_at(root: &Path) -> Vec<AmdSysfsDevice> {
             });
         if has_signal {
             devices.push(AmdSysfsDevice {
-                name: format!("AMD GPU (1002:{id})"),
+                name: amd_sysfs_name(&device, id),
+                driver_label: None,
                 device,
                 hwmon,
                 power,
@@ -1182,6 +1416,70 @@ fn discover_intel_device(root: &Path) -> Option<(String, PathBuf)> {
 }
 
 pub fn diagnostics() -> String {
+    let mut output = intel_diagnostics();
+    #[cfg(target_os = "linux")]
+    {
+        let names = vulkan::devices();
+        match &names {
+            Ok(devices) => output.push_str(&vulkan::diagnostics(devices)),
+            Err(error) => output.push_str(&format!(
+                "\nVulkan device information\n  unavailable: {error}\n"
+            )),
+        }
+        let devices = discover_amd_sysfs_at(Path::new("/sys/class/drm"));
+        if !devices.is_empty() {
+            output.push_str("\nAMD GPU naming\n");
+            if let Err(error) = &names {
+                output.push_str(&format!("  Vulkan: {error}\n"));
+            }
+            for device in devices {
+                output.push_str(&format!("  device: {}\n", device.device.display()));
+                output.push_str(&format!(
+                    "  sysfs product_name: {}\n",
+                    read_trimmed(device.device.join("product_name"))
+                        .filter(|name| !name.is_empty())
+                        .unwrap_or_else(|| "unavailable".into())
+                ));
+                output.push_str(&format!(
+                    "  libdrm_amdgpu: {}\n",
+                    amd_drm_name(&device.device).unwrap_or_else(|error| error)
+                ));
+                let id = read_trimmed(device.device.join("device"))
+                    .and_then(|id| u16::from_str_radix(id.trim_start_matches("0x"), 16).ok());
+                let metadata = id.and_then(|id| {
+                    system_pci_databases().find_map(|database| {
+                        pci_device_name(&database, 0x1002, id).map(amd_database_display_name)
+                    })
+                });
+                output.push_str(&format!(
+                    "  system hardware metadata: {}\n",
+                    metadata.as_deref().unwrap_or("unavailable")
+                ));
+                if let Ok(names) = &names {
+                    let id = read_trimmed(device.device.join("device"))
+                        .and_then(|id| u32::from_str_radix(id.trim_start_matches("0x"), 16).ok());
+                    let pci = fs::canonicalize(&device.device).ok();
+                    let name = id.and_then(|id| {
+                        pci.as_ref()
+                            .and_then(|path| path.file_name())
+                            .and_then(|name| name.to_str())
+                            .and_then(|address| vulkan::name_for_device(names, 0x1002, id, address))
+                    });
+                    output.push_str(&format!(
+                        "  Vulkan name: {}\n",
+                        name.unwrap_or("no matching physical GPU")
+                    ));
+                    if name.is_none() {
+                        output.push_str(&format!("  Vulkan devices: {names:?}\n"));
+                    }
+                }
+            }
+        }
+    }
+    output
+}
+
+fn intel_diagnostics() -> String {
     #[cfg(target_os = "linux")]
     {
         let Some(mut intel) = IntelGpu::load() else {
@@ -1450,6 +1748,59 @@ mod tests {
     }
 
     #[test]
+    fn pci_names_are_vendor_scoped_and_shortened_without_model_rules() {
+        let database = "1002  AMD\n\t1638  Cezanne [Radeon Vega Series / Radeon Vega Mobile Series]\n\t\t1002 1638  Subsystem\n8086  Intel\n\t1638  Wrong GPU\n";
+        let name = pci_device_name(database, 0x1002, 0x1638).unwrap();
+        assert_eq!(amd_database_display_name(name), "AMD Radeon Vega (Cezanne)");
+        assert_eq!(pci_device_name(database, 0x1002, 0xffff), None);
+        assert_eq!(pci_device_name(database, 0x1234, 0x1638), None);
+        assert_eq!(
+            amd_database_display_name("Chip [Example Family Desktop / Example Family Mobile]"),
+            "AMD Example Family (Chip)"
+        );
+        assert_eq!(
+            amd_database_display_name("Chip [Example Model 100 / Example Model 200]"),
+            "AMD Example Model 100 / Example Model 200"
+        );
+    }
+
+    #[test]
+    fn amd_metadata_names_work_without_drm_access_and_preserve_driver_names() {
+        let root =
+            std::env::temp_dir().join(format!("btop-rust-amd-metadata-{}", std::process::id()));
+        let device = root.join("card0/device");
+        fs::create_dir_all(&device).unwrap();
+        fs::write(device.join("vendor"), "0x1002\n").unwrap();
+        fs::write(device.join("device"), "0x1638\n").unwrap();
+        fs::write(device.join("gpu_busy_percent"), "12\n").unwrap();
+        symlink("/sys/bus/pci/drivers/amdgpu", device.join("driver")).unwrap();
+        let mut devices = discover_amd_sysfs_at(&root);
+        assert_eq!(devices.len(), 1);
+        let database =
+            "1002  AMD\n\t1638  Cezanne [Radeon Vega Series / Radeon Vega Mobile Series]\n";
+        apply_amd_database_names(&mut devices, database);
+        assert_eq!(devices[0].name, "AMD Radeon Vega (Cezanne)");
+        assert_eq!(devices[0].collect().utilization, 12);
+        devices[0].name = "Driver Supplied Name".into();
+        apply_amd_database_names(&mut devices, database);
+        assert_eq!(devices[0].name, "Driver Supplied Name");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn amd_sysfs_names_preserve_driver_text_and_fall_back_to_ids() {
+        let root =
+            std::env::temp_dir().join(format!("btop-rust-amdgpu-name-test-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        assert_eq!(amd_sysfs_name(&root, "1638"), "AMD GPU (1002:1638)");
+        fs::write(root.join("product_name"), "  \n").unwrap();
+        assert_eq!(amd_sysfs_name(&root, "1638"), "AMD GPU (1002:1638)");
+        fs::write(root.join("product_name"), "Driver Supplied GPU Name\n").unwrap();
+        assert_eq!(amd_sysfs_name(&root, "1638"), "Driver Supplied GPU Name");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn discovers_and_collects_amdgpu_sysfs_fallback() {
         let root =
             std::env::temp_dir().join(format!("btop-rust-amdgpu-test-{}", std::process::id()));
@@ -1458,6 +1809,7 @@ mod tests {
         fs::create_dir_all(&hwmon).unwrap();
         fs::write(device.join("vendor"), "0x1002\n").unwrap();
         fs::write(device.join("device"), "0x150e\n").unwrap();
+        fs::write(device.join("product_name"), "AMD Radeon Test Graphics\n").unwrap();
         symlink("/sys/bus/pci/drivers/amdgpu", device.join("driver")).unwrap();
         fs::write(device.join("gpu_busy_percent"), "42\n").unwrap();
         fs::write(device.join("mem_info_vram_total"), "1073741824\n").unwrap();
@@ -1469,7 +1821,7 @@ mod tests {
         let mut devices = discover_amd_sysfs_at(&root);
         assert_eq!(devices.len(), 1);
         let sample = devices[0].collect();
-        assert_eq!(sample.name, "AMD GPU (1002:150e)");
+        assert_eq!(sample.name, "AMD Radeon Test Graphics");
         assert_eq!(sample.utilization, 42);
         assert_eq!(sample.temperature_c, 51);
         assert_eq!(sample.gpu_clock_mhz, 1800);
