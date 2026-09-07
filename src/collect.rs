@@ -1213,6 +1213,13 @@ fn clean_cpu_name(raw: &str) -> String {
             .iter()
             .take_while(|part| **part != "@")
             .copied()
+            .filter(|part| {
+                !part.split_once('-').is_some_and(|(count, suffix)| {
+                    !count.is_empty()
+                        && count.bytes().all(|byte| byte.is_ascii_digit())
+                        && matches!(suffix, "Core" | "Cores")
+                })
+            })
             .collect::<Vec<_>>()
             .join(" ");
         for remove in [
@@ -2381,7 +2388,7 @@ mod tests {
     }
 
     #[test]
-    fn cpu_name_trimming_matches_upstream_fixtures() {
+    fn cpu_name_trimming_preserves_model_names() {
         for (input, expected) in [
             (
                 "AMD Ryzen AI 7 PRO 360 w/ Radeon 880M",
@@ -2396,7 +2403,10 @@ mod tests {
                 "Ryzen Threadripper PRO 3975WX",
             ),
             ("AMD Ryzen 7 5700X 8-Core Processor", "Ryzen 7 5700X"),
-            ("AMD EPYC 7543 32-Core Processor", "EPYC 7543 32-"),
+            ("AMD EPYC 7543 32-Core Processor", "EPYC 7543"),
+            ("AMD EPYC 7713 64-Core Processor", "EPYC 7713"),
+            ("AMD EPYC 7713P 64-Cores Processor", "EPYC 7713P"),
+            ("AMD EPYC 7713", "EPYC 7713"),
             ("Intel(R) Pentium(R) III CPU family 1400MHz", "family"),
             ("Intel(R) Pentium(R) CPU P6200 @ 2.13GHz", "P6200"),
             ("Intel(R) Core(TM) i7 CPU Q 840 @ 1.87GHz", "Q"),
