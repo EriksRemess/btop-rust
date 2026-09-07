@@ -33,6 +33,22 @@ const AF_INET6: u8 = 30;
 const IFF_RUNNING: c_uint = 0x40;
 const MNT_NOWAIT: c_int = 2;
 const SC_CLK_TCK_DARWIN: c_int = 3;
+const ENOMEM: c_int = 12;
+
+// mach_host_self() acquires a send-right reference on every call.
+struct HostPort(c_uint);
+
+impl HostPort {
+    fn new() -> Self {
+        Self(unsafe { mach_host_self() })
+    }
+}
+
+impl Drop for HostPort {
+    fn drop(&mut self) {
+        unsafe { mach_port_deallocate(mach_task_self_, self.0) };
+    }
+}
 
 pub(super) fn read_cpu_name() -> String {
     sysctl_string("machdep.cpu.brand_string")
@@ -143,12 +159,13 @@ fn extend_u32_counter(current: u32, previous: u64) -> u64 {
 }
 
 fn processor_ticks(previous: &[CpuTicks]) -> Result<Vec<CpuTicks>, String> {
+    let host = HostPort::new();
     let mut cpu_count = 0_u32;
     let mut info = ptr::null_mut::<c_int>();
     let mut info_count = 0_u32;
     let result = unsafe {
         host_processor_info(
-            mach_host_self(),
+            host.0,
             PROCESSOR_CPU_LOAD_INFO,
             &mut cpu_count,
             &mut info,
@@ -208,6 +225,8 @@ fn percent(value: u64, total: u64) -> f64 {
 }
 
 fn read_frequency(collector: &mut Collector, mode: &str) -> Option<(String, Vec<u32>)> {
+    #[cfg(not(target_arch = "aarch64"))]
+    let _ = (collector, mode);
     #[cfg(target_arch = "aarch64")]
     if collector.apple_cpu_frequency.is_none() {
         collector.apple_cpu_frequency = crate::gpu::macos::AppleCpuFrequencyCollector::new();
@@ -256,10 +275,11 @@ pub(super) fn collect_memory(
     let total = sysctl_value::<u64>("hw.memsize").unwrap_or(0);
     let page_size = sysctl_value::<u64>("hw.pagesize").unwrap_or(4096);
     let mut stats = VmStatistics64::default();
+    let host = HostPort::new();
     let mut count = (mem::size_of::<VmStatistics64>() / mem::size_of::<c_int>()) as u32;
     let result = unsafe {
         host_statistics64(
-            mach_host_self(),
+            host.0,
             HOST_VM_INFO64,
             (&mut stats as *mut VmStatistics64).cast(),
             &mut count,
@@ -289,6 +309,7 @@ pub(super) fn collect_memory(
         disks: if config.show_disks {
             collect_disks(config, previous_disks, elapsed)
         } else {
+            previous_disks.clear();
             Vec::new()
         },
     })
@@ -309,6 +330,7 @@ fn collect_disks(
     let mut mounts = ptr::null_mut::<StatFs>();
     let count = unsafe { getmntinfo(&mut mounts, MNT_NOWAIT) };
     if count <= 0 || mounts.is_null() {
+        previous.clear();
         return Vec::new();
     }
     let free_priv = config.bool_value("disk_free_priv").unwrap_or(false);
@@ -364,7 +386,11 @@ fn collect_disk_io(
     previous: &mut HashMap<String, super::DiskCounters>,
     elapsed: f64,
 ) {
+    // Only retain baselines sampled this interval. A telemetry gap must not
+    // turn several intervals of I/O into a single refresh's rate.
+    let mut next = HashMap::new();
     let Ok(class) = CString::new("IOMediaBSDClient") else {
+        previous.clear();
         return;
     };
     let matching = unsafe { IOServiceMatching(class.as_ptr()) };
@@ -372,6 +398,7 @@ fn collect_disk_io(
     if matching.is_null()
         || unsafe { IOServiceGetMatchingServices(0, matching, &mut iterator) } != KERN_SUCCESS
     {
+        previous.clear();
         return;
     }
     loop {
@@ -399,7 +426,8 @@ fn collect_disk_io(
                     activity: total_time.unwrap_or_default(),
                     activity_valid: total_time.is_some(),
                 };
-                let old = previous.insert(mount.clone(), current);
+                let old = previous.get(mount).copied();
+                next.insert(mount.clone(), current);
                 disk.io_supported = true;
                 if let Some(old) = old {
                     let (read_per_second, write_per_second, activity) =
@@ -416,7 +444,7 @@ fn collect_disk_io(
         unsafe { IOObjectRelease(drive) };
     }
     unsafe { IOObjectRelease(iterator) };
-    previous.retain(|mount, _| disks.iter().any(|disk| &disk.mount == mount));
+    *previous = next;
 }
 
 fn io_registry_property(entry: u32, key: &str) -> Option<*const c_void> {
@@ -669,41 +697,24 @@ pub(super) fn collect_network(
 
 fn interface_counters64() -> Result<HashMap<String, (u64, u64)>, String> {
     let mut mib = [CTL_NET, PF_ROUTE, 0, 0, NET_RT_IFLIST2, 0];
-    let mut size = 0_usize;
-    if unsafe {
-        sysctl(
-            mib.as_mut_ptr(),
-            mib.len() as c_uint,
-            ptr::null_mut(),
-            &mut size,
-            ptr::null_mut(),
-            0,
-        )
-    } != 0
-    {
-        return Err(format!(
-            "NET_RT_IFLIST2 size query failed: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    let mut buffer = vec![0_u8; size];
-    if unsafe {
-        sysctl(
-            mib.as_mut_ptr(),
-            mib.len() as c_uint,
-            buffer.as_mut_ptr().cast(),
-            &mut size,
-            ptr::null_mut(),
-            0,
-        )
-    } != 0
-    {
-        return Err(format!(
-            "NET_RT_IFLIST2 query failed: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    buffer.truncate(size);
+    let buffer = read_variable_sysctl(|buffer, size| {
+        if unsafe {
+            sysctl(
+                mib.as_mut_ptr(),
+                mib.len() as c_uint,
+                buffer,
+                size,
+                ptr::null_mut(),
+                0,
+            )
+        } == 0
+        {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    })
+    .map_err(|error| format!("NET_RT_IFLIST2 query failed: {error}"))?;
 
     let mut counters = HashMap::new();
     let mut offset = 0_usize;
@@ -732,6 +743,31 @@ fn interface_counters64() -> Result<HashMap<String, (u64, u64)>, String> {
         offset += message_length;
     }
     Ok(counters)
+}
+
+fn read_variable_sysctl(
+    mut query: impl FnMut(*mut c_void, &mut usize) -> std::io::Result<()>,
+) -> std::io::Result<Vec<u8>> {
+    // Interfaces and addresses can appear between the sizing and fill calls.
+    // Retry ENOMEM with a new size query, never parse a partial routing table.
+    for _ in 0..5 {
+        let mut size = 0;
+        query(ptr::null_mut(), &mut size)?;
+        if size == 0 {
+            return Ok(Vec::new());
+        }
+        let mut buffer = vec![0_u8; size];
+        match query(buffer.as_mut_ptr().cast(), &mut size) {
+            Ok(()) if size <= buffer.len() => {
+                buffer.truncate(size);
+                return Ok(buffer);
+            }
+            Ok(()) => continue,
+            Err(error) if error.raw_os_error() == Some(ENOMEM) => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::from_raw_os_error(ENOMEM))
 }
 
 fn primary_network_interface() -> Option<String> {
@@ -1013,9 +1049,11 @@ fn process_arguments(pid: c_int, buffer: &mut [u8]) -> Option<String> {
 }
 
 fn process_io(pid: c_int) -> (u64, u64) {
-    let mut usage = [0_u64; 64];
-    if unsafe { proc_pid_rusage(pid, 6, usage.as_mut_ptr().cast()) } == 0 {
-        (usage[18], usage[19])
+    // Disk counters have been available since V2. Requesting V6 needlessly
+    // disables them on older macOS releases that reject that flavor.
+    let mut usage = RusageInfoV2::default();
+    if unsafe { proc_pid_rusage(pid, 2, (&mut usage as *mut RusageInfoV2).cast()) } == 0 {
+        (usage.diskio_bytesread, usage.diskio_byteswritten)
     } else {
         (0, 0)
     }
@@ -1485,6 +1523,30 @@ struct MachTimebaseInfo {
     denom: u32,
 }
 
+#[repr(C)]
+#[derive(Default)]
+struct RusageInfoV2 {
+    uuid: [u8; 16],
+    user_time: u64,
+    system_time: u64,
+    package_idle_wakeups: u64,
+    interrupt_wakeups: u64,
+    pageins: u64,
+    wired_size: u64,
+    resident_size: u64,
+    physical_footprint: u64,
+    process_start: u64,
+    process_exit: u64,
+    child_user_time: u64,
+    child_system_time: u64,
+    child_package_idle_wakeups: u64,
+    child_interrupt_wakeups: u64,
+    child_pageins: u64,
+    child_elapsed: u64,
+    diskio_bytesread: u64,
+    diskio_byteswritten: u64,
+}
+
 // pw_name is the first member on Darwin; no later fields are accessed.
 #[repr(C)]
 struct Passwd {
@@ -1497,6 +1559,7 @@ struct Passwd {
 unsafe extern "C" {
     static mach_task_self_: c_uint;
     fn mach_host_self() -> c_uint;
+    fn mach_port_deallocate(task: c_uint, name: c_uint) -> c_int;
     fn host_processor_info(
         host: c_uint,
         flavor: c_int,
@@ -1529,6 +1592,9 @@ unsafe extern "C" {
         new: *mut c_void,
         new_size: usize,
     ) -> c_int;
+    // Intel retains the legacy statfs ABI under the unsuffixed symbol.
+    // Apple silicon only exposes the modern layout used by StatFs above.
+    #[cfg_attr(target_arch = "x86_64", link_name = "getmntinfo$INODE64")]
     fn getmntinfo(mounts: *mut *mut StatFs, flags: c_int) -> c_int;
     fn getifaddrs(addresses: *mut *mut IfAddrs) -> c_int;
     fn freeifaddrs(addresses: *mut IfAddrs);
@@ -1611,6 +1677,113 @@ mod tests {
     use super::*;
 
     #[test]
+    fn routing_table_query_retries_growth_and_discards_partial_data() {
+        let mut calls = 0;
+        let result = read_variable_sysctl(|buffer, size| {
+            calls += 1;
+            match calls {
+                1 => {
+                    assert!(buffer.is_null());
+                    *size = 4;
+                }
+                2 => {
+                    assert_eq!(*size, 4);
+                    unsafe { ptr::write_bytes(buffer, 0xff, 4) };
+                    return Err(std::io::Error::from_raw_os_error(ENOMEM));
+                }
+                3 => {
+                    assert!(buffer.is_null());
+                    *size = 8;
+                }
+                4 => {
+                    assert_eq!(*size, 8);
+                    unsafe { ptr::copy_nonoverlapping(b"route!".as_ptr(), buffer.cast(), 6) };
+                    *size = 6;
+                }
+                _ => panic!("unexpected query"),
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(result, b"route!");
+        assert_eq!(calls, 4);
+    }
+
+    #[test]
+    fn routing_table_query_bounds_retries_and_preserves_other_errors() {
+        let mut calls = 0;
+        let error = read_variable_sysctl(|buffer, size| {
+            calls += 1;
+            if buffer.is_null() {
+                *size = 4;
+                Ok(())
+            } else {
+                Err(std::io::Error::from_raw_os_error(ENOMEM))
+            }
+        })
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(ENOMEM));
+        assert_eq!(calls, 10);
+
+        let error =
+            read_variable_sysctl(|_, _| Err(std::io::Error::from_raw_os_error(1))).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(1));
+        assert!(
+            read_variable_sysctl(|_, size| {
+                *size = 0;
+                Ok(())
+            })
+            .unwrap()
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn process_disk_usage_matches_the_darwin_v2_layout() {
+        assert_eq!(mem::size_of::<RusageInfoV2>(), 160);
+        assert_eq!(mem::offset_of!(RusageInfoV2, diskio_bytesread), 144);
+        assert_eq!(mem::offset_of!(RusageInfoV2, diskio_byteswritten), 152);
+    }
+
+    #[test]
+    #[ignore = "requires live Mach APIs; run with --test-threads=1 for port reference accounting"]
+    fn live_refresh_releases_host_ports_and_disabled_disk_baselines() {
+        unsafe extern "C" {
+            fn mach_port_get_refs(
+                task: c_uint,
+                port: c_uint,
+                right: c_int,
+                refs: *mut c_uint,
+            ) -> c_int;
+        }
+        let host = HostPort::new();
+        let refs = || {
+            let mut count = 0;
+            assert_eq!(
+                unsafe { mach_port_get_refs(mach_task_self_, host.0, 0, &mut count) },
+                KERN_SUCCESS
+            );
+            count
+        };
+        let before = refs();
+        let mut config = Config::default();
+        config.show_disks = false;
+        let mut disks = HashMap::from([("/".into(), super::super::DiskCounters::default())]);
+        let mut ticks = Vec::new();
+        for _ in 0..20 {
+            ticks = processor_ticks(&ticks).unwrap();
+            collect_memory(&config, &mut disks, 1.0).unwrap();
+        }
+        assert!(!ticks.is_empty());
+        assert!(disks.is_empty());
+        assert_eq!(
+            refs(),
+            before,
+            "CPU and memory refreshes must release host send rights"
+        );
+    }
+
+    #[test]
     fn unsigned_cpu_ticks_extend_across_the_u32_wrap() {
         assert_eq!(extend_u32_counter(0x8000_0000, 0), 0x8000_0000);
         assert_eq!(extend_u32_counter(0x20, 0xffff_fff0), 0x1_0000_0020);
@@ -1681,7 +1854,21 @@ mod tests {
         let mut collector = Collector::new(&config).unwrap();
         let first = collector.collect(&config, None).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
-        let sample = collector.collect(&config, None).unwrap();
+        let pid = std::process::id();
+        let mut usage = RusageInfoV2::default();
+        assert_eq!(
+            unsafe { proc_pid_rusage(pid as c_int, 2, (&mut usage as *mut RusageInfoV2).cast()) },
+            0
+        );
+        assert!(usage.resident_size > 0);
+        let sample = collector.collect(&config, Some(pid)).unwrap();
+        let process = sample
+            .processes
+            .iter()
+            .find(|process| process.pid == pid)
+            .unwrap();
+        assert!(process.read_bytes >= usage.diskio_bytesread);
+        assert!(process.write_bytes >= usage.diskio_byteswritten);
 
         assert!(!sample.cpu.name.is_empty());
         assert!(!sample.cpu.frequency.is_empty());

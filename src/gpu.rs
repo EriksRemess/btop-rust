@@ -1416,9 +1416,10 @@ fn discover_intel_device(root: &Path) -> Option<(String, PathBuf)> {
 }
 
 pub fn diagnostics() -> String {
-    let mut output = intel_diagnostics();
+    let output = intel_diagnostics();
     #[cfg(target_os = "linux")]
-    {
+    let output = {
+        let mut output = output;
         let names = vulkan::devices();
         match &names {
             Ok(devices) => output.push_str(&vulkan::diagnostics(devices)),
@@ -1475,7 +1476,8 @@ pub fn diagnostics() -> String {
                 }
             }
         }
-    }
+        output
+    };
     output
 }
 

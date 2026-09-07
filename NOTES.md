@@ -73,6 +73,21 @@ cargo clippy --all-targets -- -D warnings
 cargo build --release
 ```
 
+On an Apple-silicon Mac, run the live macOS checks separately from the NVIDIA
+hardware test. Run them serially because the host-port leak check measures
+process-wide Mach reference counts:
+
+```console
+cargo test macos:: -- --ignored --test-threads=1
+cargo clippy --all-targets --target x86_64-apple-darwin -- -D warnings
+cargo build --release --target x86_64-apple-darwin
+```
+
+The Intel checks require the `x86_64-apple-darwin` Rust target. Cross-compilation
+checks the build and native bindings; live Intel telemetry still needs Intel
+hardware. Apple live tests require the telemetry capabilities asserted by each
+test and are not portability checks for every SoC or macOS version.
+
 CLI and configuration changes should preserve deliberate backward compatibility
 or include a clear migration path. Installation should be checked with both the
 native platform and a staged `DESTDIR`.
