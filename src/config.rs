@@ -91,6 +91,7 @@ pub struct Config {
     pub warnings: Vec<String>,
     values: HashMap<String, String>,
     source_path: Option<PathBuf>,
+    import_path: Option<PathBuf>,
     read_only: bool,
 }
 
@@ -134,6 +135,7 @@ impl Default for Config {
             warnings: Vec::new(),
             values: parse_file(Self::default_file()),
             source_path: default_path(),
+            import_path: None,
             read_only: false,
         }
     }
@@ -145,15 +147,31 @@ impl Config {
         let Some(path) = path else {
             return Ok(Self::default());
         };
+        let import = explicit
+            .is_none()
+            .then(|| {
+                path.parent()
+                    .and_then(Path::parent)
+                    .map(|root| root.join("btop/btop.conf"))
+            })
+            .flatten();
+        Self::load_paths(path, import)
+    }
+
+    fn load_paths(path: PathBuf, import: Option<PathBuf>) -> Result<Self, String> {
         let text = match fs::read_to_string(&path) {
             Ok(text) => text,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let mut config = Self {
-                    source_path: Some(path.clone()),
-                    ..Self::default()
-                };
-                config.set_read_only_from(&path);
-                return Ok(config);
+                match import
+                    .as_ref()
+                    .map(|legacy| (legacy, fs::read_to_string(legacy)))
+                {
+                    Some((_, Ok(text))) => text,
+                    Some((legacy, Err(error))) if error.kind() != std::io::ErrorKind::NotFound => {
+                        return Err(format!("could not read {}: {error}", legacy.display()));
+                    }
+                    _ => String::new(),
+                }
             }
             Err(error) => return Err(format!("could not read {}: {error}", path.display())),
         };
@@ -171,6 +189,7 @@ impl Config {
             }
         }
         config.source_path = Some(path.clone());
+        config.import_path = import;
         config.set_read_only_from(&path);
         let values = config.values.clone();
         config.update_ms = integer(&values, "update_ms")
@@ -425,8 +444,11 @@ impl Config {
     }
 
     pub fn reload(&mut self) -> Result<(), String> {
-        let path = self.source_path.clone();
-        *self = Self::load(path.as_deref())?;
+        *self = if let Some(path) = self.source_path.clone() {
+            Self::load_paths(path, self.import_path.clone())?
+        } else {
+            Self::load(None)?
+        };
         Ok(())
     }
 
@@ -567,9 +589,9 @@ fn write_config_atomically(path: &Path, output: &[u8]) -> Result<(), String> {
 
 fn default_path() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("XDG_CONFIG_HOME") {
-        Some(PathBuf::from(path).join("btop/btop.conf"))
+        Some(PathBuf::from(path).join("btoprs/btoprs.conf"))
     } else {
-        std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/btop/btop.conf"))
+        std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/btoprs/btoprs.conf"))
     }
 }
 
@@ -761,6 +783,27 @@ fn valid_preset(preset: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn imports_legacy_settings_without_writing_back_to_btop() {
+        let directory = std::env::temp_dir().join(format!("btoprs-import-{}", std::process::id()));
+        fs::create_dir_all(directory.join("btop")).unwrap();
+        let legacy = directory.join("btop/btop.conf");
+        let destination = directory.join("btoprs/btoprs.conf");
+        let original = "# btop settings\nupdate_ms = 1700\nfuture_option = true\n";
+        fs::write(&legacy, original).unwrap();
+        let mut config = Config::load_paths(destination.clone(), Some(legacy.clone())).unwrap();
+        assert_eq!(config.update_ms, 1700);
+        config.reload().unwrap();
+        assert_eq!(config.update_ms, 1700);
+        config.update_ms = 3100;
+        config.save().unwrap();
+        assert_eq!(fs::read_to_string(&legacy).unwrap(), original);
+        config.reload().unwrap();
+        assert_eq!(config.update_ms, 3100);
+        assert_eq!(Config::load(Some(&destination)).unwrap().update_ms, 3100);
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn saves_ignore_existing_temporary_symlinks_and_preserve_permissions() {

@@ -45,6 +45,12 @@ The terminal UI exits cleanly with `q` or `Ctrl-C`; `Esc` opens the main menu. R
 See the [project notes](NOTES.md) for platform decisions, known limitations,
 and verification guidance.
 
+Settings are saved to `$XDG_CONFIG_HOME/btoprs/btoprs.conf` (normally
+`~/.config/btoprs/btoprs.conf`). If that file is absent, existing settings from
+`$XDG_CONFIG_HOME/btop/btop.conf` are imported; subsequent saves go to the
+btoprs file. The original btop configuration is left intact. `--config <file>`
+loads and saves the explicitly selected file instead.
+
 `btoprs` supports btop-compatible `.theme` files. All bundled themes are embedded
 in the executable, including Cargo installations. On startup, missing themes
 are installed into `$XDG_CONFIG_HOME/btoprs/themes` (normally

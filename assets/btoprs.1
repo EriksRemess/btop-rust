@@ -54,6 +54,12 @@ Show summary of options.
 .TP 3
 \fB-V\fR, \fB--version\fR
 Show version information.
+.SH FILES
+.TP
+\fI~/.config/btoprs/btoprs.conf\fR
+Default configuration file, under XDG_CONFIG_HOME when set. If absent, settings
+are imported from the corresponding btop/btop.conf file without modifying it.
+The --config option selects another file for both loading and saving.
 .SH SEE ALSO
 .LP
 \fBbtop\fR(1), \fBtop\fR(1), \fBhtop\fR(1)

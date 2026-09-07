@@ -478,7 +478,14 @@ fn take_key_inner(bytes: &mut Vec<u8>, sequence_timed_out: bool) -> Option<Key> 
             if width == 0 {
                 (Key::Unknown, 1)
             } else if bytes.len() < width {
-                return None;
+                // Preserve valid partial characters, but do not hold a later
+                // ASCII key behind invalid UTF-8 or an expired prefix.
+                if !sequence_timed_out
+                    && std::str::from_utf8(bytes).is_err_and(|error| error.error_len().is_none())
+                {
+                    return None;
+                }
+                (Key::Unknown, 1)
             } else if let Ok(text) = std::str::from_utf8(&bytes[..width]) {
                 (Key::Char(text.chars().next()?), width)
             } else {
@@ -560,6 +567,25 @@ fn utf8_sequence_width(first: u8) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incomplete_utf8_expires_and_does_not_hold_ascii_keys() {
+        let mut partial = vec![0xf0, 0x9f];
+        assert_eq!(take_key(&mut partial), None);
+        assert_eq!(
+            take_key_after_sequence_timeout(&mut partial),
+            Some(Key::Unknown)
+        );
+        assert_eq!(take_key(&mut partial), Some(Key::Unknown));
+        assert!(partial.is_empty());
+
+        for (suffix, expected) in [(b'q', Key::Char('q')), (3, Key::CtrlC)] {
+            let mut bytes = vec![0xf0, suffix];
+            assert_eq!(take_key(&mut bytes), Some(Key::Unknown));
+            assert_eq!(take_key(&mut bytes), Some(expected));
+            assert!(bytes.is_empty());
+        }
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

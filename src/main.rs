@@ -286,12 +286,7 @@ fn run() -> Result<u8, String> {
             app.update(sample);
             collection_clock.collection_finished(Instant::now());
         }
-        let needed = render::minimum_size(&app.config, &app.sample.gpus);
-        if size.cols < needed.cols || size.rows < needed.rows {
-            terminal.draw(&render::too_small(size, needed))?;
-        } else {
-            terminal.draw(&renderer.render(size, &mut app))?;
-        }
+        terminal.draw(&renderer.render(size, &mut app))?;
 
         let deadline = collection_clock.input_deadline(Instant::now());
         loop {

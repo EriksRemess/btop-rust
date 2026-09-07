@@ -161,7 +161,7 @@ pub struct AppState {
     options_selected: usize,
     options_page: usize,
     options_category: usize,
-    options_editing: bool,
+    editing_option: Option<&'static str>,
     options_buffer: String,
     renice_buffer: String,
     signal_buffer: String,
@@ -396,7 +396,7 @@ impl AppState {
             options_selected: 0,
             options_page: 0,
             options_category: 0,
-            options_editing: false,
+            editing_option: None,
             options_buffer: String::new(),
             renice_buffer: String::new(),
             signal_buffer: String::new(),
@@ -695,7 +695,28 @@ impl AppState {
         self.detailed_pid
     }
 
+    fn clear_mouse_regions(&mut self) {
+        self.cpu_area = None;
+        self.memory_area = None;
+        self.network_area = None;
+        self.process_area = None;
+        self.cpu_control_hitboxes.clear();
+        self.memory_control_hitboxes.clear();
+        self.network_hitboxes.clear();
+        self.process_control_hitboxes.clear();
+        self.process_hitboxes.clear();
+        self.main_menu_hitboxes.clear();
+        self.signal_confirm_hitboxes.clear();
+        self.signal_choice_hitboxes.clear();
+        self.disk_scroll_area = None;
+        self.disk_scrollbar = None;
+        self.process_scrollbar = None;
+    }
+
     pub fn handle_key(&mut self, key: Key) -> bool {
+        if key == Key::CtrlC {
+            return true;
+        }
         if self.filter_editing {
             match key {
                 Key::Enter => {
@@ -883,7 +904,7 @@ impl AppState {
                 }
                 Key::Backspace => {
                     self.renice_buffer.pop();
-                    if let Ok(entered) = self.renice_buffer.parse() {
+                    if let Some(entered) = parse_nice_value(&self.renice_buffer) {
                         value = entered;
                         self.overlay = Overlay::Renice { pid, value };
                     }
@@ -892,13 +913,19 @@ impl AppState {
                     if ch.is_ascii_digit() || (ch == '-' && self.renice_buffer.is_empty()) =>
                 {
                     self.renice_buffer.push(ch);
-                    if let Ok(entered) = self.renice_buffer.parse() {
+                    if let Some(entered) = parse_nice_value(&self.renice_buffer) {
                         value = entered;
                         self.overlay = Overlay::Renice { pid, value };
                     }
                 }
                 Key::Enter | Key::Char(' ') => {
-                    let entered = self.renice_buffer.parse().unwrap_or(value);
+                    let entered = if self.renice_buffer.is_empty() {
+                        value
+                    } else if let Some(entered) = parse_nice_value(&self.renice_buffer) {
+                        entered
+                    } else {
+                        return false;
+                    };
                     self.overlay = operation_result(Operation::Renice, set_nice(pid, entered));
                 }
                 _ => return false,
@@ -966,10 +993,10 @@ impl AppState {
             return false;
         }
         if self.overlay == Overlay::Options {
-            if self.options_editing {
+            if self.editing_option.is_some() {
                 match key {
                     Key::Escape => {
-                        self.options_editing = false;
+                        self.editing_option = None;
                         self.options_buffer.clear();
                     }
                     Key::Enter => self.commit_option_edit(),
@@ -1033,7 +1060,7 @@ impl AppState {
             return false;
         }
         match key {
-            Key::CtrlC | Key::Char('q') => return true,
+            Key::Char('q') => return true,
             Key::Escape | Key::Char('m') => self.activate_cpu_control(CpuControlAction::Menu),
             Key::F1 | Key::Char('?') | Key::Char('h') => {
                 self.help_page = 0;
@@ -1185,36 +1212,12 @@ impl AppState {
 
     fn options_per_page(&self) -> usize {
         let rows = self.last_size.map(|size| size.rows as usize).unwrap_or(40);
-        let max_items = OPTION_CATEGORIES
-            .iter()
-            .map(|category| category.len())
-            .max()
-            .unwrap_or(1);
-        let height = rows.saturating_sub(7).min(max_items * 2 + 4) & !1;
-        (height.saturating_sub(4) / 2).max(1)
+        (options_geometry(80, rows).h.saturating_sub(4) / 2).max(1)
     }
 
     fn options_area(&self) -> Option<Rect> {
         let size = self.last_size?;
-        let width = 78.min((size.cols as usize).saturating_sub(2));
-        let max_items = OPTION_CATEGORIES
-            .iter()
-            .map(|category| category.len())
-            .max()
-            .unwrap_or(1);
-        let height = (size.rows as usize)
-            .saturating_sub(7)
-            .min(max_items * 2 + 4)
-            & !1;
-        let banner_y = (size.rows as usize)
-            .saturating_div(2)
-            .saturating_sub(4 + max_items);
-        Some(Rect::new(
-            source_center_x(size.cols as usize, width),
-            banner_y + 6,
-            width,
-            height,
-        ))
+        Some(options_geometry(size.cols as usize, size.rows as usize))
     }
 
     fn handle_options_mouse(&mut self, button: u16, x: usize, y: usize, pressed: bool) {
@@ -1236,10 +1239,12 @@ impl AppState {
             self.overlay = Overlay::None;
             return;
         }
-        if (area.y..=area.y + 2).contains(&y) {
-            for category in 0..OPTION_CATEGORIES.len() {
-                let start = area.x + 2 + category * 12;
-                if (start..start + 11).contains(&x) {
+        if y == area.y + 1 {
+            for (category, (tab, _)) in option_category_tabs(area, self.options_category)
+                .into_iter()
+                .enumerate()
+            {
+                if tab.contains(x, y) {
                     self.options_category = category;
                     self.options_page = 0;
                     self.options_selected = 0;
@@ -1252,7 +1257,9 @@ impl AppState {
             let option_index = self.options_page * self.options_per_page() + selected;
             if option_index < OPTION_CATEGORIES[self.options_category].len() {
                 if self.options_selected == selected {
-                    if x < area.x + 6 {
+                    if x == area.x + 26 && self.current_option().is_some_and(is_integer_option) {
+                        self.activate_option();
+                    } else if x < area.x + 6 {
                         self.change_option(-1);
                     } else if x >= area.x + 25 {
                         self.change_option(1);
@@ -1359,13 +1366,12 @@ impl AppState {
             self.change_option(1);
         } else {
             self.options_buffer = self.config.value(option).unwrap_or_default().to_string();
-            self.options_editing = true;
+            self.editing_option = Some(option);
         }
     }
 
     fn commit_option_edit(&mut self) {
-        let Some(option) = self.current_option() else {
-            self.options_editing = false;
+        let Some(option) = self.editing_option else {
             return;
         };
         let valid = if is_integer_option(option) {
@@ -1388,7 +1394,7 @@ impl AppState {
         };
         if valid {
             self.config.set_value(option, self.options_buffer.clone());
-            self.options_editing = false;
+            self.editing_option = None;
             self.options_buffer.clear();
         }
     }
@@ -1973,7 +1979,31 @@ impl Renderer {
     pub fn render(&mut self, size: Size, app: &mut AppState) -> String {
         let render_started = Instant::now();
         app.draw_times_us = [0; 6];
-        app.last_size = Some(size);
+        let selected_option = app.editing_option.or_else(|| app.current_option());
+        app.clear_mouse_regions();
+        let mut needed = minimum_size(&app.config, &app.sample.gpus);
+        if app.overlay == Overlay::Options {
+            needed.cols = needed.cols.max(80);
+            needed.rows = needed.rows.max(13);
+        }
+        let too_small_for_layout = size.cols < needed.cols || size.rows < needed.rows;
+        app.last_size = (!too_small_for_layout).then_some(size);
+        // Pagination is presentation state; resizing must retain the selected
+        // setting, including while the terminal cannot display the options.
+        if let Some(index) = selected_option.and_then(|selected| {
+            OPTION_CATEGORIES[app.options_category]
+                .iter()
+                .position(|option| *option == selected)
+        }) {
+            let per_page = app.options_per_page();
+            app.options_page = index / per_page;
+            app.options_selected = index % per_page;
+        }
+        if too_small_for_layout {
+            app.dragging_process_scrollbar = false;
+            app.dragging_disk_scrollbar = false;
+            return too_small(size, needed);
+        }
         if self.theme_name != app.config.color_theme || self.themes_dir != app.config.themes_dir {
             self.palette =
                 theme::Palette::load(&app.config.color_theme, app.config.themes_dir.as_deref())
@@ -1992,10 +2022,6 @@ impl Renderer {
         canvas.theme_background = app.config.theme_background;
         let width = canvas.width;
         let height = canvas.height;
-        app.cpu_area = None;
-        app.memory_area = None;
-        app.network_area = None;
-        app.process_area = None;
         let shown_gpus = shown_gpu_panels(&app.config, &app.sample.gpus);
         if !app.config.shown.iter().any(|shown| *shown) && shown_gpus.is_empty() {
             draw_no_boxes(&mut canvas);
@@ -2138,6 +2164,12 @@ impl Renderer {
             app.draw_times_us[3] = elapsed_us(started);
         }
         app.draw_times_us[5] = elapsed_us(render_started);
+        if app.process_scrollbar.is_none() {
+            app.dragging_process_scrollbar = false;
+        }
+        if app.disk_scrollbar.is_none() {
+            app.dragging_disk_scrollbar = false;
+        }
         if app.debug && app.overlay == Overlay::None {
             draw_debug_times(&mut canvas, app);
         }
@@ -6515,6 +6547,39 @@ fn theme_choices(config: &Config) -> Vec<String> {
     theme::available_themes(config.themes_dir.as_deref())
 }
 
+fn options_geometry(width: usize, height: usize) -> Rect {
+    let panel_width = 78.min(width.saturating_sub(2));
+    let max_items = OPTION_CATEGORIES
+        .iter()
+        .map(|items| items.len())
+        .max()
+        .unwrap_or(1);
+    Rect::new(
+        source_center_x(width, panel_width),
+        (height / 2).saturating_sub(5 + max_items) + 7,
+        panel_width,
+        height.saturating_sub(7).min(max_items * 2 + 4) & !1,
+    )
+}
+
+fn option_category_tabs(area: Rect, selected: usize) -> Vec<(Rect, String)> {
+    let mut x = area.x + 4;
+    ["general", "cpu", "gpu", "mem", "net", "proc"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, label)| {
+            let text = if index == selected {
+                format!("[{label}]")
+            } else {
+                format!("{}{label} ", index + 1)
+            };
+            let tab = Rect::new(x, area.y + 1, units::display_width(&text), 1);
+            x += tab.w + 7;
+            (tab, text)
+        })
+        .collect()
+}
+
 fn draw_options(
     canvas: &mut Canvas,
     app: &AppState,
@@ -6523,54 +6588,20 @@ fn draw_options(
     selected: usize,
 ) {
     let options = OPTION_CATEGORIES[category.min(OPTION_CATEGORIES.len() - 1)];
-    let width = 78.min(canvas.width.saturating_sub(2));
-    let max_items = OPTION_CATEGORIES
-        .iter()
-        .map(|category| category.len())
-        .max()
-        .unwrap_or(1);
-    let height = canvas.height.saturating_sub(7).min(max_items * 2 + 4) & !1;
-    let banner_y = canvas
-        .height
-        .saturating_div(2)
-        .saturating_sub(5 + max_items);
-    draw_banner(canvas, banner_y);
-    let area = Rect::new(
-        source_center_x(canvas.width, width),
-        banner_y + 7,
-        width,
-        height,
-    );
+    let area = options_geometry(canvas.width, canvas.height);
+    draw_banner(canvas, area.y - 7);
     canvas.shadow(area);
     canvas.panel(area, "", theme::HI, None);
     canvas.put(area.x + 2, area.y, '┐', theme::HI);
     canvas.text_bold(area.x + 3, area.y, "tab", theme::HI);
     canvas.put_bold(area.x + 6, area.y, '→', theme::MAIN);
     canvas.put(area.x + 7, area.y, '┌', theme::HI);
-    let labels = ["general", "cpu", "gpu", "mem", "net", "proc"];
-    let mut category_x = area.x + 4;
-    for (index, label) in labels.iter().enumerate() {
-        let text = if index == category {
-            format!("[{label}]")
-        } else {
-            format!("{}{label} ", index + 1)
-        };
-        canvas.text_bold(category_x, area.y + 1, &text, theme::TITLE);
-        canvas.put_bold(
-            category_x,
-            area.y + 1,
-            text.chars().next().unwrap_or(' '),
-            theme::HI,
-        );
+    for (index, (tab, text)) in option_category_tabs(area, category).into_iter().enumerate() {
+        canvas.text_bold(tab.x, tab.y, &text, theme::TITLE);
+        canvas.put_bold(tab.x, tab.y, text.chars().next().unwrap_or(' '), theme::HI);
         if index == category {
-            canvas.put_bold(
-                category_x + units::display_width(&text) - 1,
-                area.y + 1,
-                ']',
-                theme::HI,
-            );
+            canvas.put_bold(tab.x + tab.w - 1, tab.y, ']', theme::HI);
         }
-        category_x += units::display_width(&text) + 7;
     }
     canvas.put(area.x, area.y + 2, '├', theme::HI);
     for x in area.x + 1..area.x + area.w - 1 {
@@ -6583,7 +6614,7 @@ fn draw_options(
     }
     canvas.put(area.x + 30, area.y + area.h - 1, '┴', theme::HI);
 
-    let per_page = (height.saturating_sub(4) / 2).max(1);
+    let per_page = (area.h.saturating_sub(4) / 2).max(1);
     let start = page * per_page;
     for (row, option) in options.iter().skip(start).take(per_page).enumerate() {
         let y = area.y + 3 + row * 2;
@@ -6608,8 +6639,8 @@ fn draw_options(
                 theme::TITLE
             },
         );
-        let editing_value =
-            (selected_row && app.options_editing).then(|| clip_text(&app.options_buffer, 24));
+        let editing_value = (selected_row && app.editing_option == Some(*option))
+            .then(|| clip_text(&app.options_buffer, 24));
         let value = editing_value
             .clone()
             .unwrap_or_else(|| option_value(option, app));
@@ -6640,7 +6671,7 @@ fn draw_options(
                 theme::SELECTED,
             );
         }
-        if selected_row && !app.options_editing && option_has_arrows(option, app) {
+        if selected_row && app.editing_option.is_none() && option_has_arrows(option, app) {
             canvas.put_bold(area.x + 2, y + 1, '←', theme::SELECTED);
             canvas.put_bold(area.x + 28, y + 1, '→', theme::SELECTED);
         }
@@ -7890,6 +7921,10 @@ fn send_signal(pid: u32, signal: i32) -> Result<(), i32> {
     }
 }
 
+fn parse_nice_value(text: &str) -> Option<i32> {
+    text.parse().ok().filter(|value| (-20..=19).contains(value))
+}
+
 fn set_nice(pid: u32, value: i32) -> Result<(), i32> {
     unsafe extern "C" {
         fn setpriority(which: i32, who: u32, priority: i32) -> i32;
@@ -8599,6 +8634,9 @@ impl Canvas {
         }
     }
     fn text(&mut self, mut x: usize, y: usize, text: &str, style: theme::Style) {
+        if y >= self.height {
+            return;
+        }
         for ch in text.chars() {
             let width = units::char_width(ch);
             if width == 0 {
@@ -8624,6 +8662,9 @@ impl Canvas {
         }
     }
     fn text_bold(&mut self, mut x: usize, y: usize, text: &str, style: theme::Style) {
+        if y >= self.height {
+            return;
+        }
         for ch in text.chars() {
             let width = units::char_width(ch);
             if width == 0 {
@@ -8649,6 +8690,9 @@ impl Canvas {
         }
     }
     fn text_bold_italic(&mut self, mut x: usize, y: usize, text: &str, style: theme::Style) {
+        if y >= self.height {
+            return;
+        }
         for ch in text.chars() {
             let width = units::char_width(ch);
             if width == 0 {
@@ -8674,6 +8718,9 @@ impl Canvas {
         }
     }
     fn text_italic(&mut self, mut x: usize, y: usize, text: &str, style: theme::Style) {
+        if y >= self.height {
+            return;
+        }
         for ch in text.chars() {
             let width = units::char_width(ch);
             if width == 0 {
@@ -8977,6 +9024,169 @@ impl Canvas {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ctrl_c_quits_every_overlay_and_text_editor() {
+        for overlay in [
+            Overlay::None,
+            Overlay::Main { selected: 0 },
+            Overlay::Help,
+            Overlay::Options,
+            Overlay::Signal {
+                pid: 42,
+                signal: 15,
+            },
+            Overlay::SignalChoose {
+                pid: 42,
+                selected: 0,
+            },
+            Overlay::Renice { pid: 42, value: 0 },
+            Overlay::OperationError {
+                operation: Operation::Signal,
+                errno: 1,
+            },
+        ] {
+            let mut app = app();
+            app.overlay = overlay;
+            assert!(app.handle_key(Key::CtrlC), "{overlay:?}");
+        }
+        let mut app = app();
+        app.filter_editing = true;
+        assert!(app.handle_key(Key::CtrlC));
+        app.filter_editing = false;
+        app.overlay = Overlay::Options;
+        app.editing_option = Some("update_ms");
+        assert!(app.handle_key(Key::CtrlC));
+    }
+
+    #[test]
+    fn invalid_renice_input_cannot_be_submitted_or_overflow_arrow_adjustments() {
+        for text in [
+            "2147483647",
+            "-2147483648",
+            "999999999999999999999",
+            "20",
+            "-21",
+            "-",
+        ] {
+            let mut app = app();
+            app.overlay = Overlay::Renice {
+                pid: u32::MAX,
+                value: 0,
+            };
+            for ch in text.chars() {
+                app.handle_key(Key::Char(ch));
+            }
+            app.handle_key(Key::Enter);
+            assert!(matches!(app.overlay, Overlay::Renice { .. }), "{text}");
+            for key in [Key::Up, Key::Right, Key::Down, Key::Left] {
+                app.handle_key(key);
+                assert!(matches!(
+                    app.overlay,
+                    Overlay::Renice {
+                        value: -20..=19,
+                        ..
+                    }
+                ));
+            }
+        }
+        assert_eq!(parse_nice_value("-20"), Some(-20));
+        assert_eq!(parse_nice_value("19"), Some(19));
+    }
+
+    #[test]
+    fn options_mouse_tracks_rendered_arrows_and_categories_at_small_and_large_sizes() {
+        for (width, height) in [(80, 24), (120, 40), (180, 60)] {
+            let mut app = app();
+            app.last_size = Some(Size {
+                cols: width as u16,
+                rows: height as u16,
+            });
+            app.overlay = Overlay::Options;
+            app.options_selected = 1;
+            let mut canvas = Canvas::new(width, height);
+            draw_options(&mut canvas, &app, 0, 0, 1);
+            let arrow = canvas
+                .cells
+                .iter()
+                .position(|cell| cell.ch == '→' && cell.style == theme::SELECTED)
+                .unwrap();
+            let before = app.config.theme_background;
+            app.handle_options_mouse(0, arrow % width, arrow / width, true);
+            assert_ne!(app.config.theme_background, before, "{width}x{height}");
+            assert_eq!(app.options_selected, 1);
+            let net = canvas
+                .cells
+                .windows(4)
+                .position(|cells| cells.iter().map(|cell| cell.ch).eq("5net".chars()))
+                .unwrap();
+            app.handle_options_mouse(0, net % width, net / width, true);
+            assert_eq!(app.options_category, 4, "{width}x{height}");
+            app.options_selected = 2; // net_download is editable numeric input.
+            let mut canvas = Canvas::new(width, height);
+            draw_options(&mut canvas, &app, 4, 0, 2);
+            let edit = canvas
+                .cells
+                .iter()
+                .position(|cell| cell.ch == '↵' && cell.style == theme::SELECTED)
+                .unwrap();
+            app.handle_options_mouse(0, edit % width, edit / width, true);
+            assert!(app.editing_option.is_some(), "{width}x{height}");
+        }
+    }
+
+    #[test]
+    fn hidden_panels_and_small_windows_discard_mouse_regions() {
+        let mut app = app();
+        let mut renderer = Renderer::new();
+        let size = Size {
+            cols: 120,
+            rows: 40,
+        };
+        renderer.render(size, &mut app);
+        let menu = app
+            .cpu_control_hitboxes
+            .iter()
+            .find(|hit| hit.action == CpuControlAction::Menu)
+            .unwrap();
+        let (x, y) = (menu.start, menu.y);
+        app.handle_key(Key::Char('1'));
+        renderer.render(size, &mut app);
+        assert!(app.cpu_control_hitboxes.is_empty());
+        app.handle_mouse(0, x, y, true);
+        assert_eq!(app.overlay, Overlay::None);
+        app.config.set_value("shown_boxes", "cpu");
+        renderer.render(size, &mut app);
+        assert!(app.memory_control_hitboxes.is_empty());
+        assert!(app.network_hitboxes.is_empty());
+        assert!(app.process_control_hitboxes.is_empty());
+        assert!(app.process_hitboxes.is_empty());
+        assert!(app.disk_scrollbar.is_none());
+        assert!(app.process_scrollbar.is_none());
+        renderer.render(Size { cols: 1, rows: 1 }, &mut app);
+        assert!(app.cpu_control_hitboxes.is_empty());
+        assert!(app.last_size.is_none());
+    }
+
+    #[test]
+    fn wide_text_outside_canvas_is_clipped_and_small_options_can_recover() {
+        let mut canvas = Canvas::new(10, 1);
+        canvas.text(0, 1, "界", theme::MAIN);
+        canvas.text_bold(0, 1, "界", theme::MAIN);
+        canvas.text_italic(0, 1, "界", theme::MAIN);
+        canvas.text_bold_italic(0, 1, "界", theme::MAIN);
+        assert!(canvas.cells.iter().all(|cell| cell.ch == ' '));
+        let mut app = app();
+        app.config.set_value("shown_boxes", "net");
+        app.config.set_value("color_theme", "界界");
+        app.overlay = Overlay::Options;
+        let mut renderer = Renderer::new();
+        let frame = renderer.render(Size { cols: 80, rows: 8 }, &mut app);
+        assert!(frame.contains("Terminal size too small"));
+        let frame = renderer.render(Size { cols: 80, rows: 24 }, &mut app);
+        assert!(frame.contains("界界"));
+        assert!(app.handle_key(Key::CtrlC));
+    }
 
     #[test]
     fn signal_picker_names_and_navigation_use_native_numbers() {
@@ -9286,14 +9496,79 @@ mod tests {
         }
         assert_eq!(app.current_option(), Some("update_ms"));
         app.handle_key(Key::Enter);
-        assert!(app.options_editing);
+        assert!(app.editing_option.is_some());
         app.handle_key(Key::Delete);
         for ch in "3100".chars() {
             app.handle_key(Key::Char(ch));
         }
         app.handle_key(Key::Enter);
-        assert!(!app.options_editing);
+        assert!(app.editing_option.is_none());
         assert_eq!(app.config.update_ms, 3100);
+    }
+
+    #[test]
+    fn options_edit_keeps_its_setting_across_terminal_resizes() {
+        let normal = Size { cols: 80, rows: 24 };
+        let small = Size { cols: 80, rows: 20 };
+        let large = Size {
+            cols: 120,
+            rows: 40,
+        };
+        for sizes in [vec![small], vec![large], vec![small, small, large, normal]] {
+            let mut app = app();
+            let mut renderer = Renderer::new();
+            renderer.render(normal, &mut app);
+            app.handle_key(Key::Char('o'));
+            for _ in 0..9 {
+                app.handle_key(Key::Down);
+            }
+            assert_eq!(app.current_option(), Some("update_ms"));
+            let battery = app.config.value("selected_battery").unwrap().to_string();
+            app.handle_key(Key::Enter);
+            app.handle_key(Key::Delete);
+            for ch in "3100".chars() {
+                app.handle_key(Key::Char(ch));
+            }
+            for size in sizes {
+                renderer.render(size, &mut app);
+                assert_eq!(app.current_option(), Some("update_ms"));
+                assert_eq!(app.editing_option, Some("update_ms"));
+            }
+            app.handle_key(Key::Enter);
+            assert!(app.editing_option.is_none());
+            assert_eq!(app.config.update_ms, 3100);
+            assert_eq!(app.config.value("selected_battery"), Some(battery.as_str()));
+            renderer.render(normal, &mut app);
+            assert_eq!(app.current_option(), Some("update_ms"));
+        }
+    }
+
+    #[test]
+    fn resized_options_edit_still_validates_and_can_be_cancelled() {
+        let mut app = app();
+        let mut renderer = Renderer::new();
+        renderer.render(Size { cols: 80, rows: 24 }, &mut app);
+        app.handle_key(Key::Char('o'));
+        for _ in 0..9 {
+            app.handle_key(Key::Down);
+        }
+        let original = app.config.update_ms;
+        let battery = app.config.value("selected_battery").unwrap().to_string();
+        app.handle_key(Key::Enter);
+        app.handle_key(Key::Delete);
+        app.handle_key(Key::Char('1'));
+        renderer.render(Size { cols: 80, rows: 20 }, &mut app);
+        app.handle_key(Key::Enter);
+        assert_eq!(app.editing_option, Some("update_ms"));
+        assert_eq!(app.options_buffer, "1");
+        assert_eq!(app.config.update_ms, original);
+        assert_eq!(app.config.value("selected_battery"), Some(battery.as_str()));
+        app.handle_key(Key::Escape);
+        assert!(app.editing_option.is_none());
+        assert!(app.options_buffer.is_empty());
+        renderer.render(Size { cols: 80, rows: 24 }, &mut app);
+        assert_eq!(app.current_option(), Some("update_ms"));
+        assert_eq!(app.config.update_ms, original);
     }
 
     #[test]
@@ -9344,7 +9619,10 @@ mod tests {
         assert!(!canvas_text(&canvas).contains("page 1/"));
 
         app.handle_options_mouse(0, area.x + 10, value_y, true);
-        assert!(app.options_editing, "the numeric value is mouse-editable");
+        assert!(
+            app.editing_option.is_some(),
+            "the numeric value is mouse-editable"
+        );
         let mut editing_canvas = Canvas::new(180, 60);
         draw_options(&mut editing_canvas, &app, 0, 0, 9);
         assert_eq!(

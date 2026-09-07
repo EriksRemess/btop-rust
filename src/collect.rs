@@ -427,18 +427,30 @@ impl Collector {
         } else {
             None
         };
-        let (temperature, temperature_max) = read_temperature_info(config).unwrap_or((0.0, 90.0));
+        let (temperature, temperature_max) = if config.check_temperature {
+            read_temperature_info(config).unwrap_or((0.0, 90.0))
+        } else {
+            (0.0, 90.0)
+        };
         Ok((
             CpuSample {
                 total: percentages.first().copied().unwrap_or(0.0),
                 fields,
                 cores: percentages.into_iter().skip(1).collect(),
                 load,
-                frequency: read_frequency(config.value("freq_mode").unwrap_or("highest")),
+                frequency: if config.show_cpu_frequency {
+                    read_frequency(config.value("freq_mode").unwrap_or("highest"))
+                } else {
+                    String::new()
+                },
                 core_frequencies_mhz: Vec::new(),
                 temperature: (temperature > 0.0).then_some(temperature),
                 temperature_max,
-                core_temperatures: read_core_temperatures(core_count, config),
+                core_temperatures: if config.check_temperature && config.show_core_temperature {
+                    read_core_temperatures(core_count, config)
+                } else {
+                    vec![None; core_count]
+                },
                 name: self.cpu_name.clone(),
                 uptime,
                 battery: config
@@ -832,7 +844,13 @@ fn collect_memory(
         cached,
         swap_total,
         swap_used: swap_total.saturating_sub(swap_free),
-        disks: collect_disks(config, previous_disks, elapsed),
+        disks: if config.show_disks {
+            collect_disks(config, previous_disks, elapsed)
+        } else {
+            // Re-enabling disks must establish a fresh rate baseline.
+            previous_disks.clear();
+            Vec::new()
+        },
     })
 }
 
@@ -2002,6 +2020,26 @@ fn stat_vfs(path: &Path) -> Option<(u64, u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn disabled_linux_metrics_are_skipped_and_disk_baselines_reset() {
+        let mut config = Config::default();
+        config.set_value("shown_gpus", "");
+        config.set_value("check_temp", "false");
+        config.set_value("show_cpu_freq", "false");
+        config.set_value("show_disks", "false");
+        let mut collector = Collector::new(&config).unwrap();
+        collector
+            .previous_disks
+            .insert("old-disk".into(), DiskCounters::default());
+        let sample = collector.collect(&config, None).unwrap();
+        assert!(sample.cpu.frequency.is_empty());
+        assert!(sample.cpu.temperature.is_none());
+        assert!(sample.cpu.core_temperatures.iter().all(Option::is_none));
+        assert!(sample.memory.disks.is_empty());
+        assert!(collector.previous_disks.is_empty());
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
