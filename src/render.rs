@@ -4937,13 +4937,26 @@ fn draw_network_stat(
     canvas.text(x + 1, y, &speed_line, theme::MAIN);
     if stats_height >= 8 {
         let width = if stats_width >= 20 { 18 } else { 10 };
+        let bitrate = units::bits_per_second(top, base_10_bitrate);
+        let value = if units::display_width(&bitrate) + 2 > width {
+            let (number, unit) = bitrate.split_once(' ').unwrap_or((&bitrate, ""));
+            let prefix = match unit.chars().next() {
+                Some('k' | 'K') => "K",
+                Some('M') => "M",
+                Some('G') => "G",
+                Some('T') => "T",
+                Some('P') => "P",
+                Some('E') => "E",
+                _ => "",
+            };
+            format!("({number}{prefix})")
+        } else {
+            format!("({bitrate})")
+        };
         canvas.text(
             x + 1,
             y + 1,
-            &format!(
-                "{arrow} Top: {:>width$}",
-                format!("({})", units::bits_per_second(top, base_10_bitrate)),
-            ),
+            &format!("{arrow} Top: {value:>width$}"),
             theme::MAIN,
         );
     }
@@ -11825,6 +11838,31 @@ mod tests {
         assert!(canvas_row(&minimum, 3).contains('▲'));
         assert_eq!(minimum.cells[2 * 36 + 34].ch, '│');
         assert_eq!(minimum.cells[3 * 36 + 34].ch, '│');
+
+        app.sample.network.download_per_second = 911;
+        app.sample.network.upload_per_second = 0;
+        app.download_top = 5_607;
+        app.upload_top = 10;
+        app.sample.network.downloaded = 1_965_000_000;
+        for width in [36, 45, 46, 50] {
+            let mut canvas = Canvas::new(width + 2, 20);
+            draw_network(&mut canvas, Rect::new(0, 0, width, 20), &mut app);
+            for y in stats_y + 1..stats_y + 8 {
+                assert_eq!(canvas.cells[y * canvas.width + width - 2].ch, '│');
+                assert_eq!(canvas.cells[y * canvas.width + width - 1].ch, '│');
+                assert_eq!(canvas.cells[y * canvas.width + width].ch, ' ');
+            }
+            let top = if width <= 45 {
+                "(43.8K)"
+            } else {
+                "(43.8 Kibps)"
+            };
+            assert!(canvas_row(&canvas, stats_y + 2).contains(top));
+            assert!(canvas_row(&canvas, stats_y + 6).contains("(80 bitps)"));
+            assert!(canvas_row(&canvas, stats_y + 1).contains("911 Byte/s"));
+            assert!(canvas_row(&canvas, stats_y + 5).contains("0 Byte/s"));
+            assert!(canvas_row(&canvas, stats_y + 3).contains("1.83 GiB"));
+        }
     }
 
     #[test]
