@@ -4937,22 +4937,7 @@ fn draw_network_stat(
     canvas.text(x + 1, y, &speed_line, theme::MAIN);
     if stats_height >= 8 {
         let width = if stats_width >= 20 { 18 } else { 10 };
-        let bitrate = units::bits_per_second(top, base_10_bitrate);
-        let value = if units::display_width(&bitrate) + 2 > width {
-            let (number, unit) = bitrate.split_once(' ').unwrap_or((&bitrate, ""));
-            let prefix = match unit.chars().next() {
-                Some('k' | 'K') => "K",
-                Some('M') => "M",
-                Some('G') => "G",
-                Some('T') => "T",
-                Some('P') => "P",
-                Some('E') => "E",
-                _ => "",
-            };
-            format!("({number}{prefix})")
-        } else {
-            format!("({bitrate})")
-        };
+        let value = units::bits_per_second(top, base_10_bitrate);
         canvas.text(
             x + 1,
             y + 1,
@@ -11852,13 +11837,11 @@ mod tests {
                 assert_eq!(canvas.cells[y * canvas.width + width - 1].ch, '│');
                 assert_eq!(canvas.cells[y * canvas.width + width].ch, ' ');
             }
-            let top = if width <= 45 {
-                "(43.8K)"
-            } else {
-                "(43.8 Kibps)"
-            };
-            assert!(canvas_row(&canvas, stats_y + 2).contains(top));
-            assert!(canvas_row(&canvas, stats_y + 6).contains("(80 bitps)"));
+            assert!(canvas_row(&canvas, stats_y + 2).contains("43.8 Kibps"));
+            assert!(canvas_row(&canvas, stats_y + 6).contains("80 bitps"));
+            for y in [stats_y + 2, stats_y + 6] {
+                assert!(!canvas_row(&canvas, y).contains(['(', ')']));
+            }
             assert!(canvas_row(&canvas, stats_y + 1).contains("911 Byte/s"));
             assert!(canvas_row(&canvas, stats_y + 5).contains("0 Byte/s"));
             assert!(canvas_row(&canvas, stats_y + 3).contains("1.83 GiB"));
