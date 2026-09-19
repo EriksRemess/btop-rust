@@ -2442,6 +2442,7 @@ mod tests {
                 "Ryzen Threadripper PRO 3975WX",
             ),
             ("AMD Ryzen 7 5700X 8-Core Processor", "Ryzen 7 5700X"),
+            ("AMD Ryzen 9 5950X 16-Core Processor", "Ryzen 9 5950X"),
             ("AMD EPYC 7543 32-Core Processor", "EPYC 7543"),
             ("AMD EPYC 7713 64-Core Processor", "EPYC 7713"),
             ("AMD EPYC 7713P 64-Cores Processor", "EPYC 7713P"),

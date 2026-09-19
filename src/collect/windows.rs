@@ -418,6 +418,8 @@ impl Drop for OwnedHandle {
 pub(super) fn read_cpu_name() -> String {
     registry_cpu_name()
         .or_else(|| std::env::var("PROCESSOR_IDENTIFIER").ok())
+        .map(|name| super::clean_cpu_name(name.trim()))
+        .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "Windows CPU".into())
 }
 
