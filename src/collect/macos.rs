@@ -301,6 +301,7 @@ pub(super) fn collect_memory(
     Ok(MemorySample {
         total,
         used,
+        modified: 0,
         free,
         available,
         cached,

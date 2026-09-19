@@ -76,6 +76,14 @@ struct PerformanceInfo {
     thread_count: u32,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct WindowsMemoryComposition {
+    in_use: u64,
+    modified: u64,
+    standby: u64,
+    free: u64,
+}
+
 #[repr(C)]
 struct SystemPowerStatus {
     ac_line_status: u8,
@@ -770,29 +778,21 @@ pub(super) fn collect_memory(
         process_count: 0,
         thread_count: 0,
     };
-    let cached =
-        if unsafe { K32GetPerformanceInfo(&mut performance, size_of::<PerformanceInfo>() as u32) }
-            != 0
-        {
-            (performance.system_cache as u64).saturating_mul(performance.page_size as u64)
-        } else {
-            0
-        };
+    let _ = unsafe { K32GetPerformanceInfo(&mut performance, size_of::<PerformanceInfo>() as u32) };
     let (swap_total, swap_used) = read_pagefile_usage(performance.page_size as u64).unwrap_or((
         fallback_swap_total,
         fallback_swap_total.saturating_sub(fallback_swap_available),
     ));
+    let composition = read_memory_composition(status.total_physical, status.available_physical);
     Ok(MemorySample {
         total: status.total_physical,
-        used: status
-            .total_physical
-            .saturating_sub(status.available_physical),
-        // `available_physical` also includes standby pages. Report only the
-        // zero and free page lists as Free so it remains distinct from
-        // Available in the memory panel.
-        free: read_free_memory().unwrap_or(0),
-        available: status.available_physical,
-        cached,
+        used: composition.in_use,
+        modified: composition.modified,
+        free: composition.free,
+        available: composition.standby.saturating_add(composition.free),
+        // On Windows this field carries the standby list so the shared sample
+        // remains compact; the renderer labels it explicitly as Standby.
+        cached: composition.standby,
         swap_total,
         swap_used,
         disks,
@@ -856,14 +856,25 @@ fn read_pagefile_usage(page_size: u64) -> Option<(u64, u64)> {
     ))
 }
 
-fn read_free_memory() -> Option<u64> {
-    const COUNTER_PATH: &str = r"\Memory\Free & Zero Page List Bytes";
-    const PDH_FMT_LARGE: u32 = 0x0000_0400;
-    const PDH_CSTATUS_VALID_DATA: u32 = 0;
-    const PDH_CSTATUS_NEW_DATA: u32 = 1;
+fn read_memory_composition(total: u64, fallback_available: u64) -> WindowsMemoryComposition {
+    const COUNTER_PATHS: [&str; 5] = [
+        r"\Memory\Free & Zero Page List Bytes",
+        r"\Memory\Modified Page List Bytes",
+        r"\Memory\Standby Cache Core Bytes",
+        r"\Memory\Standby Cache Normal Priority Bytes",
+        r"\Memory\Standby Cache Reserve Bytes",
+    ];
+    let fallback = || {
+        let standby = fallback_available.min(total);
+        WindowsMemoryComposition {
+            in_use: total.saturating_sub(standby),
+            standby,
+            ..WindowsMemoryComposition::default()
+        }
+    };
     let mut query = 0;
     if unsafe { PdhOpenQueryW(ptr::null(), 0, &mut query) } != 0 {
-        return None;
+        return fallback();
     }
     struct QueryGuard(Handle);
     impl Drop for QueryGuard {
@@ -872,13 +883,45 @@ fn read_free_memory() -> Option<u64> {
         }
     }
     let query = QueryGuard(query);
-    let mut counter = 0;
-    let path = wide(COUNTER_PATH);
-    if unsafe { PdhAddEnglishCounterW(query.0, path.as_ptr(), 0, &mut counter) } != 0
-        || unsafe { PdhCollectQueryData(query.0) } != 0
-    {
-        return None;
+    let mut counters = [0; COUNTER_PATHS.len()];
+    for (path, counter) in COUNTER_PATHS.iter().zip(&mut counters) {
+        let path = wide(path);
+        if unsafe { PdhAddEnglishCounterW(query.0, path.as_ptr(), 0, counter) } != 0 {
+            return fallback();
+        }
     }
+    if unsafe { PdhCollectQueryData(query.0) } != 0 {
+        return fallback();
+    }
+    let Some(values) = counters
+        .map(read_pdh_large)
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+    else {
+        return fallback();
+    };
+    let free = values[0].min(total);
+    let modified = values[1].min(total.saturating_sub(free));
+    let standby = values[2..]
+        .iter()
+        .copied()
+        .fold(0u64, u64::saturating_add)
+        .min(total.saturating_sub(free).saturating_sub(modified));
+    WindowsMemoryComposition {
+        in_use: total
+            .saturating_sub(free)
+            .saturating_sub(modified)
+            .saturating_sub(standby),
+        modified,
+        standby,
+        free,
+    }
+}
+
+fn read_pdh_large(counter: Handle) -> Option<u64> {
+    const PDH_FMT_LARGE: u32 = 0x0000_0400;
+    const PDH_CSTATUS_VALID_DATA: u32 = 0;
+    const PDH_CSTATUS_NEW_DATA: u32 = 1;
     let mut value_type = 0;
     let mut value = PdhFormattedCounterValue {
         status: u32::MAX,
@@ -890,8 +933,8 @@ fn read_free_memory() -> Option<u64> {
     {
         return None;
     }
-    let bytes = unsafe { value.value.large_value };
-    (bytes >= 0).then_some(bytes as u64)
+    let value = unsafe { value.value.large_value };
+    (value >= 0).then_some(value as u64)
 }
 
 fn collect_disks(
@@ -1246,7 +1289,7 @@ pub(super) fn collect_processes(
                 command = String::from_utf16_lossy(&path[..length as usize]);
             }
             if let Some(command_line) = process_command_line(process.0) {
-                command = command_line;
+                command = normalize_windows_command_line(&command_line);
             }
             user = process_user(process.0, &mut collector.users);
             let priority_class = unsafe { GetPriorityClass(process.0) };
@@ -1336,6 +1379,20 @@ fn process_command_line(process: Handle) -> Option<String> {
         std::slice::from_raw_parts(value.buffer, usize::from(value.length / 2))
     }))
     .filter(|command| !command.is_empty())
+}
+
+fn normalize_windows_command_line(command: &str) -> String {
+    let command = command.trim();
+    let Some(quoted) = command.strip_prefix('"') else {
+        return command.to_string();
+    };
+    let Some(closing_quote) = quoted.find('"') else {
+        return command.to_string();
+    };
+    let mut normalized = String::with_capacity(command.len().saturating_sub(2));
+    normalized.push_str(&quoted[..closing_quote]);
+    normalized.push_str(&quoted[closing_quote + 1..]);
+    normalized
 }
 
 fn process_user(process: Handle, cache: &mut HashMap<u32, String>) -> String {
@@ -1469,6 +1526,24 @@ mod tests {
     }
 
     #[test]
+    fn displayed_windows_commands_do_not_mix_executable_quote_styles() {
+        assert_eq!(
+            normalize_windows_command_line(
+                r#""C:\Program Files\Example\app.exe" --name "two words""#
+            ),
+            r#"C:\Program Files\Example\app.exe --name "two words""#
+        );
+        assert_eq!(
+            normalize_windows_command_line(r#""C:\Windows\explorer.exe""#),
+            r"C:\Windows\explorer.exe"
+        );
+        assert_eq!(
+            normalize_windows_command_line(r"C:\Windows\System32\cmd.exe /c echo"),
+            r"C:\Windows\System32\cmd.exe /c echo"
+        );
+    }
+
+    #[test]
     #[ignore = "requires physical Windows hardware, an active IPv4 adapter, and disk counters"]
     fn live_windows_collectors_return_core_system_data() {
         let config = Config::default();
@@ -1482,7 +1557,10 @@ mod tests {
         assert!(sample.cpu.core_frequencies_mhz.is_empty());
         assert!(sample.memory.total > 0);
         assert!(sample.memory.swap_used <= sample.memory.swap_total);
-        assert!(sample.memory.free <= sample.memory.available);
+        assert_eq!(
+            sample.memory.used + sample.memory.modified + sample.memory.cached + sample.memory.free,
+            sample.memory.total
+        );
         assert!(!sample.memory.disks.is_empty());
         assert!(
             sample.memory.disks.iter().any(|disk| disk.io_supported),

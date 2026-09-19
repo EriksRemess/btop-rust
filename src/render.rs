@@ -131,6 +131,7 @@ pub struct AppState {
     pub mem_history: VecDeque<f64>,
     pub available_history: VecDeque<f64>,
     pub cached_history: VecDeque<f64>,
+    pub modified_history: VecDeque<f64>,
     pub free_history: VecDeque<f64>,
     swap_used_history: VecDeque<f64>,
     swap_free_history: VecDeque<f64>,
@@ -367,6 +368,7 @@ impl AppState {
             mem_history: VecDeque::new(),
             available_history: VecDeque::new(),
             cached_history: VecDeque::new(),
+            modified_history: VecDeque::new(),
             free_history: VecDeque::new(),
             swap_used_history: VecDeque::new(),
             swap_free_history: VecDeque::new(),
@@ -481,6 +483,10 @@ impl AppState {
         push(
             &mut self.cached_history,
             ratio(sample.memory.cached, sample.memory.total).round(),
+        );
+        push(
+            &mut self.modified_history,
+            ratio(sample.memory.modified, sample.memory.total).round(),
         );
         push(
             &mut self.free_history,
@@ -3867,8 +3873,9 @@ fn draw_memory(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
     let has_inline_swap = mem.swap_total > 0
         && app.config.bool_value("show_swap").unwrap_or(true)
         && !app.config.bool_value("swap_disk").unwrap_or(true);
-    let item_height = if has_inline_swap { 6 } else { 4 };
-    let mem_size = if area.h.saturating_sub(if has_inline_swap { 3 } else { 2 }) > 2 * item_height {
+    let memory_entry_count = 4;
+    let entry_count = memory_entry_count + if has_inline_swap { 2 } else { 0 };
+    let mem_size = if area.h.saturating_sub(if has_inline_swap { 3 } else { 2 }) > 2 * entry_count {
         3
     } else if mem_width > 25 {
         2
@@ -3878,8 +3885,8 @@ fn draw_memory(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
     let graph_height = if use_graphs {
         let reserved = if has_inline_swap { 2 } else { 1 };
         let groups = if mem_size == 3 { 2 } else { 1 };
-        let available = area.h.saturating_sub(reserved + groups * item_height);
-        ((available as f64 / item_height as f64).round() as usize).max(1)
+        let available = area.h.saturating_sub(reserved + groups * entry_count);
+        ((available as f64 / entry_count as f64).round() as usize).max(1)
     } else {
         0
     };
@@ -3935,40 +3942,77 @@ fn draw_memory(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
         theme::TITLE,
     );
 
-    let mut entries = vec![
-        (
-            "Used",
-            mem.used,
-            mem.total,
-            &app.mem_history,
-            theme::Style::Used(100),
-            false,
-        ),
-        (
-            "Available",
-            mem.available,
-            mem.total,
-            &app.available_history,
-            theme::Style::Available(100),
-            false,
-        ),
-        (
-            "Cached",
-            mem.cached,
-            mem.total,
-            &app.cached_history,
-            theme::Style::Cached(100),
-            false,
-        ),
-        (
-            "Free",
-            mem.free,
-            mem.total,
-            &app.free_history,
-            theme::Style::Free(100),
-            false,
-        ),
-    ];
+    let mut entries = if cfg!(windows) {
+        vec![
+            (
+                "In use",
+                mem.used,
+                mem.total,
+                &app.mem_history,
+                theme::Style::Used(100),
+                false,
+            ),
+            (
+                "Modified",
+                mem.modified,
+                mem.total,
+                &app.modified_history,
+                theme::Style::Cached(100),
+                false,
+            ),
+            (
+                "Standby",
+                mem.cached,
+                mem.total,
+                &app.cached_history,
+                theme::Style::Available(100),
+                false,
+            ),
+            (
+                "Free",
+                mem.free,
+                mem.total,
+                &app.free_history,
+                theme::Style::Free(100),
+                false,
+            ),
+        ]
+    } else {
+        vec![
+            (
+                "Used",
+                mem.used,
+                mem.total,
+                &app.mem_history,
+                theme::Style::Used(100),
+                false,
+            ),
+            (
+                "Available",
+                mem.available,
+                mem.total,
+                &app.available_history,
+                theme::Style::Available(100),
+                false,
+            ),
+            (
+                "Cached",
+                mem.cached,
+                mem.total,
+                &app.cached_history,
+                theme::Style::Cached(100),
+                false,
+            ),
+            (
+                "Free",
+                mem.free,
+                mem.total,
+                &app.free_history,
+                theme::Style::Free(100),
+                false,
+            ),
+        ]
+    };
     if has_inline_swap {
         entries.push((
             "Used",
@@ -9776,14 +9820,19 @@ mod tests {
             let frame = renderer.render(size, &mut app);
             frame_fingerprint(&frame)
         });
-        assert_eq!(
-            actual,
-            [
-                2_770_106_502_089_868_106,
-                10_351_852_488_876_681_533,
-                9_364_860_840_329_026_809,
-            ]
-        );
+        #[cfg(windows)]
+        let expected = [
+            2_770_106_502_089_868_106,
+            11_184_329_996_161_258_669,
+            10_008_781_212_116_715_405,
+        ];
+        #[cfg(not(windows))]
+        let expected = [
+            2_770_106_502_089_868_106,
+            10_351_852_488_876_681_533,
+            9_364_860_840_329_026_809,
+        ];
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -11435,6 +11484,29 @@ mod tests {
 
         draw_memory_divider(&mut canvas, area, 79, 5);
         assert_eq!(canvas.cells[5 * 80 + 79].style, theme::MEM_BOX);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_memory_panel_shows_task_manager_composition_categories() {
+        let mut app = app();
+        app.config.show_disks = false;
+        app.sample.memory.total = 64 * 1024 * 1024 * 1024;
+        app.sample.memory.used = 20 * 1024 * 1024 * 1024;
+        app.sample.memory.modified = 1024 * 1024 * 1024;
+        app.sample.memory.cached = 42 * 1024 * 1024 * 1024;
+        app.sample.memory.free = 1024 * 1024 * 1024;
+        let mut canvas = Canvas::new(50, 30);
+
+        draw_memory(&mut canvas, Rect::new(0, 0, 50, 30), &mut app);
+
+        let output = canvas_text(&canvas);
+        assert!(output.contains("In use:"));
+        assert!(output.contains("Modified:"));
+        assert!(output.contains("Standby:"));
+        assert!(output.contains("Free:"));
+        assert!(!output.contains("Available:"));
+        assert!(!output.contains("Cached:"));
     }
 
     #[test]

@@ -47,6 +47,7 @@ pub struct BatterySample {
 pub struct MemorySample {
     pub total: u64,
     pub used: u64,
+    pub modified: u64,
     pub free: u64,
     pub available: u64,
     pub cached: u64,
@@ -876,6 +877,7 @@ fn collect_memory(
     Ok(MemorySample {
         total,
         used: total.saturating_sub(if available <= total { available } else { free }),
+        modified: 0,
         free,
         available,
         cached,
