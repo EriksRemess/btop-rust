@@ -3,13 +3,22 @@
 mod cli;
 mod collect;
 mod config;
+#[cfg(unix)]
+mod gpu;
+#[cfg(windows)]
+#[path = "gpu/windows.rs"]
 mod gpu;
 mod logger;
 mod render;
+#[cfg(unix)]
+mod terminal;
+#[cfg(windows)]
+#[path = "terminal/windows.rs"]
 mod terminal;
 mod theme;
 mod units;
 
+#[cfg(unix)]
 use std::ffi::{CStr, CString};
 use std::io::{self, IsTerminal};
 use std::process::ExitCode;
@@ -29,13 +38,21 @@ const SIGNAL_REDRAW: u32 = 1 << 2;
 const SIGNAL_RELOAD: u32 = 1 << 3;
 static PENDING_SIGNALS: AtomicU32 = AtomicU32::new(0);
 
+#[cfg(unix)]
 const SIGHUP: i32 = 1;
+#[cfg(unix)]
 const SIGINT: i32 = 2;
+#[cfg(unix)]
 const SIGTERM: i32 = 15;
+#[cfg(unix)]
 const SIGILL: i32 = 4;
+#[cfg(unix)]
 const SIGTRAP: i32 = 5;
+#[cfg(unix)]
 const SIGABRT: i32 = 6;
+#[cfg(unix)]
 const SIGSEGV: i32 = 11;
+#[cfg(unix)]
 const SIGWINCH: i32 = 28;
 #[cfg(target_os = "linux")]
 const SIGBUS: i32 = 7;
@@ -100,6 +117,7 @@ impl CollectionClock {
     }
 }
 
+#[cfg(unix)]
 extern "C" fn signal_handler(signal: i32) {
     let flag = match signal {
         SIGHUP | SIGINT | SIGTERM => SIGNAL_QUIT,
@@ -111,6 +129,7 @@ extern "C" fn signal_handler(signal: i32) {
     PENDING_SIGNALS.fetch_or(flag, Ordering::Relaxed);
 }
 
+#[cfg(unix)]
 extern "C" fn crash_handler(signal_number: i32) {
     // SAFETY: restore_after_crash uses only libc terminal/write calls and a
     // terminal snapshot published before raw mode became active.
@@ -121,6 +140,7 @@ extern "C" fn crash_handler(signal_number: i32) {
     }
 }
 
+#[cfg(unix)]
 unsafe fn set_signal_handler(signal_number: i32, handler: usize) -> usize {
     unsafe extern "C" {
         fn signal(signal: i32, handler: usize) -> usize;
@@ -128,6 +148,7 @@ unsafe fn set_signal_handler(signal_number: i32, handler: usize) -> usize {
     unsafe { signal(signal_number, handler) }
 }
 
+#[cfg(unix)]
 unsafe fn raise_signal(signal_number: i32) -> i32 {
     unsafe extern "C" {
         fn raise(signal: i32) -> i32;
@@ -135,6 +156,7 @@ unsafe fn raise_signal(signal_number: i32) -> i32 {
     unsafe { raise(signal_number) }
 }
 
+#[cfg(unix)]
 fn install_signal_handlers() -> Result<(), String> {
     for signal_number in [
         SIGHUP, SIGINT, SIGTERM, SIGTSTP, SIGCONT, SIGWINCH, SIGUSR1, SIGUSR2,
@@ -161,6 +183,40 @@ fn install_signal_handlers() -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(windows)]
+unsafe extern "system" fn console_control_handler(control: u32) -> i32 {
+    // CTRL_C_EVENT, CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT,
+    // and CTRL_SHUTDOWN_EVENT all request an orderly terminal restoration.
+    if control <= 2 || (5..=6).contains(&control) {
+        if matches!(control, 2 | 5 | 6) {
+            unsafe { terminal::restore_after_crash() };
+        }
+        PENDING_SIGNALS.fetch_or(SIGNAL_QUIT, Ordering::Relaxed);
+        1
+    } else {
+        0
+    }
+}
+
+#[cfg(windows)]
+fn install_signal_handlers() -> Result<(), String> {
+    unsafe extern "system" {
+        fn SetConsoleCtrlHandler(
+            handler: Option<unsafe extern "system" fn(u32) -> i32>,
+            add: i32,
+        ) -> i32;
+    }
+    if unsafe { SetConsoleCtrlHandler(Some(console_control_handler), 1) } == 0 {
+        Err(format!(
+            "could not install console control handler: {}",
+            io::Error::last_os_error()
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
 fn current_tty() -> Option<String> {
     unsafe extern "C" {
         fn ttyname(fd: i32) -> *const std::os::raw::c_char;
@@ -173,6 +229,11 @@ fn current_tty() -> Option<String> {
     })
 }
 
+#[cfg(windows)]
+fn current_tty() -> Option<String> {
+    Some("Windows Console".into())
+}
+
 #[cfg(target_os = "linux")]
 fn auto_tty_mode(name: Option<&str>) -> bool {
     name.is_some_and(|name| name.starts_with("/dev/tty"))
@@ -181,6 +242,11 @@ fn auto_tty_mode(name: Option<&str>) -> bool {
 // All normal Darwin terminal sessions use /dev/ttysNNN. Unlike Linux
 // /dev/ttyN virtual consoles, these are full truecolor Unicode PTYs.
 #[cfg(target_os = "macos")]
+fn auto_tty_mode(_name: Option<&str>) -> bool {
+    false
+}
+
+#[cfg(windows)]
 fn auto_tty_mode(_name: Option<&str>) -> bool {
     false
 }
@@ -281,7 +347,8 @@ fn run() -> Result<u8, String> {
         let now = Instant::now();
         collection_clock.sync_interval(now, app.config.update_ms);
         let size = terminal.size()?;
-        if app.should_collect() && collection_clock.collection_due(now) {
+        let collection_requested = app.take_collection_request();
+        if app.should_collect() && (collection_requested || collection_clock.collection_due(now)) {
             let sample = collector.collect(&app.config, app.detailed_pid())?;
             app.update(sample);
             collection_clock.collection_finished(Instant::now());
@@ -353,6 +420,7 @@ fn reload_config(config: &mut Config, cli: &Cli) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn ensure_utf8_locale(force: bool) -> Result<(), String> {
     unsafe extern "C" {
         fn setlocale(
@@ -391,6 +459,12 @@ fn ensure_utf8_locale(force: bool) -> Result<(), String> {
     }
 }
 
+#[cfg(windows)]
+fn ensure_utf8_locale(_force: bool) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(any(unix, test))]
 fn locale_is_utf8(locale: &str) -> bool {
     locale
         .replace('-', "")
@@ -436,6 +510,7 @@ fn handle_pending_signals(
     }
 }
 
+#[cfg(unix)]
 fn suspend_process() -> Result<(), String> {
     unsafe extern "C" {
         fn raise(signal: i32) -> i32;
@@ -447,11 +522,19 @@ fn suspend_process() -> Result<(), String> {
     }
 }
 
+#[cfg(windows)]
+fn suspend_process() -> Result<(), String> {
+    // Windows has no job-control equivalent to SIGTSTP/SIGCONT. Ctrl+Z is
+    // therefore accepted as a no-op so it cannot leave the console half reset.
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CollectionClock, auto_tty_mode, locale_is_utf8};
     use std::time::{Duration, Instant};
 
+    #[cfg(unix)]
     #[test]
     fn initializes_all_locale_categories() {
         // setlocale is process-global, so test it in a child with no other tests.

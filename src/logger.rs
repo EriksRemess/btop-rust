@@ -1,6 +1,8 @@
+#[cfg(unix)]
 use std::ffi::{CStr, CString};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+#[cfg(unix)]
 use std::os::raw::{c_char, c_int, c_long};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
@@ -9,9 +11,9 @@ const ONE_MEBIBYTE: u64 = 1024 * 1024;
 
 // musl switched 32-bit targets to a 64-bit time_t while c_long remains
 // 32-bit. Other currently supported Unix targets use c_long for time_t.
-#[cfg(all(target_pointer_width = "32", target_env = "musl"))]
+#[cfg(all(unix, target_pointer_width = "32", target_env = "musl"))]
 type TimeT = i64;
-#[cfg(not(all(target_pointer_width = "32", target_env = "musl")))]
+#[cfg(all(unix, not(all(target_pointer_width = "32", target_env = "musl"))))]
 type TimeT = c_long;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -128,12 +130,20 @@ fn write(level: Level, message: &str) {
 }
 
 fn log_path() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .map(|path| path.join("btoprs/btop.log"))
+    }
+    #[cfg(unix)]
     std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
         .map(|path| path.join("btop.log"))
 }
 
+#[cfg(unix)]
 #[repr(C)]
 struct Tm {
     sec: c_int,
@@ -149,6 +159,7 @@ struct Tm {
     zone: *const c_char,
 }
 
+#[cfg(unix)]
 fn utc_timestamp() -> String {
     unsafe extern "C" {
         fn time(value: *mut TimeT) -> TimeT;
@@ -174,6 +185,35 @@ fn utc_timestamp() -> String {
     unsafe { CStr::from_ptr(output.as_ptr()) }
         .to_string_lossy()
         .into_owned()
+}
+
+#[cfg(windows)]
+fn utc_timestamp() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let days = seconds.div_euclid(86_400);
+    let day_seconds = seconds.rem_euclid(86_400);
+    // Howard Hinnant's civil-from-days algorithm, with Unix day zero shifted
+    // to the proleptic Gregorian epoch used by the formula.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}",
+        day_seconds / 3_600,
+        day_seconds / 60 % 60,
+        day_seconds % 60
+    )
 }
 
 #[cfg(test)]

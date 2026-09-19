@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -506,7 +507,11 @@ impl Config {
         let Ok(metadata) = fs::metadata(parent) else {
             return;
         };
-        if metadata.is_dir() && metadata.permissions().mode() & 0o200 == 0 {
+        #[cfg(unix)]
+        let not_writable = metadata.permissions().mode() & 0o200 == 0;
+        #[cfg(windows)]
+        let not_writable = metadata.permissions().readonly();
+        if metadata.is_dir() && not_writable {
             self.read_only = true;
             self.warnings.push(format!(
                 "`{}` is not writable; config changes are not persistent",
@@ -558,12 +563,11 @@ fn write_config_atomically(path: &Path, output: &[u8]) -> Result<(), String> {
         let mut name = path.file_name().unwrap_or_default().to_os_string();
         name.push(format!(".{}.{}.tmp", std::process::id(), sequence));
         let temporary = path.with_file_name(name);
-        let mut file = match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temporary)
-        {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = match options.open(&temporary) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(format!("could not create {}: {error}", temporary.display())),
@@ -588,6 +592,13 @@ fn write_config_atomically(path: &Path, output: &[u8]) -> Result<(), String> {
 }
 
 fn default_path() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .map(|path| path.join("btoprs/btoprs.conf"))
+    }
+    #[cfg(unix)]
     if let Some(path) = std::env::var_os("XDG_CONFIG_HOME") {
         Some(PathBuf::from(path).join("btoprs/btoprs.conf"))
     } else {
@@ -805,6 +816,7 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn saves_ignore_existing_temporary_symlinks_and_preserve_permissions() {
         use std::os::unix::fs::symlink;
@@ -830,6 +842,7 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn concurrent_config_saves_publish_complete_files_and_clean_up_failures() {
         let directory =
@@ -907,6 +920,7 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 
+    #[cfg(unix)]
     #[test]
     fn readable_config_in_read_only_directory_is_loaded_but_not_rewritten() {
         let directory = std::env::temp_dir().join(format!(

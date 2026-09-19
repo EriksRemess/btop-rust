@@ -50,9 +50,27 @@ leave them frozen at zero; those unavailable power readings are hidden. The UI
 does not infer media utilization, memory clock, PCIe throughput, or dedicated
 VRAM values from unrelated counters.
 
+### Windows
+
+Windows support uses the Win32 console in virtual-terminal mode. System data
+comes from native NT, Kernel32, PSAPI, Tool Help, IP Helper, registry, and power
+management APIs. The initial backend includes aggregate and per-logical-CPU
+usage and current frequency, memory and system cache, actual page-file use,
+logical-drive capacity, default-route network selection, IPv4 and traffic
+counters, battery state, disk throughput and activity, and process CPU, memory,
+command line, account, thread, priority, and I/O data. Process termination and
+priority controls use native process APIs.
+
+NVIDIA GPU telemetry is available through the driver-supplied NVML library.
+AMD and Intel GPU telemetry, CPU temperature and power, IPv6 display, and
+per-process scheduler state are not yet implemented on Windows. Unsupported
+values are omitted or left unavailable rather than synthesized.
+
 ## Known limitations
 
 - FreeBSD, OpenBSD, and NetBSD collectors have not been ported.
+- Windows AMD/Intel GPU and CPU hardware-sensor telemetry is not implemented
+  yet.
 - AMD and Intel GPU combinations need broader verification on physical
   hardware; NVIDIA has live coverage on an RTX A4000.
 - Device identity and removable or network filesystem edge cases need more

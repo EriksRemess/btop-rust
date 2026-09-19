@@ -6,7 +6,7 @@ license = "Apache-2.0"
 description = "A dependency-free terminal resource monitor"
 readme = "README.md"
 repository = "https://github.com/EriksRemess/btop-rust"
-keywords = ["system-monitor", "terminal", "tui", "linux", "macos"]
+keywords = ["system-monitor", "tui", "linux", "macos", "windows"]
 categories = ["command-line-utilities"]
 
 [[bin]]
