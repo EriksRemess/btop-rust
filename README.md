@@ -1,6 +1,7 @@
 # btoprs
 
-A terminal resource monitor inspired by btop++, for Linux and macOS 26 or later.
+A terminal resource monitor inspired by btop++, for Linux, macOS 26 or later,
+and Windows 10 or later.
 Keep an eye on CPU, memory, disks, network traffic, and running processes, with
 GPU monitoring where supported.
 
@@ -20,12 +21,14 @@ for command-line options.
 
 Choose a theme and adjust settings from the menu. All bundled themes are
 included in the executable, and btop-compatible `.theme` files are supported.
-Add custom themes to `~/.config/btoprs/themes`.
+Add custom themes to `~/.config/btoprs/themes`. On Windows, themes are stored
+under `%APPDATA%\btoprs\themes`.
 
 Settings are saved to `~/.config/btoprs/btoprs.conf`. Both paths follow
 `$XDG_CONFIG_HOME` when set. Existing btop settings are imported on first use
 without changing the original file. Use `btoprs --config <file>` to select a
-different configuration file.
+different configuration file. On Windows, the default settings file is
+`%APPDATA%\btoprs\btoprs.conf`.
 
 See the [project notes](NOTES.md) for platform details and known limitations.
 

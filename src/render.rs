@@ -167,6 +167,7 @@ pub struct AppState {
     signal_buffer: String,
     last_size: Option<Size>,
     pub needs_redraw: bool,
+    collection_requested: bool,
     overlay: Overlay,
     filter_editing: bool,
     filter_buffer: String,
@@ -402,6 +403,7 @@ impl AppState {
             signal_buffer: String::new(),
             last_size: None,
             needs_redraw: true,
+            collection_requested: false,
             overlay: Overlay::None,
             filter_editing: false,
             detailed_pid: None,
@@ -689,6 +691,10 @@ impl AppState {
 
     pub fn should_collect(&self) -> bool {
         self.overlay == Overlay::None || self.config.bool_value("background_update").unwrap_or(true)
+    }
+
+    pub fn take_collection_request(&mut self) -> bool {
+        std::mem::take(&mut self.collection_requested)
     }
 
     pub fn detailed_pid(&self) -> Option<u32> {
@@ -1520,16 +1526,20 @@ impl AppState {
         if list.is_empty() {
             return;
         }
-        let current = list
-            .iter()
-            .position(|v| v == &self.sample.network.selected)
-            .unwrap_or(0);
+        let selected = self
+            .config
+            .net_iface
+            .as_ref()
+            .filter(|selected| list.contains(selected))
+            .unwrap_or(&self.sample.network.selected);
+        let current = list.iter().position(|v| v == selected).unwrap_or(0);
         let next = if forward {
             (current + 1) % list.len()
         } else {
             (current + list.len() - 1) % list.len()
         };
         self.config.net_iface = Some(list[next].clone());
+        self.collection_requested = true;
     }
 
     fn network_zero_active(&self) -> bool {
@@ -2760,22 +2770,24 @@ fn draw_cpu(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
             canvas.put(box_x + (column + 1) * column_width, y, '│', theme::BOX);
         }
     }
-    let load = format!(
-        "Load avg: {:.2} {:.2} {:.2}",
-        cpu.load[0], cpu.load[1], cpu.load[2]
-    );
-    canvas.text_bold(
-        box_x + box_width.saturating_sub(load.len() + 1),
-        box_y + box_height - 2 - inline_gpus.len(),
-        "Load avg:",
-        theme::MAIN,
-    );
-    canvas.text(
-        box_x + box_width.saturating_sub(load.len() + 1) + 9,
-        box_y + box_height - 2 - inline_gpus.len(),
-        &load[9..],
-        theme::MAIN,
-    );
+    if cpu.load.iter().all(|value| value.is_finite()) {
+        let load = format!(
+            "Load avg: {:.2} {:.2} {:.2}",
+            cpu.load[0], cpu.load[1], cpu.load[2]
+        );
+        canvas.text_bold(
+            box_x + box_width.saturating_sub(load.len() + 1),
+            box_y + box_height - 2 - inline_gpus.len(),
+            "Load avg:",
+            theme::MAIN,
+        );
+        canvas.text(
+            box_x + box_width.saturating_sub(load.len() + 1) + 9,
+            box_y + box_height - 2 - inline_gpus.len(),
+            &load[9..],
+            theme::MAIN,
+        );
+    }
 
     for (row, &index) in inline_gpus.iter().enumerate() {
         let gpu = &app.sample.gpus[index];
@@ -4650,7 +4662,10 @@ fn draw_network(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
         }
         return;
     }
-    let interface = units::truncate(&net.selected, 15);
+    // Let the selector follow the interface name while keeping the title controls
+    // clear of the panel label. Long names use all remaining space and only then
+    // get truncated; short names keep the selector compact and right-aligned.
+    let interface = units::truncate(&net.selected, area.w.saturating_sub(34).max(1));
     let selector = format!("←b {interface} n→");
     let interface_len = units::display_width(&interface);
     let selector_x = area.x + area.w.saturating_sub(interface_len + 9);
@@ -4986,13 +5001,16 @@ fn matches_process_filter(process: &ProcessSample, filter: &str) -> bool {
         || process.user.to_ascii_lowercase().contains(&filter)
 }
 
+#[cfg(unix)]
 const POSIX_REGEX_STORAGE_BYTES: usize = 1024;
 
 // regex_t is opaque here to keep the crate dependency-free. Supported libcs
 // use pointer alignment and only a small fraction of this storage.
 #[repr(C, align(16))]
+#[cfg(unix)]
 struct PosixRegexStorage([u8; POSIX_REGEX_STORAGE_BYTES]);
 
+#[cfg(unix)]
 fn posix_regex_matches(pattern: &str, value: &str, whole: bool) -> bool {
     use std::ffi::CString;
     use std::os::raw::{c_char, c_int, c_void};
@@ -5029,6 +5047,309 @@ fn posix_regex_matches(pattern: &str, value: &str, whole: bool) -> bool {
     let matched = unsafe { regexec(regex_ptr, value.as_ptr(), 0, std::ptr::null_mut(), 0) == 0 };
     unsafe { regfree(regex_ptr) };
     matched
+}
+
+#[cfg(windows)]
+fn posix_regex_matches(pattern: &str, value: &str, whole: bool) -> bool {
+    let Some(expression) = WindowsRegexParser::new(pattern).parse() else {
+        return false;
+    };
+    let value: Vec<char> = value.chars().collect();
+    if whole {
+        regex_expression_ends(&expression, &value, &[0]).contains(&value.len())
+    } else {
+        (0..=value.len())
+            .any(|start| !regex_expression_ends(&expression, &value, &[start]).is_empty())
+    }
+}
+
+#[cfg(windows)]
+#[derive(Clone)]
+struct WindowsRegex {
+    alternatives: Vec<Vec<WindowsRegexPiece>>,
+}
+
+#[cfg(windows)]
+#[derive(Clone)]
+struct WindowsRegexPiece {
+    atom: WindowsRegexAtom,
+    minimum: usize,
+    maximum: Option<usize>,
+}
+
+#[cfg(windows)]
+#[derive(Clone)]
+enum WindowsRegexAtom {
+    Literal(char),
+    Any,
+    Class {
+        negated: bool,
+        ranges: Vec<(char, char)>,
+    },
+    Group(Box<WindowsRegex>),
+    Start,
+    End,
+}
+
+#[cfg(windows)]
+struct WindowsRegexParser {
+    characters: Vec<char>,
+    index: usize,
+}
+
+#[cfg(windows)]
+impl WindowsRegexParser {
+    fn new(pattern: &str) -> Self {
+        Self {
+            characters: pattern.chars().collect(),
+            index: 0,
+        }
+    }
+
+    fn parse(mut self) -> Option<WindowsRegex> {
+        let expression = self.expression()?;
+        (self.index == self.characters.len()).then_some(expression)
+    }
+
+    fn expression(&mut self) -> Option<WindowsRegex> {
+        let mut alternatives = vec![self.sequence()?];
+        while self.peek() == Some('|') {
+            self.index += 1;
+            alternatives.push(self.sequence()?);
+        }
+        Some(WindowsRegex { alternatives })
+    }
+
+    fn sequence(&mut self) -> Option<Vec<WindowsRegexPiece>> {
+        let mut pieces = Vec::new();
+        while !matches!(self.peek(), None | Some(')') | Some('|')) {
+            pieces.push(self.piece()?);
+        }
+        Some(pieces)
+    }
+
+    fn piece(&mut self) -> Option<WindowsRegexPiece> {
+        let atom = self.atom()?;
+        let (minimum, maximum) = match self.peek() {
+            Some('*') => {
+                self.index += 1;
+                (0, None)
+            }
+            Some('+') => {
+                self.index += 1;
+                (1, None)
+            }
+            Some('?') => {
+                self.index += 1;
+                (0, Some(1))
+            }
+            Some('{') => self.repetition()?,
+            _ => (1, Some(1)),
+        };
+        if matches!(self.peek(), Some('*' | '+' | '?' | '{')) {
+            return None;
+        }
+        Some(WindowsRegexPiece {
+            atom,
+            minimum,
+            maximum,
+        })
+    }
+
+    fn atom(&mut self) -> Option<WindowsRegexAtom> {
+        match self.take()? {
+            '.' => Some(WindowsRegexAtom::Any),
+            '^' => Some(WindowsRegexAtom::Start),
+            '$' => Some(WindowsRegexAtom::End),
+            '(' => {
+                let expression = self.expression()?;
+                (self.take()? == ')').then_some(WindowsRegexAtom::Group(Box::new(expression)))
+            }
+            '[' => self.character_class(),
+            '\\' => Some(WindowsRegexAtom::Literal(self.take()?)),
+            ')' | '|' | '*' | '+' | '?' | '{' | '}' => None,
+            literal => Some(WindowsRegexAtom::Literal(literal)),
+        }
+    }
+
+    fn character_class(&mut self) -> Option<WindowsRegexAtom> {
+        let negated = if self.peek() == Some('^') {
+            self.index += 1;
+            true
+        } else {
+            false
+        };
+        let mut ranges = Vec::new();
+        let mut first = true;
+        loop {
+            self.peek()?;
+            if self.peek() == Some(']') && !first {
+                self.index += 1;
+                break;
+            }
+            let start = self.class_character()?;
+            first = false;
+            if self.peek() == Some('-') && self.characters.get(self.index + 1).copied() != Some(']')
+            {
+                self.index += 1;
+                let end = self.class_character()?;
+                if start > end {
+                    return None;
+                }
+                ranges.push((start, end));
+            } else {
+                ranges.push((start, start));
+            }
+        }
+        (!ranges.is_empty()).then_some(WindowsRegexAtom::Class { negated, ranges })
+    }
+
+    fn class_character(&mut self) -> Option<char> {
+        match self.take()? {
+            '\\' => self.take(),
+            character => Some(character),
+        }
+    }
+
+    fn repetition(&mut self) -> Option<(usize, Option<usize>)> {
+        self.index += 1;
+        let minimum = self.number()?;
+        let maximum = match self.take()? {
+            '}' => Some(minimum),
+            ',' if self.peek() == Some('}') => {
+                self.index += 1;
+                None
+            }
+            ',' => {
+                let maximum = self.number()?;
+                if self.take()? != '}' || maximum < minimum {
+                    return None;
+                }
+                Some(maximum)
+            }
+            _ => return None,
+        };
+        if minimum > 1_024 || maximum.is_some_and(|maximum| maximum > 1_024) {
+            return None;
+        }
+        Some((minimum, maximum))
+    }
+
+    fn number(&mut self) -> Option<usize> {
+        let start = self.index;
+        while self
+            .peek()
+            .is_some_and(|character| character.is_ascii_digit())
+        {
+            self.index += 1;
+        }
+        (self.index > start)
+            .then(|| {
+                self.characters[start..self.index]
+                    .iter()
+                    .collect::<String>()
+            })?
+            .parse()
+            .ok()
+    }
+
+    fn peek(&self) -> Option<char> {
+        self.characters.get(self.index).copied()
+    }
+
+    fn take(&mut self) -> Option<char> {
+        let value = self.peek()?;
+        self.index += 1;
+        Some(value)
+    }
+}
+
+#[cfg(windows)]
+fn regex_expression_ends(
+    expression: &WindowsRegex,
+    value: &[char],
+    starts: &[usize],
+) -> Vec<usize> {
+    let mut output = Vec::new();
+    for sequence in &expression.alternatives {
+        let mut positions = starts.to_vec();
+        for piece in sequence {
+            positions = regex_piece_ends(piece, value, &positions);
+            if positions.is_empty() {
+                break;
+            }
+        }
+        output.extend(positions);
+    }
+    output.sort_unstable();
+    output.dedup();
+    output
+}
+
+#[cfg(windows)]
+fn regex_piece_ends(piece: &WindowsRegexPiece, value: &[char], starts: &[usize]) -> Vec<usize> {
+    let mut frontier = starts.to_vec();
+    let mut reached = starts.to_vec();
+    let mut output = if piece.minimum == 0 {
+        starts.to_vec()
+    } else {
+        Vec::new()
+    };
+    let mut repetitions = 0usize;
+    while piece.maximum.is_none_or(|maximum| repetitions < maximum) {
+        let next = regex_atom_ends(&piece.atom, value, &frontier);
+        repetitions += 1;
+        if repetitions >= piece.minimum {
+            output.extend(&next);
+        }
+        if next.is_empty() {
+            break;
+        }
+        let has_new_position = next.iter().any(|position| !reached.contains(position));
+        reached.extend(&next);
+        reached.sort_unstable();
+        reached.dedup();
+        frontier = next;
+        if piece.maximum.is_none() && !has_new_position && repetitions >= piece.minimum {
+            break;
+        }
+    }
+    output.sort_unstable();
+    output.dedup();
+    output
+}
+
+#[cfg(windows)]
+fn regex_atom_ends(atom: &WindowsRegexAtom, value: &[char], starts: &[usize]) -> Vec<usize> {
+    let mut output = Vec::new();
+    for &position in starts {
+        match atom {
+            WindowsRegexAtom::Literal(expected)
+                if value.get(position).is_some_and(|actual| actual == expected) =>
+            {
+                output.push(position + 1);
+            }
+            WindowsRegexAtom::Any if position < value.len() => output.push(position + 1),
+            WindowsRegexAtom::Class { negated, ranges } if position < value.len() => {
+                let character = value[position];
+                let included = ranges
+                    .iter()
+                    .any(|(start, end)| (*start..=*end).contains(&character));
+                if included != *negated {
+                    output.push(position + 1);
+                }
+            }
+            WindowsRegexAtom::Group(expression) => {
+                output.extend(regex_expression_ends(expression, value, &[position]));
+            }
+            WindowsRegexAtom::Start if position == 0 => output.push(position),
+            WindowsRegexAtom::End if position == value.len() => output.push(position),
+            _ => {}
+        }
+    }
+    output.sort_unstable();
+    output.dedup();
+    output
 }
 
 fn tree_filter_with_descendants<'a>(
@@ -5609,7 +5930,18 @@ fn draw_processes(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
     } else {
         app.process_offset = app.process_offset.min(listed.len().saturating_sub(rows));
     }
-    let user_w = if area.w < 75 { 5 } else { 10 };
+    let user_w = if area.w < 75 {
+        5
+    } else {
+        listed
+            .iter()
+            .skip(app.process_offset)
+            .take(rows)
+            .map(|(process, _)| units::display_width(&process.user))
+            .max()
+            .unwrap_or(0)
+            .clamp(5, 10)
+    };
     let thread_w = if area.w < 75 { 0 } else { 4 };
     // Keep btop's -1 sentinel in the width arithmetic even though Rust uses
     // zero to mean that the thread column is hidden.
@@ -7572,12 +7904,24 @@ const SIGNALS: [&str; 32] = [
     "SIGUSR2",
 ];
 
+#[cfg(windows)]
+const SIGNALS: [&str; 16] = [
+    "", "", "", "", "", "", "", "", "", "KILL", "", "", "", "", "", "CLOSE",
+];
+
+fn signal_name(signal: i32) -> &'static str {
+    selectable_signals()
+        .find(|(number, _)| *number == signal as usize)
+        .map(|(_, name)| name)
+        .unwrap_or("signal")
+}
+
 fn selectable_signals() -> impl Iterator<Item = (usize, &'static str)> {
     SIGNALS
         .iter()
         .copied()
         .enumerate()
-        .filter(|(number, name)| *number != 0 && *name != "SIGSTKFLT")
+        .filter(|(number, name)| *number != 0 && !name.is_empty() && *name != "SIGSTKFLT")
 }
 
 fn move_signal_horizontal(selected: u8, right: bool) -> u8 {
@@ -7628,7 +7972,7 @@ fn draw_signal(canvas: &mut Canvas, app: &mut AppState, pid: u32, signal: i32) {
         h,
     );
     canvas.shadow(area);
-    let name = if signal == 15 { "SIGTERM" } else { "SIGKILL" };
+    let name = signal_name(signal);
     canvas.panel(area, name, theme::RED, None);
     let process_name = app
         .sample
@@ -7869,6 +8213,7 @@ fn draw_operation_error(canvas: &mut Canvas, operation: Operation, errno: i32) {
         width,
         height,
     );
+    #[cfg(unix)]
     let detail = match errno {
         22 => "Unsupported signal!".to_string(),
         1 | 13 => format!(
@@ -7881,6 +8226,23 @@ fn draw_operation_error(canvas: &mut Canvas, operation: Operation, errno: i32) {
         ),
         3 => "Process not found!".to_string(),
         _ => format!("Unknown error! (errno: {errno})"),
+    };
+    #[cfg(windows)]
+    let detail = match errno {
+        5 => format!(
+            "Insufficient permissions to {}!",
+            if operation == Operation::Signal {
+                "control process"
+            } else {
+                "change process priority"
+            }
+        ),
+        50 if operation == Operation::Signal => {
+            "No window to close; use KILL for this process.".to_string()
+        }
+        87 => "Invalid process operation!".to_string(),
+        1168 => "Process not found!".to_string(),
+        _ => format!("Windows error {errno}"),
     };
     canvas.shadow(area);
     canvas.panel(area, "error", theme::RED, None);
@@ -7908,6 +8270,7 @@ fn last_errno() -> i32 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
 }
 
+#[cfg(unix)]
 fn send_signal(pid: u32, signal: i32) -> Result<(), i32> {
     unsafe extern "C" {
         fn kill(pid: i32, signal: i32) -> i32;
@@ -7919,10 +8282,67 @@ fn send_signal(pid: u32, signal: i32) -> Result<(), i32> {
     }
 }
 
+#[cfg(windows)]
+fn send_signal(pid: u32, signal: i32) -> Result<(), i32> {
+    const PROCESS_TERMINATE: u32 = 0x0001;
+    const ERROR_NOT_SUPPORTED: i32 = 50;
+    const WM_CLOSE: u32 = 0x0010;
+    #[link(name = "Kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, process_id: u32) -> isize;
+        fn TerminateProcess(process: isize, exit_code: u32) -> i32;
+        fn CloseHandle(handle: isize) -> i32;
+    }
+    #[link(name = "User32")]
+    unsafe extern "system" {
+        fn EnumWindows(
+            callback: unsafe extern "system" fn(isize, isize) -> i32,
+            parameter: isize,
+        ) -> i32;
+        fn GetWindowThreadProcessId(window: isize, process_id: *mut u32) -> u32;
+        fn PostMessageW(window: isize, message: u32, word: usize, long: isize) -> i32;
+    }
+    #[repr(C)]
+    struct CloseRequest {
+        pid: u32,
+        sent: bool,
+    }
+    unsafe extern "system" fn close_window(window: isize, parameter: isize) -> i32 {
+        let request = unsafe { &mut *(parameter as *mut CloseRequest) };
+        let mut window_pid = 0;
+        unsafe { GetWindowThreadProcessId(window, &mut window_pid) };
+        if window_pid == request.pid && unsafe { PostMessageW(window, WM_CLOSE, 0, 0) } != 0 {
+            request.sent = true;
+        }
+        1
+    }
+    if signal == 15 {
+        let mut request = CloseRequest { pid, sent: false };
+        unsafe { EnumWindows(close_window, (&mut request as *mut CloseRequest) as isize) };
+        return if request.sent {
+            Ok(())
+        } else {
+            Err(ERROR_NOT_SUPPORTED)
+        };
+    }
+    let process = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+    if process == 0 {
+        return Err(last_errno());
+    }
+    let result = unsafe { TerminateProcess(process, 1) };
+    unsafe { CloseHandle(process) };
+    if result != 0 {
+        Ok(())
+    } else {
+        Err(last_errno())
+    }
+}
+
 fn parse_nice_value(text: &str) -> Option<i32> {
     text.parse().ok().filter(|value| (-20..=19).contains(value))
 }
 
+#[cfg(unix)]
 fn set_nice(pid: u32, value: i32) -> Result<(), i32> {
     unsafe extern "C" {
         fn setpriority(which: i32, who: u32, priority: i32) -> i32;
@@ -7931,6 +8351,45 @@ fn set_nice(pid: u32, value: i32) -> Result<(), i32> {
         Ok(())
     } else {
         Err(last_errno())
+    }
+}
+
+#[cfg(windows)]
+fn set_nice(pid: u32, value: i32) -> Result<(), i32> {
+    const PROCESS_SET_INFORMATION: u32 = 0x0200;
+    #[link(name = "Kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, process_id: u32) -> isize;
+        fn SetPriorityClass(process: isize, priority: u32) -> i32;
+        fn CloseHandle(handle: isize) -> i32;
+    }
+    let priority = windows_priority_class(value);
+    let process = unsafe { OpenProcess(PROCESS_SET_INFORMATION, 0, pid) };
+    if process == 0 {
+        return Err(last_errno());
+    }
+    let result = unsafe { SetPriorityClass(process, priority) };
+    unsafe { CloseHandle(process) };
+    if result != 0 {
+        Ok(())
+    } else {
+        Err(last_errno())
+    }
+}
+
+#[cfg(windows)]
+fn windows_priority_class(value: i32) -> u32 {
+    const IDLE_PRIORITY_CLASS: u32 = 0x0000_0040;
+    const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+    const NORMAL_PRIORITY_CLASS: u32 = 0x0000_0020;
+    const ABOVE_NORMAL_PRIORITY_CLASS: u32 = 0x0000_8000;
+    const HIGH_PRIORITY_CLASS: u32 = 0x0000_0080;
+    match value {
+        10.. => IDLE_PRIORITY_CLASS,
+        1..=9 => BELOW_NORMAL_PRIORITY_CLASS,
+        0 => NORMAL_PRIORITY_CLASS,
+        -5..=-1 => ABOVE_NORMAL_PRIORITY_CLASS,
+        _ => HIGH_PRIORITY_CLASS,
     }
 }
 
@@ -9092,6 +9551,15 @@ mod tests {
         assert_eq!(parse_nice_value("19"), Some(19));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_renice_never_selects_realtime_priority() {
+        const HIGH_PRIORITY_CLASS: u32 = 0x0000_0080;
+        const REALTIME_PRIORITY_CLASS: u32 = 0x0000_0100;
+        assert_eq!(windows_priority_class(-20), HIGH_PRIORITY_CLASS);
+        assert_ne!(windows_priority_class(-20), REALTIME_PRIORITY_CLASS);
+    }
+
     #[test]
     fn options_mouse_tracks_rendered_arrows_and_categories_at_small_and_large_sizes() {
         for (width, height) in [(80, 24), (120, 40), (180, 60)] {
@@ -9186,6 +9654,7 @@ mod tests {
         assert!(app.handle_key(Key::CtrlC));
     }
 
+    #[cfg(unix)]
     #[test]
     fn signal_picker_names_and_navigation_use_native_numbers() {
         assert_eq!(SIGNALS[crate::SIGBUS as usize], "SIGBUS");
@@ -9963,6 +10432,35 @@ mod tests {
         assert!(process.contains(" 12K tester"));
         assert!(process.contains(" 12%"));
         assert!(process.contains("12.34"));
+    }
+
+    #[test]
+    fn process_user_column_tracks_visible_account_width() {
+        let mut app = app();
+        app.config.process_tree = false;
+        app.sample.processes = vec![ProcessSample {
+            pid: 42,
+            name: "program.exe".into(),
+            command: r#"C:\Program Files\Example\program.exe --long-command"#.into(),
+            user: "eriks".into(),
+            ..ProcessSample::default()
+        }];
+        let mut short = Canvas::new(120, 15);
+        draw_processes(&mut short, Rect::new(0, 0, 120, 15), &mut app);
+        let short_threads = canvas_row(&short, 1)
+            .find("Threads:")
+            .expect("thread header is visible");
+
+        app.sample.processes[0].user = "long-account-name".into();
+        let mut long = Canvas::new(120, 15);
+        draw_processes(&mut long, Rect::new(0, 0, 120, 15), &mut app);
+        let long_threads = canvas_row(&long, 1)
+            .find("Threads:")
+            .expect("thread header is visible");
+
+        assert_eq!(short_threads, long_threads + 5);
+        assert!(canvas_row(&short, 2).contains("eriks"));
+        assert!(canvas_row(&long, 2).contains("long-acco+"));
     }
 
     #[test]
@@ -11440,6 +11938,14 @@ mod tests {
         assert!(matches_process_filter(&process, "!.*--namespace.*"));
         assert!(!matches_process_filter(&process, "!["));
         assert!(posix_regex_matches(
+            r"^(systemd|code)(-[a-z]+)?$",
+            "systemd-journald",
+            false
+        ));
+        assert!(posix_regex_matches(r"^Code\.exe$", "Code.exe", false));
+        assert!(posix_regex_matches(r"^[0-9]{2,4}$", "2048", false));
+        assert!(!posix_regex_matches(r"^[^0-9]+$", "code2", false));
+        assert!(posix_regex_matches(
             "^first.second$",
             "first\nsecond",
             false
@@ -11893,6 +12399,12 @@ mod tests {
         let previous = hitbox(&app, NetworkAction::Previous);
         click(&mut app, previous);
         assert_eq!(app.config.net_iface.as_deref(), Some("wlan0"));
+        assert!(app.take_collection_request());
+        // A second input before a sample arrives advances from the pending
+        // choice instead of repeatedly selecting the same interface.
+        click(&mut app, previous);
+        assert_eq!(app.config.net_iface.as_deref(), Some("eth0"));
+        assert!(app.take_collection_request());
 
         let zero = hitbox(&app, NetworkAction::Zero);
         click(&mut app, zero);
@@ -11924,6 +12436,55 @@ mod tests {
         let title = canvas_row(&narrow, 0);
         assert!(title.contains("10.0.0.100"));
         assert!(title.contains("sync"));
+    }
+
+    #[test]
+    fn network_interface_selector_fits_name_and_available_space() {
+        let mut app = app();
+        app.sample.network.connected = true;
+        app.sample.network.selected = "vEthernet (Default Switch)".into();
+        app.sample.network.interfaces = vec![app.sample.network.selected.clone()];
+
+        let mut wide = Canvas::new(80, 12);
+        draw_network(&mut wide, Rect::new(0, 0, 80, 12), &mut app);
+        assert!(canvas_row(&wide, 0).contains("←b vEthernet (Default Switch) n→"));
+        let long_selector_x = app
+            .network_hitboxes
+            .iter()
+            .find(|hitbox| hitbox.action == NetworkAction::Previous)
+            .expect("previous interface control is visible")
+            .start;
+
+        app.sample.network.selected = "Wi-Fi".into();
+        let mut short = Canvas::new(80, 12);
+        draw_network(&mut short, Rect::new(0, 0, 80, 12), &mut app);
+        assert!(canvas_row(&short, 0).contains("←b Wi-Fi n→"));
+        let short_selector_x = app
+            .network_hitboxes
+            .iter()
+            .find(|hitbox| hitbox.action == NetworkAction::Previous)
+            .expect("previous interface control is visible")
+            .start;
+        assert!(short_selector_x > long_selector_x);
+
+        app.sample.network.selected = "vEthernet (Default Switch)".into();
+        let mut narrow = Canvas::new(48, 12);
+        draw_network(&mut narrow, Rect::new(0, 0, 48, 12), &mut app);
+        let title = canvas_row(&narrow, 0);
+        assert!(title.contains(&units::truncate(&app.sample.network.selected, 14)));
+        assert!(!title.contains(&app.sample.network.selected));
+        for action in [
+            NetworkAction::Sync,
+            NetworkAction::Auto,
+            NetworkAction::Zero,
+        ] {
+            assert!(
+                app.network_hitboxes
+                    .iter()
+                    .any(|hitbox| hitbox.action == action),
+                "{action:?} control is visible"
+            );
+        }
     }
 
     #[test]

@@ -12,6 +12,8 @@ use crate::logger;
 
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(windows)]
+mod windows;
 
 #[derive(Debug, Clone, Default)]
 pub struct CpuSample {
@@ -252,6 +254,8 @@ pub struct Collector {
     gpus: GpuCollector,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     apple_cpu_frequency: Option<crate::gpu::macos::AppleCpuFrequencyCollector>,
+    #[cfg(windows)]
+    windows_cpu_frequency: windows::CpuFrequencyCollector,
     rapl: Option<RaplReader>,
     container_engine: Option<String>,
 }
@@ -273,15 +277,36 @@ impl Collector {
                 {
                     String::new()
                 }
+            } else if cfg!(windows) {
+                #[cfg(windows)]
+                {
+                    windows::read_cpu_name()
+                }
+                #[cfg(not(windows))]
+                {
+                    String::new()
+                }
             } else {
                 read_cpu_name()
             },
-            users: read_users(),
+            users: if cfg!(windows) {
+                HashMap::new()
+            } else {
+                read_users()
+            },
             gpus: GpuCollector::new(config),
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             apple_cpu_frequency: crate::gpu::macos::AppleCpuFrequencyCollector::new(),
-            rapl: discover_rapl(Path::new("/sys/class/powercap")),
-            container_engine: detect_container(),
+            #[cfg(windows)]
+            windows_cpu_frequency: windows::CpuFrequencyCollector::new(),
+            rapl: (!cfg!(windows))
+                .then(|| discover_rapl(Path::new("/sys/class/powercap")))
+                .flatten(),
+            container_engine: if cfg!(windows) {
+                None
+            } else {
+                detect_container()
+            },
         })
     }
 
@@ -328,7 +353,10 @@ impl Collector {
         })
     }
 
+    #[cfg_attr(windows, allow(unreachable_code))]
     fn collect_cpu(&mut self, config: &Config) -> Result<(CpuSample, u64), String> {
+        #[cfg(windows)]
+        return windows::collect_cpu(self, config);
         if cfg!(target_os = "macos") {
             #[cfg(target_os = "macos")]
             return macos::collect_cpu(self, config);
@@ -471,7 +499,10 @@ impl Collector {
         self.rapl.as_mut()?.read_watts()
     }
 
+    #[cfg_attr(windows, allow(unreachable_code))]
     fn collect_network(&mut self, config: &Config, elapsed: f64) -> Result<NetworkSample, String> {
+        #[cfg(windows)]
+        return windows::collect_network(self, config, elapsed);
         if cfg!(target_os = "macos") {
             #[cfg(target_os = "macos")]
             return macos::collect_network(self, config, elapsed);
@@ -560,6 +591,7 @@ impl Collector {
         })
     }
 
+    #[cfg_attr(windows, allow(unreachable_code, unused_variables))]
     fn collect_processes(
         &mut self,
         total_delta: u64,
@@ -568,6 +600,8 @@ impl Collector {
         config: &Config,
         detailed_pid: Option<u32>,
     ) -> Result<Vec<ProcessSample>, String> {
+        #[cfg(windows)]
+        return windows::collect_processes(self, total_delta, cores, config, detailed_pid);
         if cfg!(target_os = "macos") {
             #[cfg(target_os = "macos")]
             return macos::collect_processes(self, total_delta, cores, config, detailed_pid);
@@ -798,11 +832,14 @@ fn parse_process_stat(_pid: u32, stat: &str) -> Option<RawProcess> {
     })
 }
 
+#[cfg_attr(windows, allow(unreachable_code))]
 fn collect_memory(
     config: &Config,
     previous_disks: &mut HashMap<String, DiskCounters>,
     elapsed: f64,
 ) -> Result<MemorySample, String> {
+    #[cfg(windows)]
+    return windows::collect_memory(config, previous_disks, elapsed);
     if cfg!(target_os = "macos") {
         #[cfg(target_os = "macos")]
         return macos::collect_memory(config, previous_disks, elapsed);
@@ -2097,7 +2134,7 @@ mod tests {
     #[test]
     fn discovers_package_rapl_without_assuming_its_index() {
         let root = std::env::temp_dir().join(format!("btop-rust-rapl-test-{}", std::process::id()));
-        let package = root.join("intel-rapl:7");
+        let package = root.join("intel-rapl-7");
         fs::create_dir_all(&package).unwrap();
         fs::write(package.join("name"), "package-1\n").unwrap();
         fs::write(package.join("energy_uj"), "42\n").unwrap();

@@ -207,6 +207,14 @@ fn bundled_theme(requested: &Path) -> Option<&'static str> {
 }
 
 fn user_theme_directory() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        std::env::var_os("APPDATA")
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+            .map(|directory| directory.join("btoprs/themes"))
+    }
+    #[cfg(unix)]
     std::env::var_os("XDG_CONFIG_HOME")
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
@@ -226,6 +234,7 @@ pub fn install_missing_themes(custom_dir: Option<&Path>) -> std::io::Result<()> 
 }
 
 fn install_missing_themes_in(directory: &Path, search_dirs: &[PathBuf]) -> std::io::Result<()> {
+    #[cfg(unix)]
     use std::os::unix::fs::DirBuilderExt;
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT_STAGING: AtomicU64 = AtomicU64::new(0);
@@ -262,7 +271,13 @@ fn install_missing_themes_in(directory: &Path, search_dirs: &[PathBuf]) -> std::
     let staging = loop {
         let sequence = NEXT_STAGING.fetch_add(1, Ordering::Relaxed);
         let path = directory.join(format!(".btoprs-themes-{}-{sequence}", std::process::id()));
-        match fs::DirBuilder::new().mode(0o700).create(&path) {
+        #[cfg(unix)]
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(windows)]
+        let builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        builder.mode(0o700);
+        match builder.create(&path) {
             Ok(()) => break Staging(path),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error),
@@ -781,6 +796,7 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn unreadable_bundled_theme_files_use_embedded_palette() {
         use std::os::unix::fs::symlink;
@@ -828,6 +844,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn installs_missing_themes_preserving_edits_and_symlinks() {
         use std::os::unix::fs::symlink;

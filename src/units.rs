@@ -1,6 +1,6 @@
-#[cfg(all(target_pointer_width = "32", target_env = "musl"))]
+#[cfg(all(unix, target_pointer_width = "32", target_env = "musl"))]
 type TimeT = i64;
-#[cfg(not(all(target_pointer_width = "32", target_env = "musl")))]
+#[cfg(all(unix, not(all(target_pointer_width = "32", target_env = "musl"))))]
 type TimeT = std::os::raw::c_long;
 
 pub fn bytes(value: u64, base_10: bool) -> String {
@@ -160,6 +160,7 @@ pub fn column_slice(text: &str, start: usize, width: usize) -> String {
     output
 }
 
+#[cfg(unix)]
 pub fn char_width(ch: char) -> usize {
     unsafe extern "C" {
         fn wcwidth(ch: i32) -> i32;
@@ -167,7 +168,18 @@ pub fn char_width(ch: char) -> usize {
     let width = unsafe { wcwidth(ch as i32) };
     if width >= 0 {
         width as usize
-    } else if matches!(ch as u32, 0x0300..=0x036f | 0x1ab0..=0x1aff | 0x1dc0..=0x1dff | 0x20d0..=0x20ff | 0xfe00..=0xfe0f | 0xfe20..=0xfe2f | 0xe0100..=0xe01ef)
+    } else {
+        portable_char_width(ch)
+    }
+}
+
+#[cfg(windows)]
+pub fn char_width(ch: char) -> usize {
+    portable_char_width(ch)
+}
+
+fn portable_char_width(ch: char) -> usize {
+    if matches!(ch as u32, 0x0300..=0x036f | 0x1ab0..=0x1aff | 0x1dc0..=0x1dff | 0x20d0..=0x20ff | 0xfe00..=0xfe0f | 0xfe20..=0xfe2f | 0xe0100..=0xe01ef)
     {
         0
     } else if matches!(ch as u32, 0x1100..=0x115f | 0x2329..=0x232a | 0x2e80..=0xa4cf | 0xac00..=0xd7a3 | 0xf900..=0xfaff | 0xfe10..=0xfe19 | 0xfe30..=0xfe6f | 0xff00..=0xff60 | 0xffe0..=0xffe6 | 0x1f300..=0x1faff | 0x20000..=0x3fffd)
@@ -227,6 +239,55 @@ pub fn local_clock_format(format: &str) -> String {
         .into_owned()
 }
 
+#[cfg(not(unix))]
+pub fn local_clock_format(format: &str) -> String {
+    #[repr(C)]
+    #[derive(Default)]
+    struct SystemTime {
+        year: u16,
+        month: u16,
+        day_of_week: u16,
+        day: u16,
+        hour: u16,
+        minute: u16,
+        second: u16,
+        milliseconds: u16,
+    }
+    #[link(name = "Kernel32")]
+    unsafe extern "system" {
+        fn GetLocalTime(time: *mut SystemTime);
+    }
+    let mut time = SystemTime::default();
+    unsafe { GetLocalTime(&mut time) };
+    let mut output = String::new();
+    let mut chars = format.chars();
+    while let Some(character) = chars.next() {
+        if character != '%' {
+            output.push(character);
+            continue;
+        }
+        match chars.next() {
+            Some('%') => output.push('%'),
+            Some('Y') => output.push_str(&format!("{:04}", time.year)),
+            Some('m') => output.push_str(&format!("{:02}", time.month)),
+            Some('d') => output.push_str(&format!("{:02}", time.day)),
+            Some('H') => output.push_str(&format!("{:02}", time.hour)),
+            Some('M') => output.push_str(&format!("{:02}", time.minute)),
+            Some('S') => output.push_str(&format!("{:02}", time.second)),
+            Some('X') | Some('T') => output.push_str(&format!(
+                "{:02}:{:02}:{:02}",
+                time.hour, time.minute, time.second
+            )),
+            Some(other) => {
+                output.push('%');
+                output.push(other);
+            }
+            None => output.push('%'),
+        }
+    }
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,9 +328,4 @@ mod tests {
         assert!(year.chars().all(|ch| ch.is_ascii_digit()));
         assert_eq!(local_clock_format("literal"), "literal");
     }
-}
-
-#[cfg(not(unix))]
-pub fn local_clock_format(_format: &str) -> String {
-    String::new()
 }
