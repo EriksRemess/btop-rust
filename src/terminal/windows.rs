@@ -155,6 +155,7 @@ pub enum Key {
     F1,
     F2,
     Function(u8),
+    Resize,
     Mouse {
         button: u16,
         x: u16,
@@ -360,7 +361,7 @@ impl Terminal {
                 MOUSE_EVENT if self.mouse_enabled => {
                     (mouse_from_record(unsafe { record.event.mouse }), 1)
                 }
-                WINDOW_BUFFER_SIZE_EVENT => (Some(Key::Unknown), 1),
+                WINDOW_BUFFER_SIZE_EVENT => (Some(Key::Resize), 1),
                 _ => (None, 0),
             };
             if let Some(key) = key {
@@ -465,7 +466,11 @@ fn key_from_record(event: KeyEventRecord, high_surrogate: &mut Option<u16>) -> O
 fn mouse_from_record(event: MouseEventRecord) -> Option<Key> {
     let x = event.mouse_position.x.max(0) as u16;
     let y = event.mouse_position.y.max(0) as u16;
-    if event.event_flags == 0 {
+    if matches!(event.event_flags, 0 | 1) {
+        let motion = event.event_flags == 1;
+        if motion && event.button_state & 7 == 0 {
+            return None;
+        }
         let button = if event.button_state & 1 != 0 {
             0
         } else if event.button_state & 4 != 0 {
@@ -476,7 +481,7 @@ fn mouse_from_record(event: MouseEventRecord) -> Option<Key> {
             0
         };
         return Some(Key::Mouse {
-            button,
+            button: button + if motion { 32 } else { 0 },
             x,
             y,
             pressed: event.button_state != 0,
@@ -504,6 +509,50 @@ mod tests {
         assert_eq!(std::mem::size_of::<MouseEventRecord>(), 16);
         assert_eq!(std::mem::size_of::<InputRecord>(), 20);
         assert_eq!(std::mem::size_of::<ConsoleScreenBufferInfo>(), 22);
+    }
+
+    #[test]
+    fn mouse_drag_events_preserve_the_button_and_release() {
+        let event = MouseEventRecord {
+            mouse_position: Coord { x: 7, y: 11 },
+            button_state: 1,
+            control_key_state: 0,
+            event_flags: 1,
+        };
+        for (state, button) in [(1, 32), (4, 33), (2, 34)] {
+            assert_eq!(
+                mouse_from_record(MouseEventRecord {
+                    button_state: state,
+                    ..event
+                }),
+                Some(Key::Mouse {
+                    button,
+                    x: 7,
+                    y: 11,
+                    pressed: true
+                })
+            );
+        }
+        assert_eq!(
+            mouse_from_record(MouseEventRecord {
+                button_state: 0,
+                ..event
+            }),
+            None
+        );
+        assert_eq!(
+            mouse_from_record(MouseEventRecord {
+                button_state: 0,
+                event_flags: 0,
+                ..event
+            }),
+            Some(Key::Mouse {
+                button: 0,
+                x: 7,
+                y: 11,
+                pressed: false
+            })
+        );
     }
 
     #[test]

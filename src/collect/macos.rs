@@ -369,7 +369,7 @@ fn collect_disks(
                 io_supported: false,
                 read_per_second: 0,
                 write_per_second: 0,
-                io_activity: 0.0,
+                io_activity: None,
             })
         })
         .collect::<Vec<_>>();
@@ -494,16 +494,16 @@ fn macos_disk_counter_delta(
     old: super::DiskCounters,
     now: super::DiskCounters,
     elapsed: f64,
-) -> (u64, u64, f64) {
+) -> (u64, u64, Option<f64>) {
     let seconds = elapsed.max(0.001);
     let read = (now.sectors_read.saturating_sub(old.sectors_read) as f64 / seconds).round() as u64;
     let write =
         (now.sectors_written.saturating_sub(old.sectors_written) as f64 / seconds).round() as u64;
     let activity = if old.activity_valid && now.activity_valid {
         let busy_nanoseconds = now.activity.saturating_sub(old.activity) as f64;
-        (busy_nanoseconds / (seconds * 1_000_000_000.0) * 100.0).clamp(0.0, 100.0)
+        Some((busy_nanoseconds / (seconds * 1_000_000_000.0) * 100.0).clamp(0.0, 100.0))
     } else {
-        0.0
+        None
     };
     (read, write, activity)
 }
@@ -1838,14 +1838,14 @@ mod tests {
 
         assert_eq!(
             macos_disk_counter_delta(old, now, 2.0),
-            (2_000, 3_000, 25.0)
+            (2_000, 3_000, Some(25.0))
         );
 
         let unavailable = super::super::DiskCounters {
             activity_valid: false,
             ..now
         };
-        assert_eq!(macos_disk_counter_delta(old, unavailable, 2.0).2, 0.0);
+        assert_eq!(macos_disk_counter_delta(old, unavailable, 2.0).2, None);
     }
 
     #[test]

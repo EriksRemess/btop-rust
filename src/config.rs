@@ -256,10 +256,10 @@ impl Config {
 
     pub fn apply_cli(&mut self, cli: &Cli) {
         if let Some(update_ms) = cli.update_ms {
-            self.update_ms = update_ms.clamp(100, 86_400_000);
+            self.set_value("update_ms", update_ms.clamp(100, 86_400_000).to_string());
         }
         if let Some(filter) = &cli.filter {
-            self.process_filter.clone_from(filter);
+            self.set_value("proc_filter", filter.clone());
         }
         if let Some(force_tty) = cli.force_tty {
             self.tty_mode = force_tty;
@@ -356,7 +356,10 @@ impl Config {
     }
 
     pub fn bool_value(&self, key: &str) -> Option<bool> {
-        self.value(key).and_then(parse_bool)
+        BOOLS
+            .contains(&key)
+            .then(|| self.value(key).and_then(parse_bool))
+            .flatten()
     }
 
     pub fn set_value(&mut self, key: &str, value: impl Into<String>) {
@@ -380,6 +383,7 @@ impl Config {
                     _ => ProcessSort::CpuLazy,
                 };
             }
+            "proc_filter" => self.process_filter = value,
             "proc_reversed" => set_bool(&value, &mut self.process_reversed),
             "proc_per_core" => set_bool(&value, &mut self.process_per_core),
             "proc_mem_bytes" => set_bool(&value, &mut self.process_mem_bytes),
@@ -614,10 +618,12 @@ fn parse_file(text: &str) -> HashMap<String, String> {
                 return None;
             }
             let (key, value) = line.split_once('=')?;
-            Some((
-                key.trim().to_string(),
-                value.trim().trim_matches('"').to_string(),
-            ))
+            let value = value.trim();
+            let value = value
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+                .unwrap_or(value);
+            Some((key.trim().to_string(), value.to_string()))
         })
         .collect()
 }
@@ -640,61 +646,62 @@ fn parse_bool(value: &str) -> Option<bool> {
     }
 }
 
+const BOOLS: &[&str] = &[
+    "theme_background",
+    "truecolor",
+    "force_tty",
+    "vim_keys",
+    "disable_mouse",
+    "rounded_corners",
+    "terminal_sync",
+    "proc_reversed",
+    "proc_tree",
+    "proc_colors",
+    "proc_gradient",
+    "proc_per_core",
+    "proc_mem_bytes",
+    "proc_cpu_graphs",
+    "proc_info_smaps",
+    "proc_left",
+    "proc_filter_kernel",
+    "proc_follow_detailed",
+    "proc_aggregate",
+    "keep_dead_proc_usage",
+    "cpu_invert_lower",
+    "cpu_single_graph",
+    "cpu_bottom",
+    "show_uptime",
+    "show_cpu_watts",
+    "check_temp",
+    "show_coretemp",
+    "base_10_sizes",
+    "show_cpu_freq",
+    "background_update",
+    "mem_graphs",
+    "mem_below_net",
+    "zfs_arc_cached",
+    "show_swap",
+    "swap_disk",
+    "show_disks",
+    "only_physical",
+    "use_fstab",
+    "zfs_hide_datasets",
+    "disk_free_priv",
+    "show_io_stat",
+    "io_mode",
+    "io_graph_combined",
+    "swap_upload_download",
+    "net_auto",
+    "net_sync",
+    "show_battery",
+    "show_battery_watts",
+    "save_config_on_exit",
+    "nvml_measure_pcie_speeds",
+    "rsmi_measure_pcie_speeds",
+    "gpu_mirror_graph",
+];
+
 fn valid_config_value(name: &str, value: &str) -> Result<(), String> {
-    const BOOLS: &[&str] = &[
-        "theme_background",
-        "truecolor",
-        "force_tty",
-        "vim_keys",
-        "disable_mouse",
-        "rounded_corners",
-        "terminal_sync",
-        "proc_reversed",
-        "proc_tree",
-        "proc_colors",
-        "proc_gradient",
-        "proc_per_core",
-        "proc_mem_bytes",
-        "proc_cpu_graphs",
-        "proc_info_smaps",
-        "proc_left",
-        "proc_filter_kernel",
-        "proc_follow_detailed",
-        "proc_aggregate",
-        "keep_dead_proc_usage",
-        "cpu_invert_lower",
-        "cpu_single_graph",
-        "cpu_bottom",
-        "show_uptime",
-        "show_cpu_watts",
-        "check_temp",
-        "show_coretemp",
-        "base_10_sizes",
-        "show_cpu_freq",
-        "background_update",
-        "mem_graphs",
-        "mem_below_net",
-        "zfs_arc_cached",
-        "show_swap",
-        "swap_disk",
-        "show_disks",
-        "only_physical",
-        "use_fstab",
-        "zfs_hide_datasets",
-        "disk_free_priv",
-        "show_io_stat",
-        "io_mode",
-        "io_graph_combined",
-        "swap_upload_download",
-        "net_auto",
-        "net_sync",
-        "show_battery",
-        "show_battery_watts",
-        "save_config_on_exit",
-        "nvml_measure_pcie_speeds",
-        "rsmi_measure_pcie_speeds",
-        "gpu_mirror_graph",
-    ];
     if BOOLS.contains(&name) {
         return parse_bool(value)
             .map(|_| ())
@@ -740,16 +747,13 @@ fn valid_config_value(name: &str, value: &str) -> Result<(), String> {
             "cpu direct",
             "cpu lazy",
         ]),
-        "shown_boxes" => {
-            !value.is_empty()
-                && value.split_whitespace().all(|item| {
-                    matches!(item, "cpu" | "mem" | "net" | "proc")
-                        || item
-                            .strip_prefix("gpu")
-                            .and_then(|index| index.parse::<u8>().ok())
-                            .is_some_and(|index| index < 6)
-                })
-        }
+        "shown_boxes" => value.split_whitespace().all(|item| {
+            matches!(item, "cpu" | "mem" | "net" | "proc")
+                || item
+                    .strip_prefix("gpu")
+                    .and_then(|index| index.parse::<u8>().ok())
+                    .is_some_and(|index| index < 6)
+        }),
         "presets" => value.split_whitespace().all(valid_preset),
         "cpu_core_map" => value.split_whitespace().all(|mapping| {
             mapping.split_once(':').is_some_and(|(cpu, sensor)| {
@@ -794,6 +798,56 @@ fn valid_preset(preset: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn boolean_options_are_identified_by_schema_not_their_text() {
+        let mut config = Config::default();
+        for value in ["Auto", "True", "False"] {
+            config.set_value("base_10_bitrate", value);
+            assert_eq!(config.bool_value("base_10_bitrate"), None);
+        }
+        config.set_value("custom_cpu_name", "true");
+        assert_eq!(config.bool_value("custom_cpu_name"), None);
+        config.set_value("proc_reversed", "True");
+        assert_eq!(config.bool_value("proc_reversed"), Some(true));
+    }
+
+    #[test]
+    fn cli_overrides_and_filter_edits_update_both_config_views() {
+        let mut config = Config::default();
+        config.apply_cli(&Cli {
+            update_ms: Some(1700),
+            filter: Some("worker".into()),
+            ..Cli::default()
+        });
+        assert_eq!(config.update_ms, 1700);
+        assert_eq!(config.value("update_ms"), Some("1700"));
+        assert_eq!(config.process_filter, "worker");
+        assert_eq!(config.value("proc_filter"), Some("worker"));
+        config.set_value("proc_filter", "");
+        assert!(config.process_filter.is_empty());
+    }
+
+    #[test]
+    fn quoted_text_and_hidden_panels_survive_save_and_reload() {
+        let path =
+            std::env::temp_dir().join(format!("btoprs-roundtrip-{}.conf", std::process::id()));
+        fs::write(&path, "").unwrap();
+        let mut config = Config::load(Some(&path)).unwrap();
+        for name in ["cpu", "mem", "net", "proc"] {
+            config.toggle_box(name);
+        }
+        assert_eq!(config.shown, [false; 4]);
+        for text in ["\"worker\"", "\"leading", "trailing\"", "\"", "  spaces  "] {
+            config.set_value("custom_cpu_name", text);
+            config.save().unwrap();
+            config.reload().unwrap();
+            assert!(config.warnings.is_empty(), "{:?}", config.warnings);
+            assert_eq!(config.value("custom_cpu_name"), Some(text));
+            assert_eq!(config.shown, [false; 4]);
+        }
+        fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn imports_legacy_settings_without_writing_back_to_btop() {

@@ -983,7 +983,7 @@ fn collect_disks(
         let old = counters.and_then(|_| previous_disks.get(&mount).copied());
         let (read_per_second, write_per_second, io_activity) = old
             .zip(counters)
-            .map(|(old, now)| disk_counter_delta(old, now, 1, false, elapsed))
+            .map(|(old, now)| disk_counter_delta(old, now, 1, elapsed))
             .unwrap_or_default();
         if let Some(counters) = counters {
             current_disks.insert(mount.clone(), counters);

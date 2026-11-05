@@ -65,7 +65,7 @@ pub struct DiskSample {
     pub io_supported: bool,
     pub read_per_second: u64,
     pub write_per_second: u64,
-    pub io_activity: f64,
+    pub io_activity: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -622,7 +622,7 @@ impl Collector {
             else {
                 continue;
             };
-            let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
+            let Ok(stat) = fs::read(entry.path().join("stat")) else {
                 continue;
             };
             let Some(raw) = parse_process_stat(pid, &stat) else {
@@ -815,11 +815,14 @@ struct RawProcess {
     start_ticks: u64,
 }
 
-fn parse_process_stat(_pid: u32, stat: &str) -> Option<RawProcess> {
-    let open = stat.find('(')?;
-    let close = stat.rfind(')')?;
-    let name = stat[open + 1..close].to_string();
-    let rest: Vec<&str> = stat[close + 2..].split_whitespace().collect();
+fn parse_process_stat(_pid: u32, stat: &[u8]) -> Option<RawProcess> {
+    let open = stat.iter().position(|byte| *byte == b'(')?;
+    let close = stat.iter().rposition(|byte| *byte == b')')?;
+    let name = String::from_utf8_lossy(stat.get(open + 1..close)?).into_owned();
+    let rest: Vec<&str> = std::str::from_utf8(stat.get(close + 1..)?)
+        .ok()?
+        .split_whitespace()
+        .collect();
     Some(RawProcess {
         name,
         state: rest.first()?.chars().next()?,
@@ -973,9 +976,7 @@ fn collect_disks_for_mounts(
             let old = counters.and_then(|_| previous_disks.get(&counter_key).copied());
             let (read_per_second, write_per_second, io_activity) = old
                 .zip(counters)
-                .map(|(old, now)| {
-                    disk_counter_delta(old, now, block_size, filesystem == "zfs", elapsed)
-                })
+                .map(|(old, now)| disk_counter_delta(old, now, block_size, elapsed))
                 .unwrap_or_default();
             disks.push(DiskSample {
                 mount,
@@ -1004,9 +1005,8 @@ fn disk_counter_delta(
     old: DiskCounters,
     now: DiskCounters,
     block_size: u64,
-    zfs: bool,
     elapsed: f64,
-) -> (u64, u64, f64) {
+) -> (u64, u64, Option<f64>) {
     let seconds = elapsed.max(0.001);
     let read = now
         .sectors_read
@@ -1019,11 +1019,8 @@ fn disk_counter_delta(
         .saturating_mul(block_size) as f64
         / seconds;
     let activity_delta = now.activity.saturating_sub(old.activity) as f64;
-    let activity = if zfs {
-        activity_delta
-    } else {
-        (activity_delta / seconds / 10.0).clamp(0.0, 100.0)
-    };
+    let activity = (old.activity_valid && now.activity_valid)
+        .then(|| (activity_delta / seconds / 10.0).clamp(0.0, 100.0));
     (read.round() as u64, write.round() as u64, activity)
 }
 
@@ -1080,8 +1077,6 @@ fn read_zfs_counters(root: &Path, device: &str, pool_total: bool) -> Option<Disk
 
 fn parse_zfs_objset(text: &str) -> Option<(String, DiskCounters)> {
     let mut name = None;
-    let mut reads = 0;
-    let mut writes = 0;
     let mut bytes_read = 0;
     let mut bytes_written = 0;
     for line in text.lines() {
@@ -1095,8 +1090,6 @@ fn parse_zfs_objset(text: &str) -> Option<(String, DiskCounters)> {
         };
         match label {
             "dataset_name" => name = Some(value.to_string()),
-            "reads" => reads = value.parse().unwrap_or(0),
-            "writes" => writes = value.parse().unwrap_or(0),
             "nread" => bytes_read = value.parse().unwrap_or(0),
             "nwritten" => bytes_written = value.parse().unwrap_or(0),
             _ => {}
@@ -1107,8 +1100,9 @@ fn parse_zfs_objset(text: &str) -> Option<(String, DiskCounters)> {
         DiskCounters {
             sectors_read: bytes_read,
             sectors_written: bytes_written,
-            activity: reads + writes,
-            activity_valid: true,
+            // Objset counters describe operation counts, not busy time.
+            activity: 0,
+            activity_valid: false,
         },
     ))
 }
@@ -2118,7 +2112,7 @@ mod tests {
                     disk.write_per_second,
                     disk.io_activity
                 ),
-                (2560, 5120, 25.0)
+                (2560, 5120, Some(25.0))
             );
         }
         collect_disks_for_mounts(&config, &mut previous, 2.0, "", &directory);
@@ -2166,10 +2160,27 @@ mod tests {
 
     #[test]
     fn parses_process_names_with_spaces() {
-        let stat = "42 (a process name) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 4 18 19 20 100";
+        let stat = b"42 (a process name) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 4 18 19 20 100";
         let parsed = parse_process_stat(42, stat).unwrap();
         assert_eq!(parsed.name, "a process name");
         assert_eq!(parsed.parent, 1);
+    }
+
+    #[test]
+    fn process_names_accept_non_utf8_and_parentheses_without_losing_metrics() {
+        let stat = b"42 (a )\xff( name) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 4 18 19 20 100";
+        let parsed = parse_process_stat(42, stat).unwrap();
+        assert_eq!(parsed.name, "a )\u{fffd}( name");
+        assert_eq!(parsed.state, 'S');
+        assert_eq!(parsed.parent, 1);
+        assert_eq!(parsed.user_ticks, 11);
+        assert_eq!(parsed.system_ticks, 12);
+        assert_eq!(parsed.threads, 4);
+        assert_eq!(parsed.start_ticks, 19);
+        assert_eq!(parsed.rss_pages, 100);
+        for malformed in [b"42 ) (".as_slice(), b"42 ()", b"42 (name) \xff"] {
+            assert!(parse_process_stat(42, malformed).is_none());
+        }
     }
 
     #[test]
@@ -2202,10 +2213,25 @@ mod tests {
             activity_valid: true,
         };
         assert_eq!(
-            disk_counter_delta(old, now, 512, false, 2.0),
-            (2_560, 5_120, 25.0)
+            disk_counter_delta(old, now, 512, 2.0),
+            (2_560, 5_120, Some(25.0))
         );
-        assert_eq!(disk_counter_delta(old, now, 1, true, 2.0), (5, 10, 500.0));
+        let unavailable = DiskCounters {
+            activity_valid: false,
+            ..now
+        };
+        assert_eq!(disk_counter_delta(old, unavailable, 1, 2.0), (5, 10, None));
+        assert_eq!(disk_counter_delta(old, old, 512, 2.0), (0, 0, Some(0.0)));
+    }
+
+    #[test]
+    fn zfs_deltas_keep_byte_rates_without_inventing_busy_time() {
+        let (_, old) = parse_zfs_objset(
+            "dataset_name 7 tank/home\nreads 4 10\nwrites 4 20\nnread 4 4096\nnwritten 4 8192\n",
+        )
+        .unwrap();
+        let (_, now) = parse_zfs_objset("dataset_name 7 tank/home\nreads 4 1010\nwrites 4 2020\nnread 4 8192\nnwritten 4 16384\n").unwrap();
+        assert_eq!(disk_counter_delta(old, now, 1, 2.0), (2048, 4096, None));
     }
 
     #[test]
@@ -2409,8 +2435,8 @@ mod tests {
             Some(DiskCounters {
                 sectors_read: 4096,
                 sectors_written: 8192,
-                activity: 14,
-                activity_valid: true,
+                activity: 0,
+                activity_valid: false,
             })
         );
         assert_eq!(
@@ -2418,8 +2444,8 @@ mod tests {
             Some(DiskCounters {
                 sectors_read: 5120,
                 sectors_written: 10240,
-                activity: 19,
-                activity_valid: true,
+                activity: 0,
+                activity_valid: false,
             })
         );
 

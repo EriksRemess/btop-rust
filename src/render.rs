@@ -521,7 +521,11 @@ impl AppState {
             let history = self.disk_histories.entry(disk.mount.clone()).or_default();
             push(&mut history.read, disk.read_per_second as f64);
             push(&mut history.write, disk.write_per_second as f64);
-            push(&mut history.activity, disk.io_activity);
+            if let Some(activity) = disk.io_activity {
+                push(&mut history.activity, activity);
+            } else {
+                history.activity.clear();
+            }
         }
         let (download_speed, upload_speed) = if sample.network.connected {
             (
@@ -729,10 +733,16 @@ impl AppState {
         if key == Key::CtrlC {
             return true;
         }
+        #[cfg(windows)]
+        if key == Key::Resize {
+            self.needs_redraw = true;
+            return false;
+        }
         if self.filter_editing {
             match key {
                 Key::Enter => {
-                    self.config.process_filter.clone_from(&self.filter_buffer);
+                    self.config
+                        .set_value("proc_filter", self.filter_buffer.clone());
                     self.filter_editing = false;
                 }
                 Key::Escape => {
@@ -837,12 +847,12 @@ impl AppState {
                 }
                 Key::Backspace => {
                     self.signal_buffer.pop();
-                    selected = self.signal_buffer.parse().unwrap_or(0);
+                    selected = parse_signal_number(&self.signal_buffer).unwrap_or(0);
                     self.overlay = Overlay::SignalChoose { pid, selected };
                 }
                 Key::Char(ch) if ch.is_ascii_digit() => {
                     self.signal_buffer.push(ch);
-                    selected = self.signal_buffer.parse::<u8>().unwrap_or(0).min(64);
+                    selected = parse_signal_number(&self.signal_buffer).unwrap_or(0);
                     self.overlay = Overlay::SignalChoose { pid, selected };
                 }
                 Key::Enter | Key::Char(' ') if selected > 0 => {
@@ -987,12 +997,11 @@ impl AppState {
                 Key::Escape | Key::Enter | Key::Backspace | Key::Char('q' | 'h' | ' ') => {
                     self.overlay = Overlay::None
                 }
-                Key::Down | Key::PageDown | Key::Char('j') => {
-                    self.help_page = (self.help_page + 1) % 2
+                Key::Down | Key::PageDown | Key::Char('j') | Key::Mouse { button: 65, .. } => {
+                    self.move_help_page(true)
                 }
-                Key::Up | Key::PageUp | Key::Char('k') => self.help_page = (self.help_page + 1) % 2,
-                Key::Mouse { button: 64, .. } | Key::Mouse { button: 65, .. } => {
-                    self.help_page = (self.help_page + 1) % 2
+                Key::Up | Key::PageUp | Key::Char('k') | Key::Mouse { button: 64, .. } => {
+                    self.move_help_page(false)
                 }
                 Key::Mouse {
                     button: 0,
@@ -1165,11 +1174,11 @@ impl AppState {
             Key::Char('N') => self.activate_process_control(ProcessControlAction::Nice),
             Key::Char('F') => self.activate_process_control(ProcessControlAction::Follow),
             Key::Char('c') => self.activate_process_control(ProcessControlAction::PerCore),
-            Key::Char('%') => self.config.process_mem_bytes ^= true,
+            Key::Char('%') => self.config.flip_value("proc_mem_bytes"),
             Key::Char('/') | Key::Char('f') => {
                 self.activate_process_control(ProcessControlAction::Filter)
             }
-            Key::Delete => self.config.process_filter.clear(),
+            Key::Delete => self.config.set_value("proc_filter", ""),
             Key::Char('d') => self.activate_memory_control(MemoryControlAction::Disks),
             Key::Char('i') if self.config.show_disks => {
                 self.activate_memory_control(MemoryControlAction::IoMode)
@@ -1192,6 +1201,7 @@ impl AppState {
     }
 
     fn activate_main_menu_item(&mut self, selected: u8) -> bool {
+        self.needs_redraw = true;
         match selected {
             0 => {
                 self.options_selected = 0;
@@ -1219,7 +1229,8 @@ impl AppState {
         } else {
             (index + ProcessSort::ALL.len() - 1) % ProcessSort::ALL.len()
         };
-        self.config.process_sort = ProcessSort::ALL[next];
+        self.config
+            .set_value("proc_sorting", ProcessSort::ALL[next].label());
     }
 
     fn options_per_page(&self) -> usize {
@@ -1347,7 +1358,7 @@ impl AppState {
                 .value(option)
                 .and_then(|value| value.parse::<i64>().ok())
                 .unwrap_or(0);
-            let mut next = current + i64::from(direction) * step;
+            let mut next = current.saturating_add(i64::from(direction) * step);
             if option == "update_ms" {
                 next = next.clamp(100, 86_400_000);
             } else if option == "proc_tree_auto_collapse" {
@@ -1393,14 +1404,13 @@ impl AppState {
             })
         } else if option == "shown_boxes" {
             let boxes: Vec<&str> = self.options_buffer.split_whitespace().collect();
-            !boxes.is_empty()
-                && boxes.iter().all(|name| {
-                    matches!(*name, "cpu" | "mem" | "net" | "proc")
-                        || name
-                            .strip_prefix("gpu")
-                            .and_then(|index| index.parse::<usize>().ok())
-                            .is_some_and(|index| index < self.sample.gpus.len())
-                })
+            boxes.iter().all(|name| {
+                matches!(*name, "cpu" | "mem" | "net" | "proc")
+                    || name
+                        .strip_prefix("gpu")
+                        .and_then(|index| index.parse::<usize>().ok())
+                        .is_some_and(|index| index < self.sample.gpus.len())
+            })
         } else {
             true
         };
@@ -1544,7 +1554,7 @@ impl AppState {
         } else {
             (current + list.len() - 1) % list.len()
         };
-        self.config.net_iface = Some(list[next].clone());
+        self.config.set_value("net_iface", list[next].clone());
         self.collection_requested = true;
     }
 
@@ -1580,8 +1590,8 @@ impl AppState {
 
     fn activate_network_control(&mut self, action: NetworkAction) {
         match action {
-            NetworkAction::Sync => self.config.net_sync ^= true,
-            NetworkAction::Auto => self.config.net_auto ^= true,
+            NetworkAction::Sync => self.config.flip_value("net_sync"),
+            NetworkAction::Auto => self.config.flip_value("net_auto"),
             NetworkAction::Zero => self.toggle_network_zero(),
             NetworkAction::Previous => self.cycle_interface(false),
             NetworkAction::Next => self.cycle_interface(true),
@@ -1595,13 +1605,13 @@ impl AppState {
                 self.filter_buffer.clone_from(&self.config.process_filter);
             }
             ProcessControlAction::DeleteFilter => {
-                self.config.process_filter.clear();
+                self.config.set_value("proc_filter", "");
                 self.filter_buffer.clear();
             }
             ProcessControlAction::Pause => self.config.pause_processes ^= true,
-            ProcessControlAction::PerCore => self.config.process_per_core ^= true,
-            ProcessControlAction::Reverse => self.config.process_reversed ^= true,
-            ProcessControlAction::Tree => self.config.process_tree ^= true,
+            ProcessControlAction::PerCore => self.config.flip_value("proc_per_core"),
+            ProcessControlAction::Reverse => self.config.flip_value("proc_reversed"),
+            ProcessControlAction::Tree => self.config.flip_value("proc_tree"),
             ProcessControlAction::SortPrevious => self.rotate_sort(false),
             ProcessControlAction::SortNext => self.rotate_sort(true),
             ProcessControlAction::Info => self.toggle_process_details(),
@@ -1618,17 +1628,27 @@ impl AppState {
             CpuControlAction::Menu => self.overlay = Overlay::Main { selected: 0 },
             CpuControlAction::Preset => self.config.cycle_preset(true),
             CpuControlAction::DecreaseUpdate => {
-                self.config.update_ms = self.config.update_ms.saturating_sub(100).max(100)
+                self.config.set_value(
+                    "update_ms",
+                    self.config
+                        .update_ms
+                        .saturating_sub(100)
+                        .max(100)
+                        .to_string(),
+                );
             }
             CpuControlAction::IncreaseUpdate => {
-                self.config.update_ms = (self.config.update_ms + 100).min(86_400_000)
+                self.config.set_value(
+                    "update_ms",
+                    (self.config.update_ms + 100).min(86_400_000).to_string(),
+                );
             }
         }
     }
 
     fn activate_memory_control(&mut self, action: MemoryControlAction) {
         match action {
-            MemoryControlAction::Disks => self.config.show_disks ^= true,
+            MemoryControlAction::Disks => self.config.flip_value("show_disks"),
             MemoryControlAction::IoMode => self.config.flip_value("io_mode"),
         }
     }
@@ -1931,6 +1951,17 @@ impl AppState {
         false
     }
 
+    fn move_help_page(&mut self, forward: bool) {
+        let size = self.last_size.unwrap_or(Size { cols: 80, rows: 24 });
+        let area = help_geometry(size.cols as usize, size.rows as usize);
+        let pages = HELP_ROWS.div_ceil(area.h.saturating_sub(3).max(1));
+        self.help_page = if forward {
+            (self.help_page + 1) % pages
+        } else {
+            (self.help_page + pages - 1) % pages
+        };
+    }
+
     fn select_from_disk_scrollbar(&mut self, y: usize) {
         let Some(scrollbar) = self.disk_scrollbar else {
             return;
@@ -1998,10 +2029,16 @@ impl Renderer {
         let selected_option = app.editing_option.or_else(|| app.current_option());
         app.clear_mouse_regions();
         let mut needed = minimum_size(&app.config, &app.sample.gpus);
-        if app.overlay == Overlay::Options {
-            needed.cols = needed.cols.max(80);
-            needed.rows = needed.rows.max(13);
-        }
+        let (overlay_cols, overlay_rows) = match app.overlay {
+            Overlay::None => (0, 0),
+            Overlay::Main { .. } => (56, 16),
+            Overlay::Options | Overlay::Help => (80, 13),
+            Overlay::Signal { .. } | Overlay::OperationError { .. } => (54, 11),
+            Overlay::SignalChoose { .. } => (80, 21),
+            Overlay::Renice { .. } => (54, 15),
+        };
+        needed.cols = needed.cols.max(overlay_cols);
+        needed.rows = needed.rows.max(overlay_rows);
         let too_small_for_layout = size.cols < needed.cols || size.rows < needed.rows;
         app.last_size = (!too_small_for_layout).then_some(size);
         // Pagination is presentation state; resizing must retain the selected
@@ -2194,7 +2231,12 @@ impl Renderer {
         }
         match app.overlay {
             Overlay::Main { selected } => draw_main_menu(&mut canvas, app, selected),
-            Overlay::Help => draw_help(&mut canvas, app.help_page),
+            Overlay::Help => {
+                let area = help_geometry(width, height);
+                let pages = HELP_ROWS.div_ceil(area.h.saturating_sub(3).max(1));
+                app.help_page = app.help_page.min(pages - 1);
+                draw_help(&mut canvas, app.help_page);
+            }
             Overlay::Options => draw_options(
                 &mut canvas,
                 app,
@@ -4317,14 +4359,17 @@ fn draw_disks_capacity(
             swap,
         );
     }
-    let disk_ios = disks.iter().filter(|disk| disk.io_supported).count();
+    let disk_ios = disks
+        .iter()
+        .filter(|disk| disk.io_activity.is_some())
+        .count();
     let io_rows = usize::from(show_io_stat) * disk_ios;
     let show_free = disks.len() * 3 + io_rows <= area.h.saturating_sub(1);
     let roomy_gap = disks.len() * 4 + io_rows <= area.h.saturating_sub(1);
     let layout: Vec<_> = disks
         .iter()
         .map(|disk| {
-            let io_row = usize::from(show_io_stat && disk.io_supported);
+            let io_row = usize::from(show_io_stat && disk.io_activity.is_some());
             let content_rows = 2 + io_row + usize::from(show_free);
             (content_rows, content_rows + usize::from(roomy_gap))
         })
@@ -4333,7 +4378,7 @@ fn draw_disks_capacity(
     app.disk_offset = app.disk_offset.min(maximum_offset);
     let disk_offset = app.disk_offset;
     for disk in disks.into_iter().skip(disk_offset) {
-        let io_row = usize::from(show_io_stat && disk.io_supported);
+        let io_row = usize::from(show_io_stat && disk.io_activity.is_some());
         let content_rows = 2 + io_row + usize::from(show_free);
         let disk_rows = content_rows + usize::from(roomy_gap);
         if cy + content_rows > area.h.saturating_sub(2) {
@@ -4513,26 +4558,33 @@ fn draw_disks_io(
     }
     let graph_height = area
         .h
-        .saturating_sub(2 + disks.len() * 2)
+        .saturating_sub(
+            2 + disks
+                .iter()
+                .map(|disk| 1 + usize::from(disk.io_activity.is_some()))
+                .sum::<usize>(),
+        )
         .checked_div(disks.len())
         .unwrap_or(0)
         .max(if combined { 1 } else { 2 });
     let half_height = graph_height.div_ceil(2);
     let custom_speeds = disk_io_speeds(app.config.value("io_graph_speeds").unwrap_or(""));
-    let visible = area
-        .h
-        .saturating_sub(2)
-        .checked_div(graph_height + 2)
-        .unwrap_or(0)
-        .max(1);
-    let maximum_offset = disks.len().saturating_sub(visible);
+    let layout: Vec<_> = disks
+        .iter()
+        .map(|disk| {
+            let rows = graph_height + 1 + usize::from(disk.io_activity.is_some());
+            (rows, rows)
+        })
+        .collect();
+    let maximum_offset = last_disk_page_start(&layout, area.h.saturating_sub(2));
     app.disk_offset = app.disk_offset.min(maximum_offset);
     let disk_offset = app.disk_offset;
     let mut cy = 0usize;
     for disk in disks.into_iter().skip(disk_offset) {
-        // The divider starts at relative row `cy + 1`; the final graph row is
-        // `cy + graph_height + 2`. Keep that row above the bottom border.
-        if cy.saturating_add(graph_height).saturating_add(2) > area.h.saturating_sub(2) {
+        let activity_rows = usize::from(disk.io_activity.is_some());
+        let content_rows = graph_height + 1 + activity_rows;
+        // Keep the final graph row above the bottom border.
+        if cy.saturating_add(content_rows) > area.h.saturating_sub(2) {
             break;
         }
         let y = area.y + 1 + cy;
@@ -4589,7 +4641,9 @@ fn draw_disks_io(
             theme::TITLE,
         );
         let activity_y = y + 1;
-        if let Some(history) = app.disk_histories.get(&disk.mount) {
+        if activity_rows > 0
+            && let Some(history) = app.disk_histories.get(&disk.mount)
+        {
             draw_graph_background(
                 canvas,
                 Rect::new(divider + 6, activity_y, disks_width.saturating_sub(6), 1),
@@ -4604,8 +4658,10 @@ fn draw_disks_io(
                 false,
             );
         }
-        canvas.text(divider + 2, activity_y, "IO%", theme::MAIN);
-        let graph_y = y + 2;
+        if activity_rows > 0 {
+            canvas.text(divider + 2, activity_y, "IO%", theme::MAIN);
+        }
+        let graph_y = y + 1 + activity_rows;
         let maximum = custom_speeds
             .get(&disk.mount)
             .copied()
@@ -4651,7 +4707,7 @@ fn draw_disks_io(
                 );
             }
         }
-        cy += graph_height + 2;
+        cy += content_rows;
     }
     if cy < area.h - 2 {
         draw_disk_divider(canvas, area, divider, area.y + 1 + cy);
@@ -6711,8 +6767,22 @@ fn draw_main_menu(canvas: &mut Canvas, app: &mut AppState, selected: u8) {
     }
 }
 
+const HELP_ROWS: usize = 46;
+
+fn help_geometry(width: usize, height: usize) -> Rect {
+    let panel_width = 78.min(width.saturating_sub(2));
+    let banner_y = height.saturating_div(2).saturating_sub(6 + HELP_ROWS / 2);
+    let y = banner_y + 7;
+    Rect::new(
+        source_center_x(width, panel_width),
+        y,
+        panel_width,
+        height.saturating_sub(y).min(HELP_ROWS + 3),
+    )
+}
+
 fn draw_help(canvas: &mut Canvas, page: usize) {
-    const HELP: [(&str, &str); 46] = [
+    const HELP: [(&str, &str); HELP_ROWS] = [
         ("Mouse 1", "Clicks buttons and selects in process list."),
         (
             "Mouse scroll",
@@ -6772,19 +6842,8 @@ fn draw_help(canvas: &mut Canvas, page: usize) {
         ("", "For bug reporting and project updates, visit:"),
         ("", "https://github.com/EriksRemess/btop-rust"),
     ];
-    let panel_width = 78.min(canvas.width.saturating_sub(2));
-    let height = canvas.height.saturating_sub(6).min(HELP.len() + 3);
-    let banner_y = canvas
-        .height
-        .saturating_div(2)
-        .saturating_sub(6 + HELP.len() / 2);
-    draw_banner(canvas, banner_y);
-    let area = Rect::new(
-        source_center_x(canvas.width, panel_width),
-        banner_y + 7,
-        panel_width,
-        height,
-    );
+    let area = help_geometry(canvas.width, canvas.height);
+    draw_banner(canvas, area.y - 7);
     canvas.shadow(area);
     canvas.panel(area, "help", theme::HI, None);
     canvas.text_bold(
@@ -6793,14 +6852,14 @@ fn draw_help(canvas: &mut Canvas, page: usize) {
         &format!("{}Description:", center_text("Key:", 20)),
         theme::TITLE,
     );
-    let per_page = height.saturating_sub(3);
+    let per_page = area.h.saturating_sub(3).max(1);
     for (row, (key, description)) in HELP.iter().skip(page * per_page).take(per_page).enumerate() {
         let y = area.y + 2 + row;
         canvas.text_bold(area.x + 1, y, &center_text(key, 20), theme::HI);
         canvas.text(area.x + 21, y, description, theme::MAIN);
     }
     if HELP.len() > per_page {
-        let label = format!("↑ page {}/2 ↓", page + 1);
+        let label = format!("↑ page {}/{} ↓", page + 1, HELP.len().div_ceil(per_page));
         canvas.control_footer(
             area.x + 2,
             area.y + area.h - 1,
@@ -7960,6 +8019,20 @@ fn signal_name(signal: i32) -> &'static str {
         .unwrap_or("signal")
 }
 
+#[cfg(any(windows, test))]
+fn windows_signal_supported(signal: i32) -> bool {
+    matches!(signal, 9 | 15)
+}
+
+fn parse_signal_number(text: &str) -> Option<u8> {
+    let signal = text.parse::<u8>().ok()?;
+    #[cfg(windows)]
+    let valid = windows_signal_supported(i32::from(signal));
+    #[cfg(unix)]
+    let valid = (1..=64).contains(&signal);
+    valid.then_some(signal)
+}
+
 fn selectable_signals() -> impl Iterator<Item = (usize, &'static str)> {
     SIGNALS
         .iter()
@@ -8074,7 +8147,7 @@ fn draw_dialog_button(canvas: &mut Canvas, area: Rect, label: &str, selected: bo
 
 fn draw_signal_chooser(canvas: &mut Canvas, app: &mut AppState, pid: u32, selected: u8) {
     app.signal_choice_hitboxes.clear();
-    let width = 78.min(canvas.width.saturating_sub(4));
+    let width = 78.min(canvas.width.saturating_sub(2));
     let height = 19.min(canvas.height.saturating_sub(2));
     let area = Rect::new(
         canvas.width.saturating_sub(width) / 2,
@@ -8328,6 +8401,9 @@ fn send_signal(pid: u32, signal: i32) -> Result<(), i32> {
 
 #[cfg(windows)]
 fn send_signal(pid: u32, signal: i32) -> Result<(), i32> {
+    if !windows_signal_supported(signal) {
+        return Err(87); // ERROR_INVALID_PARAMETER; never turn an unknown signal into KILL.
+    }
     const PROCESS_TERMINATE: u32 = 0x0001;
     const ERROR_NOT_SUPPORTED: i32 = 50;
     const WM_CLOSE: u32 = 0x0010;
@@ -8373,13 +8449,13 @@ fn send_signal(pid: u32, signal: i32) -> Result<(), i32> {
     if process == 0 {
         return Err(last_errno());
     }
-    let result = unsafe { TerminateProcess(process, 1) };
-    unsafe { CloseHandle(process) };
-    if result != 0 {
+    let result = if unsafe { TerminateProcess(process, 1) } != 0 {
         Ok(())
     } else {
         Err(last_errno())
-    }
+    };
+    unsafe { CloseHandle(process) };
+    result
 }
 
 fn parse_nice_value(text: &str) -> Option<i32> {
@@ -8412,13 +8488,13 @@ fn set_nice(pid: u32, value: i32) -> Result<(), i32> {
     if process == 0 {
         return Err(last_errno());
     }
-    let result = unsafe { SetPriorityClass(process, priority) };
-    unsafe { CloseHandle(process) };
-    if result != 0 {
+    let result = if unsafe { SetPriorityClass(process, priority) } != 0 {
         Ok(())
     } else {
         Err(last_errno())
-    }
+    };
+    unsafe { CloseHandle(process) };
+    result
 }
 
 #[cfg(windows)]
@@ -9679,6 +9755,51 @@ mod tests {
     }
 
     #[test]
+    fn overlays_survive_tiny_windows_with_hidden_or_single_panels() {
+        for shown in ["", "net", "mem", "proc", "cpu", "cpu mem net proc"] {
+            let mut app = app();
+            app.config.set_value("shown_boxes", shown);
+            let mut renderer = Renderer::new();
+            for overlay in [
+                Overlay::None,
+                Overlay::Main { selected: 0 },
+                Overlay::Help,
+                Overlay::Options,
+                Overlay::Signal {
+                    pid: 42,
+                    signal: 15,
+                },
+                Overlay::SignalChoose {
+                    pid: 42,
+                    selected: 9,
+                },
+                Overlay::Renice { pid: 42, value: 0 },
+                Overlay::OperationError {
+                    operation: Operation::Signal,
+                    errno: 1,
+                },
+            ] {
+                app.overlay = overlay;
+                for (cols, rows) in [
+                    (0, 0),
+                    (1, 1),
+                    (20, 5),
+                    (36, 6),
+                    (44, 16),
+                    (60, 8),
+                    (80, 24),
+                    (120, 40),
+                ] {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        renderer.render(Size { cols, rows }, &mut app)
+                    }));
+                    assert!(result.is_ok(), "{shown:?}, {overlay:?}, {cols}x{rows}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn wide_text_outside_canvas_is_clipped_and_small_options_can_recover() {
         let mut canvas = Canvas::new(10, 1);
         canvas.text(0, 1, "界", theme::MAIN);
@@ -9734,6 +9855,208 @@ mod tests {
             rows: 40,
         });
         app
+    }
+
+    fn select_option(app: &mut AppState, name: &str) {
+        let (category, index) = OPTION_CATEGORIES
+            .iter()
+            .enumerate()
+            .find_map(|(category, options)| {
+                options
+                    .iter()
+                    .position(|option| *option == name)
+                    .map(|index| (category, index))
+            })
+            .unwrap();
+        app.options_category = category;
+        app.options_page = index / app.options_per_page();
+        app.options_selected = index % app.options_per_page();
+    }
+
+    #[test]
+    fn unsupported_signal_numbers_are_rejected_instead_of_clamped() {
+        for number in ["", "0", "65", "99", "256", "-1"] {
+            assert_eq!(parse_signal_number(number), None);
+        }
+        for number in [9, 15] {
+            assert_eq!(parse_signal_number(&number.to_string()), Some(number));
+            assert!(windows_signal_supported(i32::from(number)));
+        }
+        for number in [-1, 0, 1, 19, 64, 255] {
+            assert!(!windows_signal_supported(number));
+            #[cfg(windows)]
+            assert_eq!(send_signal(0, number), Err(87));
+        }
+        let mut app = app();
+        app.overlay = Overlay::SignalChoose {
+            pid: 42,
+            selected: 15,
+        };
+        app.handle_key(Key::Char('9'));
+        app.handle_key(Key::Char('9'));
+        assert_eq!(
+            app.overlay,
+            Overlay::SignalChoose {
+                pid: 42,
+                selected: 0
+            }
+        );
+        app.handle_key(Key::Enter);
+        assert_eq!(
+            app.overlay,
+            Overlay::SignalChoose {
+                pid: 42,
+                selected: 0
+            }
+        );
+        app.handle_key(Key::Backspace);
+        assert_eq!(
+            app.overlay,
+            Overlay::SignalChoose {
+                pid: 42,
+                selected: 9
+            }
+        );
+    }
+
+    #[test]
+    fn shortcuts_keep_options_in_sync_and_can_be_toggled_back() {
+        let mut app = app();
+        for (key, option, expected) in [
+            ('r', "proc_reversed", true),
+            ('e', "proc_tree", true),
+            ('c', "proc_per_core", true),
+            ('%', "proc_mem_bytes", false),
+            ('d', "show_disks", false),
+        ] {
+            app.handle_key(Key::Char(key));
+            assert_eq!(app.config.bool_value(option), Some(expected), "{option}");
+            select_option(&mut app, option);
+            app.change_option(1);
+            assert_eq!(app.config.bool_value(option), Some(!expected), "{option}");
+        }
+        assert!(!app.config.process_reversed);
+        assert!(!app.config.process_tree);
+        assert!(!app.config.process_per_core);
+        assert!(app.config.process_mem_bytes);
+        assert!(app.config.show_disks);
+        app.rotate_sort(true);
+        assert_eq!(app.config.value("proc_sorting"), Some("pid"));
+        app.activate_cpu_control(CpuControlAction::IncreaseUpdate);
+        assert_eq!(app.config.value("update_ms"), Some("2100"));
+        for (action, option) in [
+            (NetworkAction::Auto, "net_auto"),
+            (NetworkAction::Sync, "net_sync"),
+        ] {
+            app.activate_network_control(action);
+            assert_eq!(app.config.bool_value(option), Some(false));
+            select_option(&mut app, option);
+            app.change_option(1);
+            assert_eq!(app.config.bool_value(option), Some(true));
+        }
+        app.sample.network.interfaces = vec!["first".into(), "second".into()];
+        app.cycle_interface(true);
+        assert_eq!(
+            app.config.value("net_iface"),
+            app.config.net_iface.as_deref()
+        );
+        app.handle_key(Key::Char('/'));
+        app.handle_key(Key::Char('x'));
+        app.handle_key(Key::Enter);
+        assert_eq!(app.config.value("proc_filter"), Some("x"));
+        assert_eq!(app.config.process_filter, "x");
+        app.handle_key(Key::Delete);
+        assert_eq!(app.config.value("proc_filter"), Some(""));
+        assert!(app.config.process_filter.is_empty());
+    }
+
+    #[test]
+    fn bitrate_choices_cycle_both_directions_and_survive_reload() {
+        let path = std::env::temp_dir().join(format!("btoprs-bitrate-{}.conf", std::process::id()));
+        std::fs::write(&path, "base_10_bitrate = \"Auto\"\n").unwrap();
+        let mut app = app();
+        app.config = Config::load(Some(&path)).unwrap();
+        select_option(&mut app, "base_10_bitrate");
+        for (direction, expected) in [
+            (1, "True"),
+            (1, "False"),
+            (1, "Auto"),
+            (-1, "False"),
+            (-1, "True"),
+            (-1, "Auto"),
+        ] {
+            app.change_option(direction);
+            assert_eq!(app.config.value("base_10_bitrate"), Some(expected));
+            app.config.save().unwrap();
+            app.config.reload().unwrap();
+            assert!(app.config.warnings.is_empty());
+            assert_eq!(app.config.value("base_10_bitrate"), Some(expected));
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn integer_option_arrows_saturate_at_representable_limits() {
+        let mut app = app();
+        for option in ["net_download", "net_upload"] {
+            select_option(&mut app, option);
+            app.config.set_value(option, i64::MAX.to_string());
+            app.change_option(1);
+            assert_eq!(app.config.value(option), Some("9223372036854775807"));
+            app.change_option(-1);
+            assert_eq!(app.config.value(option), Some("9223372036854775806"));
+            app.config.set_value(option, i64::MIN.to_string());
+            app.change_option(-1);
+            assert_eq!(app.config.value(option), Some("-9223372036854775808"));
+        }
+    }
+
+    #[test]
+    fn opening_main_menu_items_requests_an_immediate_redraw() {
+        for (selected, expected) in [(0, Overlay::Options), (1, Overlay::Help)] {
+            let mut app = app();
+            app.overlay = Overlay::Main { selected };
+            app.needs_redraw = false;
+            assert!(!app.handle_key(Key::Enter));
+            assert_eq!(app.overlay, expected);
+            assert!(app.needs_redraw);
+
+            app.overlay = Overlay::Main { selected };
+            Renderer::new().render(
+                Size {
+                    cols: 120,
+                    rows: 40,
+                },
+                &mut app,
+            );
+            let hitbox = *app
+                .main_menu_hitboxes
+                .iter()
+                .find(|hitbox| hitbox.item == selected)
+                .unwrap();
+            app.needs_redraw = false;
+            assert!(!app.handle_key(Key::Mouse {
+                button: 0,
+                x: hitbox.x as u16,
+                y: hitbox.y as u16,
+                pressed: true
+            }));
+            assert_eq!(app.overlay, expected);
+            assert!(app.needs_redraw);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_resize_redraws_without_disturbing_an_editor() {
+        let mut app = app();
+        app.filter_editing = true;
+        app.filter_buffer = "worker".into();
+        app.needs_redraw = false;
+        assert!(!app.handle_key(Key::Resize));
+        assert!(app.needs_redraw);
+        assert!(app.filter_editing);
+        assert_eq!(app.filter_buffer, "worker");
     }
 
     fn canvas_text(canvas: &Canvas) -> String {
@@ -10168,6 +10491,39 @@ mod tests {
         assert_eq!(canvas.cells[8 * 180 + 50].ch, '╭');
         assert_eq!(canvas.cells[56 * 180 + 50].ch, '╰');
         assert!(canvas_row(&canvas, 55).contains("https://github.com/EriksRemess/btop-rust"));
+    }
+
+    #[test]
+    fn help_pages_reach_the_last_entry_and_keep_the_footer_inside_the_window() {
+        for (rows, pages) in [(13, 16), (24, 4), (40, 2), (60, 1)] {
+            let mut app = app();
+            app.config.set_value("shown_boxes", "net");
+            app.overlay = Overlay::Help;
+            let mut renderer = Renderer::new();
+            for page in 0..pages {
+                renderer.render(Size { cols: 80, rows }, &mut app);
+                assert_eq!(app.help_page, page);
+                let mut canvas = Canvas::new(80, rows as usize);
+                draw_help(&mut canvas, app.help_page);
+                if pages > 1 {
+                    assert!(
+                        canvas_row(&canvas, rows as usize - 1)
+                            .contains(&format!("page {}/{pages}", page + 1))
+                    );
+                }
+                if page == pages - 1 {
+                    assert!(
+                        canvas_text(&canvas).contains("https://github.com/EriksRemess/btop-rust")
+                    );
+                }
+                app.handle_key(Key::PageDown);
+            }
+            assert_eq!(app.help_page, 0);
+            app.handle_key(Key::PageUp);
+            assert_eq!(app.help_page, pages - 1);
+            renderer.render(Size { cols: 80, rows: 60 }, &mut app);
+            assert_eq!(app.help_page, 0);
+        }
     }
 
     #[test]
@@ -11401,7 +11757,7 @@ mod tests {
             io_supported: true,
             read_per_second: 1024 * 1024,
             write_per_second: 2 * 1024 * 1024,
-            io_activity: 25.0,
+            io_activity: Some(25.0),
         });
         app.disk_histories.insert(
             "/".into(),
@@ -11439,6 +11795,65 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn unavailable_disk_activity_keeps_rates_without_an_io_percent_row() {
+        let mut app = app();
+        app.sample.memory.disks.push(DiskSample {
+            mount: "/tank".into(),
+            total: 1024 * 1024 * 1024,
+            io_supported: true,
+            read_per_second: 1024 * 1024,
+            write_per_second: 2 * 1024 * 1024,
+            io_activity: Some(25.0),
+            ..DiskSample::default()
+        });
+        app.update(app.sample.clone());
+        assert_eq!(app.disk_histories["/tank"].activity.len(), 1);
+        app.sample.memory.disks[0].io_activity = None;
+        app.update(app.sample.clone());
+        assert!(app.disk_histories["/tank"].activity.is_empty());
+        assert_eq!(app.disk_histories["/tank"].read.len(), 2);
+        for io_mode in ["false", "true"] {
+            app.config.set_value("io_mode", io_mode);
+            let mut canvas = Canvas::new(100, 20);
+            draw_memory(&mut canvas, Rect::new(0, 0, 100, 20), &mut app);
+            let output = canvas_text(&canvas);
+            assert!(output.contains("tank"));
+            assert!(output.contains("▼▲ 3.0M"));
+            assert!(!output.contains("IO%"));
+        }
+    }
+
+    #[test]
+    fn mixed_disk_activity_support_keeps_every_disk_reachable() {
+        for combined in ["false", "true"] {
+            let mut app = app();
+            app.config.set_value("io_mode", "true");
+            app.config.set_value("io_graph_combined", combined);
+            app.sample.memory.disks = (0..6)
+                .map(|index| DiskSample {
+                    mount: format!("/disk-{index}"),
+                    io_supported: true,
+                    io_activity: (index % 2 == 0).then_some(0.0),
+                    ..DiskSample::default()
+                })
+                .collect();
+            let area = Rect::new(0, 0, 100, 10);
+            let mut seen = [false; 6];
+            for offset in 0..6 {
+                app.disk_offset = offset;
+                let mut canvas = Canvas::new(100, 10);
+                draw_memory(&mut canvas, area, &mut app);
+                let output = canvas_text(&canvas);
+                for (index, seen) in seen.iter_mut().enumerate() {
+                    *seen |= output.contains(&format!("disk-{index}"));
+                }
+                assert!(!canvas_row(&canvas, 9).contains('W'));
+            }
+            assert_eq!(seen, [true; 6]);
         }
     }
 
@@ -11550,7 +11965,7 @@ mod tests {
             io_supported: true,
             read_per_second: 1024 * 1024,
             write_per_second: 2 * 1024 * 1024,
-            io_activity: 25.0,
+            io_activity: Some(25.0),
         });
         app.disk_histories.insert(
             "/".into(),
@@ -11575,6 +11990,7 @@ mod tests {
             used: 1024 * 1024 * 1024,
             free: 1024 * 1024 * 1024,
             io_supported: true,
+            io_activity: Some(0.0),
             ..DiskSample::default()
         });
         app.disk_histories.insert(
@@ -11732,6 +12148,7 @@ mod tests {
                 used: 512 * 1024 * 1024,
                 free: 512 * 1024 * 1024,
                 io_supported: true,
+                io_activity: Some(0.0),
                 ..DiskSample::default()
             })
             .collect();
@@ -11765,6 +12182,7 @@ mod tests {
                 used: 512 * 1024 * 1024,
                 free: 512 * 1024 * 1024,
                 io_supported: true,
+                io_activity: Some(0.0),
                 ..DiskSample::default()
             })
             .collect();
@@ -11795,9 +12213,9 @@ mod tests {
                 used: 512 * 1024 * 1024,
                 free: 512 * 1024 * 1024,
                 io_supported: mount == "/",
+                io_activity: (mount == "/").then_some(25.0),
                 read_per_second: usize::from(mount == "/") as u64 * 1024 * 1024,
                 write_per_second: usize::from(mount == "/") as u64 * 2 * 1024 * 1024,
-                ..DiskSample::default()
             })
             .collect();
         app.disk_histories.insert(
@@ -11845,6 +12263,7 @@ mod tests {
             total: 1024 * 1024 * 1024,
             used: 256 * 1024 * 1024,
             io_supported: true,
+            io_activity: Some(0.0),
             ..DiskSample::default()
         });
         app.disk_histories

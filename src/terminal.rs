@@ -1,7 +1,7 @@
 use std::cell::UnsafeCell;
 use std::io::{self, Read, Write};
 use std::mem::MaybeUninit;
-use std::os::raw::{c_int, c_short, c_uchar, c_uint, c_ulong};
+use std::os::raw::{c_int, c_short, c_uchar, c_uint, c_ulong, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -104,7 +104,7 @@ unsafe extern "C" {
     fn poll(fds: *mut PollFd, count: c_ulong, timeout: c_int) -> c_int;
     #[cfg(target_os = "macos")]
     fn poll(fds: *mut PollFd, count: c_uint, timeout: c_int) -> c_int;
-    fn write(fd: c_int, buffer: *const u8, count: usize) -> isize;
+    fn write(fd: c_int, buffer: *const c_void, count: usize) -> isize;
     fn fcntl(fd: c_int, command: c_int, ...) -> c_int;
 }
 
@@ -141,7 +141,7 @@ pub unsafe fn restore_after_crash() {
         }
         write(
             STDOUT,
-            CRASH_RESTORE_SEQUENCE.as_ptr(),
+            CRASH_RESTORE_SEQUENCE.as_ptr().cast(),
             CRASH_RESTORE_SEQUENCE.len(),
         );
     }

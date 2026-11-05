@@ -210,9 +210,9 @@ impl GpuCollector {
             if shown.contains("nvidia") && self.nvml.is_none() {
                 self.nvml = Nvml::load();
             }
-            if shown.contains("amd") && self.rsmi.is_none() {
+            if shown.contains("amd") && self.rsmi.is_none() && self.amd_sysfs.is_empty() {
                 self.rsmi = Rsmi::load();
-                if self.rsmi.is_none() && self.amd_sysfs.is_empty() {
+                if self.rsmi.is_none() {
                     self.amd_sysfs = discover_amd_sysfs();
                 }
             }
@@ -821,11 +821,13 @@ impl Rsmi {
                 if measure_pcie {
                     let mut tx = 0;
                     let mut rx = 0;
-                    if unsafe { (self.functions.pcie)(index, &mut tx, &mut rx, ptr::null_mut()) }
+                    let mut packet_size = 0;
+                    if unsafe { (self.functions.pcie)(index, &mut tx, &mut rx, &mut packet_size) }
                         == RSMI_SUCCESS
+                        && packet_size > 0
                     {
-                        sample.pcie_tx_kib = tx as i64;
-                        sample.pcie_rx_kib = rx as i64;
+                        sample.pcie_tx_kib = rsmi_pcie_kib(tx, packet_size);
+                        sample.pcie_rx_kib = rsmi_pcie_kib(rx, packet_size);
                         sample.support.pcie = true;
                     }
                 }
@@ -868,6 +870,12 @@ impl Drop for Rsmi {
     fn drop(&mut self) {
         unsafe { (self.functions.shutdown)() };
     }
+}
+
+fn rsmi_pcie_kib(packets: u64, packet_size: u64) -> i64 {
+    // ROCm forwards amdgpu's one-second packet counts and maximum payload
+    // size. Match rocm-smi's bandwidth estimate before converting to KiB/s.
+    (u128::from(packets) * u128::from(packet_size) / 1024).min(u128::from(u64::MAX / 1024)) as i64
 }
 
 fn rsmi_u32(function: RsmiU32, index: u32, target: &mut u32) -> bool {
@@ -1603,6 +1611,18 @@ unsafe extern "C" {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rsmi_packet_counts_are_converted_to_kib_per_second() {
+        assert_eq!(rsmi_pcie_kib(8192, 128), 1024);
+        assert_eq!(rsmi_pcie_kib(8192, 256), 2048);
+        assert_eq!(rsmi_pcie_kib(8192, 512), 4096);
+        assert_eq!(rsmi_pcie_kib(0, 256), 0);
+        assert_eq!(rsmi_pcie_kib(8192, 0), 0);
+        let maximum = rsmi_pcie_kib(u64::MAX, u64::MAX);
+        assert!(maximum >= 0);
+        assert_eq!((maximum as u64).checked_mul(1024), Some(u64::MAX - 1023));
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
