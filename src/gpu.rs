@@ -1,6 +1,6 @@
 use std::ffi::{CStr, CString, c_char, c_int, c_long, c_uint, c_ulong, c_void};
 use std::fs;
-use std::mem;
+use std::mem::{self, DropGuard};
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 use std::ptr;
@@ -629,17 +629,13 @@ struct RsmiFunctions {
     pcie: RsmiPcie,
 }
 
-struct RsmiInitGuard {
+fn rsmi_init_guard(
+    library: DynamicLibrary,
     shutdown: RsmiShutdown,
-    armed: bool,
-}
-
-impl Drop for RsmiInitGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            unsafe { (self.shutdown)() };
-        }
-    }
+) -> DropGuard<DynamicLibrary, impl FnOnce(DynamicLibrary)> {
+    DropGuard::new(library, move |_library| {
+        unsafe { shutdown() };
+    })
 }
 
 struct Rsmi {
@@ -670,12 +666,8 @@ impl Rsmi {
             return None;
         }
         // Every fallible symbol/version/device check below may return early.
-        // Keep the driver initialized only after ownership has transferred to
-        // the completed Rsmi backend.
-        let mut init_guard = RsmiInitGuard {
-            shutdown,
-            armed: true,
-        };
+        // Shut down before unloading the library until the backend takes ownership.
+        let library = rsmi_init_guard(library, shutdown);
         let mut version = RsmiVersion {
             major: 0,
             minor: 0,
@@ -752,7 +744,7 @@ impl Rsmi {
             temperature_limits.push(temperature / 1000);
         }
         let mut backend = Self {
-            _library: library,
+            _library: DropGuard::dismiss(library),
             functions,
             count,
             names,
@@ -765,7 +757,6 @@ impl Rsmi {
             .into_iter()
             .map(|sample| sample.support)
             .collect();
-        init_guard.armed = false;
         Some(backend)
     }
 
@@ -952,15 +943,6 @@ fn amd_drm_name(device: &Path) -> Result<String, String> {
     type Initialize = unsafe extern "C" fn(c_int, *mut u32, *mut u32, *mut *mut c_void) -> c_int;
     type Deinitialize = unsafe extern "C" fn(*mut c_void) -> c_int;
     type MarketingName = unsafe extern "C" fn(*mut c_void) -> *const c_char;
-    struct Handle {
-        raw: *mut c_void,
-        deinitialize: Deinitialize,
-    }
-    impl Drop for Handle {
-        fn drop(&mut self) {
-            unsafe { (self.deinitialize)(self.raw) };
-        }
-    }
     let library = DynamicLibrary::open(&["libdrm_amdgpu.so.1", "libdrm_amdgpu.so"])
         .ok_or("libdrm_amdgpu is unavailable")?;
     let initialize: Initialize = library
@@ -1007,8 +989,10 @@ fn amd_drm_name(device: &Path) -> Result<String, String> {
             );
             continue;
         }
-        let handle = Handle { raw, deinitialize };
-        let value = unsafe { name(handle.raw) };
+        let handle = DropGuard::new(raw, |raw| {
+            unsafe { deinitialize(raw) };
+        });
+        let value = unsafe { name(*handle) };
         if !value.is_null() {
             let value = unsafe { CStr::from_ptr(value) }
                 .to_string_lossy()
@@ -1696,21 +1680,26 @@ mod tests {
     #[test]
     fn partial_rsmi_initialization_always_shuts_down() {
         SHUTDOWN_CALLS.store(0, Ordering::Relaxed);
+        let library = || DynamicLibrary {
+            handle: ptr::null_mut(),
+        };
         {
-            let _guard = RsmiInitGuard {
-                shutdown: record_rsmi_shutdown,
-                armed: true,
-            };
+            let _guard = rsmi_init_guard(library(), record_rsmi_shutdown);
         }
         assert_eq!(SHUTDOWN_CALLS.load(Ordering::Relaxed), 1);
 
         {
-            let _guard = RsmiInitGuard {
-                shutdown: record_rsmi_shutdown,
-                armed: false,
-            };
+            let guard = rsmi_init_guard(library(), record_rsmi_shutdown);
+            let _library = DropGuard::dismiss(guard);
         }
         assert_eq!(SHUTDOWN_CALLS.load(Ordering::Relaxed), 1);
+
+        let result = std::panic::catch_unwind(|| {
+            let _guard = rsmi_init_guard(library(), record_rsmi_shutdown);
+            panic!("initialization interrupted");
+        });
+        assert!(result.is_err());
+        assert_eq!(SHUTDOWN_CALLS.load(Ordering::Relaxed), 2);
     }
 
     #[test]

@@ -1113,7 +1113,7 @@ fn disk_filters(value: &str) -> (bool, HashSet<String>) {
         return (false, HashSet::new());
     };
     let exclude = first.starts_with("exclude=");
-    let first = first.strip_prefix("exclude=").unwrap_or(first);
+    let first = first.trim_prefix("exclude=");
     let mut filters = HashSet::new();
     if !first.is_empty() {
         filters.insert(first.to_string());

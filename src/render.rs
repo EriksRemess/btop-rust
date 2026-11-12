@@ -1608,7 +1608,7 @@ impl AppState {
                 self.config.set_value("proc_filter", "");
                 self.filter_buffer.clear();
             }
-            ProcessControlAction::Pause => self.config.pause_processes ^= true,
+            ProcessControlAction::Pause => self.config.pause_processes.toggle(),
             ProcessControlAction::PerCore => self.config.flip_value("proc_per_core"),
             ProcessControlAction::Reverse => self.config.flip_value("proc_reversed"),
             ProcessControlAction::Tree => self.config.flip_value("proc_tree"),

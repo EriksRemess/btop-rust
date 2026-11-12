@@ -7,7 +7,7 @@ GPU monitoring where supported.
 
 ## Install and run
 
-With Rust and Cargo installed:
+With Rust 1.100 or later and Cargo installed:
 
 ```console
 cargo install btoprs

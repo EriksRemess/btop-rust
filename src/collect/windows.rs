@@ -1,6 +1,6 @@
 use super::*;
 use std::ffi::c_void;
-use std::mem::{MaybeUninit, size_of};
+use std::mem::{DropGuard, MaybeUninit, size_of};
 use std::time::Duration;
 
 type Handle = isize;
@@ -878,21 +878,17 @@ fn read_memory_composition(total: u64, fallback_available: u64) -> WindowsMemory
     if unsafe { PdhOpenQueryW(ptr::null(), 0, &mut query) } != 0 {
         return fallback();
     }
-    struct QueryGuard(Handle);
-    impl Drop for QueryGuard {
-        fn drop(&mut self) {
-            unsafe { PdhCloseQuery(self.0) };
-        }
-    }
-    let query = QueryGuard(query);
+    let query = DropGuard::new(query, |query| {
+        unsafe { PdhCloseQuery(query) };
+    });
     let mut counters = [0; COUNTER_PATHS.len()];
     for (path, counter) in COUNTER_PATHS.iter().zip(&mut counters) {
         let path = wide(path);
-        if unsafe { PdhAddEnglishCounterW(query.0, path.as_ptr(), 0, counter) } != 0 {
+        if unsafe { PdhAddEnglishCounterW(*query, path.as_ptr(), 0, counter) } != 0 {
             return fallback();
         }
     }
-    if unsafe { PdhCollectQueryData(query.0) } != 0 {
+    if unsafe { PdhCollectQueryData(*query) } != 0 {
         return fallback();
     }
     let Some(values) = counters
@@ -1059,15 +1055,9 @@ pub(super) fn collect_network(
     if result != 0 || table.is_null() {
         return Err(format!("GetIfTable2 failed with Windows error {result}"));
     }
-    struct TableGuard(*mut MibIfTable2);
-    impl Drop for TableGuard {
-        fn drop(&mut self) {
-            unsafe { FreeMibTable(self.0.cast()) };
-        }
-    }
-    let table = TableGuard(table);
-    let count = unsafe { (*table.0).number_of_entries as usize };
-    let first = unsafe { (*table.0).table.as_ptr() };
+    let table = DropGuard::new(table, |table| unsafe { FreeMibTable(table.cast()) });
+    let count = unsafe { (**table).number_of_entries as usize };
+    let first = unsafe { (**table).table.as_ptr() };
     let mut rows = Vec::new();
     for index in 0..count {
         let row = unsafe { &*first.add(index) };

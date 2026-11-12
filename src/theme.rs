@@ -234,6 +234,7 @@ pub fn install_missing_themes(custom_dir: Option<&Path>) -> std::io::Result<()> 
 }
 
 fn install_missing_themes_in(directory: &Path, search_dirs: &[PathBuf]) -> std::io::Result<()> {
+    use std::mem::DropGuard;
     #[cfg(unix)]
     use std::os::unix::fs::DirBuilderExt;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -262,12 +263,6 @@ fn install_missing_themes_in(directory: &Path, search_dirs: &[PathBuf]) -> std::
     fs::create_dir_all(directory)?;
     // Publish complete files without replacing an existing destination, even
     // when two instances start together. Keep staging on the same filesystem.
-    struct Staging(PathBuf);
-    impl Drop for Staging {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
     let staging = loop {
         let sequence = NEXT_STAGING.fetch_add(1, Ordering::Relaxed);
         let path = directory.join(format!(".btoprs-themes-{}-{sequence}", std::process::id()));
@@ -278,13 +273,17 @@ fn install_missing_themes_in(directory: &Path, search_dirs: &[PathBuf]) -> std::
         #[cfg(unix)]
         builder.mode(0o700);
         match builder.create(&path) {
-            Ok(()) => break Staging(path),
+            Ok(()) => {
+                break DropGuard::new(path, |path| {
+                    let _ = fs::remove_dir_all(path);
+                });
+            }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error),
         }
     };
     for (name, contents) in missing {
-        let source = staging.0.join(name);
+        let source = staging.join(name);
         fs::write(&source, contents)?;
         match fs::hard_link(&source, directory.join(name)) {
             Ok(()) => {}
