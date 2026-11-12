@@ -109,3 +109,14 @@ test and are not portability checks for every SoC or macOS version.
 CLI and configuration changes should preserve deliberate backward compatibility
 or include a clear migration path. Installation should be checked with both the
 native platform and a staged `DESTDIR`.
+
+The elevated config-save regression is ignored by default because it verifies
+replacement of a config owned by the invoking user while the saver is root.
+It runs in an exclusive mode-0700 temporary fixture and uses SUDO_UID/SUDO_GID.
+Build as your normal user, then invoke the test binary printed by Cargo for
+this single privileged case:
+
+```console
+cargo test --no-run
+sudo /path/to/btoprs-test-binary config::tests::elevated_save_preserves_original_owner --ignored --exact --test-threads=1
+```
