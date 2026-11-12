@@ -3,13 +3,18 @@
 mod cli;
 mod collect;
 mod config;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
+mod gpu;
+#[cfg(target_os = "macos")]
+#[path = "gpu/snow_leopard.rs"]
 mod gpu;
 #[cfg(windows)]
 #[path = "gpu/windows.rs"]
 mod gpu;
 mod logger;
 mod render;
+#[cfg(target_os = "macos")]
+mod sensors;
 #[cfg(unix)]
 mod terminal;
 #[cfg(windows)]
@@ -527,6 +532,21 @@ fn suspend_process() -> Result<(), String> {
     // Windows has no job-control equivalent to SIGTSTP/SIGCONT. Ctrl+Z is
     // therefore accepted as a no-op so it cannot leave the console half reset.
     Ok(())
+}
+
+// Test fixtures are private trees. Avoid std's post-10.6 openat-based remover;
+// production staging cleanup only unlinks files in its own mode-0700 directory.
+#[cfg(test)]
+fn test_remove_dir_all(path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
+    let path = path.as_ref();
+    let meta = std::fs::symlink_metadata(path)?;
+    if !meta.is_dir() || meta.file_type().is_symlink() {
+        return std::fs::remove_file(path);
+    }
+    for entry in std::fs::read_dir(path)? {
+        test_remove_dir_all(entry?.path())?;
+    }
+    std::fs::remove_dir(path)
 }
 
 #[cfg(test)]

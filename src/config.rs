@@ -867,7 +867,7 @@ mod tests {
         config.reload().unwrap();
         assert_eq!(config.update_ms, 3100);
         assert_eq!(Config::load(Some(&destination)).unwrap().update_ms, 3100);
-        fs::remove_dir_all(directory).unwrap();
+        crate::test_remove_dir_all(directory).unwrap();
     }
 
     #[cfg(unix)]
@@ -893,7 +893,7 @@ mod tests {
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o640
         );
-        fs::remove_dir_all(directory).unwrap();
+        crate::test_remove_dir_all(directory).unwrap();
     }
 
     #[cfg(unix)]
@@ -926,7 +926,7 @@ mod tests {
         fs::create_dir(&invalid).unwrap();
         assert!(write_config_atomically(&invalid, b"data").is_err());
         assert_eq!(fs::read_dir(&directory).unwrap().count(), 2);
-        fs::remove_dir_all(directory).unwrap();
+        crate::test_remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -982,7 +982,7 @@ mod tests {
             std::process::id()
         ));
         let path = directory.join("btop.conf");
-        let _ = fs::remove_dir_all(&directory);
+        let _ = crate::test_remove_dir_all(&directory);
         fs::create_dir(&directory).unwrap();
         fs::write(&path, "update_ms = 1700\nsave_config_on_exit = true\n").unwrap();
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o555)).unwrap();
@@ -1001,7 +1001,7 @@ mod tests {
         );
 
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
-        fs::remove_dir_all(directory).unwrap();
+        crate::test_remove_dir_all(directory).unwrap();
     }
 
     #[test]

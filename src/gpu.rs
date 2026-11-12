@@ -1760,7 +1760,7 @@ mod tests {
         assert!(!sample.support.utilization);
         assert!(!sample.support.power);
 
-        fs::remove_dir_all(root).unwrap();
+        crate::test_remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1806,7 +1806,7 @@ mod tests {
         devices[0].name = "Driver Supplied Name".into();
         apply_amd_database_names(&mut devices, database);
         assert_eq!(devices[0].name, "Driver Supplied Name");
-        fs::remove_dir_all(root).unwrap();
+        crate::test_remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1819,7 +1819,7 @@ mod tests {
         assert_eq!(amd_sysfs_name(&root, "1638"), "AMD GPU (1002:1638)");
         fs::write(root.join("product_name"), "Driver Supplied GPU Name\n").unwrap();
         assert_eq!(amd_sysfs_name(&root, "1638"), "Driver Supplied GPU Name");
-        fs::remove_dir_all(root).unwrap();
+        crate::test_remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1851,7 +1851,7 @@ mod tests {
         assert_eq!(sample.memory_used, 268_435_456);
         assert!(sample.support.memory_total);
 
-        fs::remove_dir_all(root).unwrap();
+        crate::test_remove_dir_all(root).unwrap();
     }
 
     #[test]

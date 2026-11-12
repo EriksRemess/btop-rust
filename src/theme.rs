@@ -265,7 +265,12 @@ fn install_missing_themes_in(directory: &Path, search_dirs: &[PathBuf]) -> std::
     struct Staging(PathBuf);
     impl Drop for Staging {
         fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
+            if let Ok(entries) = fs::read_dir(&self.0) {
+                for entry in entries.flatten() {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+            let _ = fs::remove_dir(&self.0);
         }
     }
     let staging = loop {
@@ -793,7 +798,7 @@ mod tests {
             assert_eq!(after.color("hi_fg", (0, 0, 0)), (0x11, 0x22, 0x33));
             assert!(directory.join("ayu.theme").is_file());
         }
-        fs::remove_dir_all(root).unwrap();
+        crate::test_remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
@@ -825,7 +830,7 @@ mod tests {
             fs::rename(&path, directory.join("my-custom.theme")).unwrap();
             assert!(Palette::load_in("my-custom", [directory]).is_err());
         }
-        fs::remove_dir_all(root).unwrap();
+        crate::test_remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -882,7 +887,7 @@ mod tests {
             fs::read_dir(&directory).unwrap().count(),
             BUNDLED_THEMES.len()
         );
-        fs::remove_dir_all(root).unwrap();
+        crate::test_remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -902,7 +907,7 @@ mod tests {
             fs::read_dir(&directory).unwrap().count(),
             BUNDLED_THEMES.len()
         );
-        fs::remove_dir_all(directory).unwrap();
+        crate::test_remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -948,7 +953,7 @@ mod tests {
             std::env::temp_dir().join(format!("btoprs-theme-dedup-test-{}", std::process::id()));
         let primary = root.join("btoprs/themes");
         let legacy = root.join("btop/themes");
-        let _ = fs::remove_dir_all(&root);
+        let _ = crate::test_remove_dir_all(&root);
         fs::create_dir_all(&primary).unwrap();
         fs::create_dir_all(&legacy).unwrap();
         fs::write(primary.join("shared.theme"), "theme[hi_fg]=\"#112233\"\n").unwrap();
@@ -965,7 +970,7 @@ mod tests {
             Some(primary.join("shared.theme"))
         );
 
-        fs::remove_dir_all(root).unwrap();
+        crate::test_remove_dir_all(root).unwrap();
     }
 
     #[test]

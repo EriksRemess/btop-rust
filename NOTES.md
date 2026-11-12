@@ -24,31 +24,26 @@ Linux data comes from procfs, sysfs, perf events, and dynamically loaded GPU
 interfaces. Desktop entries and icons are Linux installation artifacts and are
 not installed on macOS.
 
-### macOS
+### Snow Leopard (this branch)
 
-The general macOS collectors use Mach, libproc, sysctl, getifaddrs,
-SystemConfiguration, CoreFoundation, and IOKit. Public interfaces are preferred
-where they provide the metric. Apple-silicon CPU and GPU details additionally
-use private IOReport interfaces resolved at runtime, plus power-manager and AGX
-registry data, HID thermal sensors, and an SMC fallback. The CPU clock is
-residency-weighted from per-core performance states and the matching DVFS
-frequency tables and is shown per core when available; the legacy
-`hw.cpufrequency` sysctl remains the Intel and fallback path. Private metrics
-are capability-checked so missing or renamed channels do not prevent startup.
+The Intel macOS backend targets the 10.6 SDK. Mach CPU/VM counters and native
+sysctl/libproc supply system and accessible-process data. The VM layout is the
+96-byte Snow Leopard structure; inactive pages are treated as reclaimable.
+Compressed-memory and modern per-process disk-I/O APIs are not used.
 
-The Apple GPU panel can show interval activity, residency-weighted frequency,
-the dominant P-state, estimated power, temperature, hardware core count,
-resident unified-memory use, and normalized AGX memory-bandwidth activity.
-Unified memory is labeled UMA because it is shared system memory, not dedicated
-VRAM.
+GPU collection is a separate compact legacy backend. It reads only Radeon
+`VRAM,totalsize` and `vramFreeBytes` and Intel SMC `TG0D`/`TC0D` temperatures.
+There are no IOReport, HID, AGX, NVML, ROCm, Vulkan or Linux GPU probes in the
+macOS binary. SMC commands are limited to key metadata and byte reads.
 
-AVE encoder and AVD decoder values are session counts, not utilization
-percentages. Media-engine power and traffic are displayed only when the current
-system supplies a usable value with a meaningful unit. Some macOS 27 systems,
-including the tested A18 Pro machine, advertise AVE/VDEC energy channels but
-leave them frozen at zero; those unavailable power readings are hidden. The UI
-does not infer media utilization, memory clock, PCIe throughput, or dedicated
-VRAM values from unrelated counters.
+Disk byte counters are found on the physical IOBlockStorageDriver ancestor.
+Only one mounted volume per physical drive receives these rates. No disk busy
+percentage is inferred from overlapping read/write service times. The fixed
+`hw.cpufrequency` value is nominal frequency, not a measured live P-state.
+
+Cross-build and native test instructions are in [README.md](README.md).
+Rust's compiler warning about its official 10.12 minimum is expected; linking
+and native runtime checks are both required to establish compatibility.
 
 ### Windows
 
@@ -91,21 +86,34 @@ cargo clippy --all-targets -- -D warnings
 cargo build --release
 ```
 
-On an Apple-silicon Mac, run the live macOS checks separately from the NVIDIA
-hardware test. Run them serially because the host-port leak check measures
-process-wide Mach reference counts:
+On the iMac, run the cross-built test executable serially:
 
 ```console
-cargo test macos:: -- --ignored --test-threads=1
-cargo clippy --all-targets --target x86_64-apple-darwin -- -D warnings
-cargo build --release --target x86_64-apple-darwin
+./btoprs-tests --test-threads=1
+./btoprs-tests collect::macos::tests::live_collector_returns_core_system_data --ignored --nocapture --test-threads=1
+./btoprs-tests live_refresh_releases_host_ports --ignored --test-threads=1
 ```
 
-The Intel checks require the `x86_64-apple-darwin` Rust target. Cross-compilation
-checks the build and native bindings; live Intel telemetry still needs Intel
-hardware. Apple live tests require the telemetry capabilities asserted by each
-test and are not portability checks for every SoC or macOS version.
+The build script records the test executable path in
+`target/snow-leopard/test-executables.json`. Native UI validation uses
+`scripts/snow-leopard/ui-probe.m` with an isolated Snow Ghostty process, config
+and temporary home. It checks monitor/options/help/filter rendering, fullscreen
+resize in both directions, normal quit and restoration of the original PTY
+attributes. Do not direct test key events at a user's existing terminal.
 
-CLI and configuration changes should preserve deliberate backward compatibility
-or include a clear migration path. Installation should be checked with both the
-native platform and a staged `DESTDIR`.
+## Snow Leopard validation, 2026-11-12
+
+- Cross-built with Rust 1.99.1, rebuilt std/pthread TLS, Core 2 and the 10.6 SDK.
+- Native suite: 187 regular tests plus the two separately run live collector and
+  Mach host-port reference checks. Linux suite: 199 tests. Both target Clippy
+  checks passed with warnings denied, apart from Rust's expected OS-minimum
+  diagnostic (not a source-code lint).
+- Live reads verified two CPU cores, 4 GiB RAM, swap, physical-drive byte counters,
+  en0 traffic/addressing, accessible processes, CPU/GPU temperatures and 128 MiB
+  Radeon VRAM with bounded current use.
+- Visually inspected the real Snow Ghostty monitor, help and settings captures.
+  Filtering, fullscreen/restore resizing and normal quit passed. Original PTY
+  attributes were restored, excluding only transient Darwin PENDIN state.
+
+These checks establish this specific application/toolchain/hardware combination,
+not general Rust support for macOS 10.6 or untested GPU drivers.

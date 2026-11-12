@@ -96,7 +96,10 @@ pub struct ProcessSample {
     pub nice: i32,
     pub kernel_thread: bool,
     pub elapsed_seconds: u64,
+    // Retained in the shared sample schema; Snow Leopard does not expose these.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub read_bytes: u64,
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub write_bytes: u64,
 }
 
@@ -253,8 +256,6 @@ pub struct Collector {
     cpu_name: String,
     users: HashMap<u32, String>,
     gpus: GpuCollector,
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    apple_cpu_frequency: Option<crate::gpu::macos::AppleCpuFrequencyCollector>,
     #[cfg(windows)]
     windows_cpu_frequency: windows::CpuFrequencyCollector,
     rapl: Option<RaplReader>,
@@ -296,8 +297,6 @@ impl Collector {
                 read_users()
             },
             gpus: GpuCollector::new(config),
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            apple_cpu_frequency: crate::gpu::macos::AppleCpuFrequencyCollector::new(),
             #[cfg(windows)]
             windows_cpu_frequency: windows::CpuFrequencyCollector::new(),
             rapl: (!cfg!(windows))
@@ -2117,7 +2116,7 @@ mod tests {
         }
         collect_disks_for_mounts(&config, &mut previous, 2.0, "", &directory);
         assert!(previous.is_empty());
-        fs::remove_dir_all(directory).unwrap();
+        crate::test_remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -2140,7 +2139,7 @@ mod tests {
         assert_eq!(reader.energy_path, package.join("energy_uj"));
         assert_eq!(reader.max_energy_uj, 1_000);
 
-        fs::remove_dir_all(root).unwrap();
+        crate::test_remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2348,7 +2347,7 @@ mod tests {
         assert_eq!(charging.status, "charging");
         assert_eq!(charging.seconds, Some(4_321));
 
-        fs::remove_dir_all(root).unwrap();
+        crate::test_remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2371,7 +2370,7 @@ mod tests {
 
         assert_eq!(read_thermal_zone_fallback(&root), Some((42.5, 95.0)));
 
-        fs::remove_dir_all(root).unwrap();
+        crate::test_remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2449,7 +2448,7 @@ mod tests {
             })
         );
 
-        fs::remove_dir_all(root).unwrap();
+        crate::test_remove_dir_all(root).unwrap();
     }
 
     #[test]

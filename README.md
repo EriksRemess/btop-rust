@@ -1,37 +1,67 @@
-# btoprs
+# btoprs for Snow Leopard
 
-A terminal resource monitor inspired by btop++, for Linux, macOS 26 or later,
-and Windows 10 or later.
-Keep an eye on CPU, memory, disks, network traffic, and running processes, with
-GPU monitoring where supported.
+An Intel/Core 2 port of btop-rust for Mac OS X 10.6.8. This branch uses native
+Mach, sysctl, libproc and IOKit interfaces available on the old iMac.
 
-## Install and run
+It provides aggregate/per-core CPU load, load averages and uptime, nominal CPU
+frequency, CPU diode temperature, RAM and swap, mounted-disk capacity and
+whole-drive read/write rates, network traffic and addresses, and accessible
+processes. The legacy Radeon panel shows driver-reported VRAM use and SMC GPU
+temperature. Unsupported metrics and irrelevant settings are omitted.
 
-With Rust and Cargo installed:
+## Build on Linux
 
-```console
-cargo install btoprs
-btoprs
+Use Rust **1.99.1** with `rust-src`, Clang, Python 3, a MacOSX10.6 SDK and the
+compatible OSXCross stable linker:
+
+```sh
+python3 scripts/snow-leopard/build.py \
+  --sdk /path/to/MacOSX10.6.sdk \
+  --tools /path/to/osxcross/target/bin --tests
 ```
 
-Press `Esc` to open the menu and `q` or `Ctrl-C` to quit. Run `btoprs --help`
-for command-line options.
+The executable is `target/snow-leopard/cargo/x86_64-apple-darwin/release/btoprs`.
+Copy it to `~/.local/bin/btoprs` on the Mac. No Rust installation, MacPorts
+runtime libraries or administrator access is needed on the target.
 
-## Make it yours
+This is an application-specific legacy port, outside Rust's official macOS
+minimum. The build reconstructs std with pthread-key TLS, supplies the small
+compatibility functions in `scripts/snow-leopard/compat.c`, and verifies 10.6
+load commands and `LC_UNIXTHREAD`. Do not substitute a modern linker solely
+because it produces a successful build.
 
-Choose a theme and adjust settings from the menu. All bundled themes are
-included in the executable, and btop-compatible `.theme` files are supported.
-Add custom themes to `~/.config/btoprs/themes`. On Windows, themes are stored
-under `%APPDATA%\btoprs\themes`.
+## Use
 
-Settings are saved to `~/.config/btoprs/btoprs.conf`. Both paths follow
-`$XDG_CONFIG_HOME` when set. Existing btop settings are imported on first use
-without changing the original file. Use `btoprs --config <file>` to select a
-different configuration file. On Windows, the default settings file is
-`%APPDATA%\btoprs\btoprs.conf`.
+Run `btoprs` in Snow Ghostty or another UTF-8 terminal. `q` quits, `o` opens
+settings, `h` opens help and `f` filters processes. Configuration lives at
+`~/.config/btoprs/btoprs.conf`; `--config FILE` selects another file. All themes
+remain bundled; an example Catppuccin Mocha config is in
+[scripts/snow-leopard/btoprs.conf](scripts/snow-leopard/btoprs.conf).
 
-See the [project notes](NOTES.md) for platform details and known limitations.
+Snow Leopard's unprivileged libproc lists accessible processes, normally those
+owned by the current user. Protected processes may be absent. Per-process disk
+I/O, per-core temperature, live CPU P-states, CPU/GPU power, GPU utilization,
+GPU clocks, PCIe and media-engine telemetry are unavailable. Disk rates describe
+the physical drive and are assigned to only one mounted volume per drive; the
+driver's cumulative service times are not presented as disk busy percentage.
+
+See [project notes](NOTES.md) for validation and inherited platform details.
+The original `main` branch remains the general Linux/modern macOS/Windows app.
+
+The `--tests` build also produces `target/snow-leopard/ui-probe`. Copy that,
+its test executable and `scripts/snow-leopard/{test-target.py,run-monitor.py,btoprs.conf}`
+to the Mac, then run with MacPorts Python 3.13:
+
+```sh
+python3.13 test-target.py --binary ~/.local/bin/btoprs \
+  --tests ./btoprs-tests --ui-probe ./ui-probe
+```
+
+This opens an isolated Snow Ghostty window and exercises settings, help,
+filtering, fullscreen resizing, quit and PTY restoration. Logs and captures stay
+in its private temporary directory. Cross-target linting uses the build script's
+`--clippy` flag.
 
 ## License
 
-Licensed under the [Apache License 2.0](LICENSE). See [NOTICE](NOTICE) for attribution.
+[Apache License 2.0](LICENSE). See [NOTICE](NOTICE) for attribution.

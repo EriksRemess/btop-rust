@@ -6,8 +6,8 @@ use std::ptr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{
-    BatterySample, Collector, CpuSample, CpuTicks, DiskSample, MemorySample, NetworkSample,
-    ProcessSample, update_network_counter,
+    Collector, CpuSample, CpuTicks, DiskSample, MemorySample, NetworkSample, ProcessSample,
+    update_network_counter,
 };
 use crate::config::Config;
 
@@ -20,7 +20,6 @@ const CPU_STATE_NICE: usize = 3;
 const HOST_VM_INFO64: c_int = 4;
 const PROC_PIDTBSDINFO: c_int = 3;
 const PROC_PIDTASKINFO: c_int = 4;
-const PROC_PIDT_SHORTBSDINFO: c_int = 13;
 const PROC_FLAG_SYSTEM: u32 = 1;
 const CTL_KERN: c_int = 1;
 const CTL_NET: c_int = 4;
@@ -122,32 +121,23 @@ pub(super) fn collect_cpu(
             core_temperatures,
             name: collector.cpu_name.clone(),
             uptime: read_uptime(),
-            battery: config
-                .bool_value("show_battery")
-                .unwrap_or(true)
-                .then(read_battery)
-                .flatten(),
+            battery: None,
             watts: None,
             container_engine: None,
             active_cpus: Some((0..core_count).collect::<HashSet<_>>()),
-            available_batteries: vec!["Auto".to_string()],
+            available_batteries: Vec::new(),
         },
         total_delta,
     ))
 }
 
 fn cpu_temperatures(enabled: bool, core_count: usize) -> (Option<f64>, Vec<Option<f64>>) {
-    if !enabled {
-        return (None, vec![None; core_count]);
-    }
-    #[cfg(target_arch = "aarch64")]
-    {
-        crate::gpu::macos::read_cpu_temperatures(core_count)
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        (None, vec![None; core_count])
-    }
+    let package = if enabled {
+        crate::sensors::temperature(*b"TC0D")
+    } else {
+        None
+    };
+    (package, vec![None; core_count])
 }
 
 fn extend_u32_counter(current: u32, previous: u64) -> u64 {
@@ -224,28 +214,7 @@ fn percent(value: u64, total: u64) -> f64 {
     }
 }
 
-fn read_frequency(collector: &mut Collector, mode: &str) -> Option<(String, Vec<u32>)> {
-    #[cfg(not(target_arch = "aarch64"))]
-    let _ = (collector, mode);
-    #[cfg(target_arch = "aarch64")]
-    if collector.apple_cpu_frequency.is_none() {
-        collector.apple_cpu_frequency = crate::gpu::macos::AppleCpuFrequencyCollector::new();
-    }
-    #[cfg(target_arch = "aarch64")]
-    if let Some(frequencies) = collector
-        .apple_cpu_frequency
-        .as_mut()
-        .map(crate::gpu::macos::AppleCpuFrequencyCollector::collect_mhz)
-        .filter(|frequencies| !frequencies.is_empty())
-    {
-        let summary = super::calculate_frequency(mode, &frequencies);
-        let cores = frequencies
-            .into_iter()
-            .map(|frequency| frequency.round() as u32)
-            .collect();
-        return Some((summary, cores));
-    }
-
+fn read_frequency(_collector: &mut Collector, _mode: &str) -> Option<(String, Vec<u32>)> {
     let hz = sysctl_value::<u64>("hw.cpufrequency")?;
     Some((
         super::normalize_frequency(hz as f64 / 1_000_000.0),
@@ -289,14 +258,12 @@ pub(super) fn collect_memory(
         return Err(format!("host_statistics64 failed with Mach error {result}"));
     }
     let free = u64::from(stats.free_count).saturating_mul(page_size);
-    let cached = u64::from(stats.external_page_count).saturating_mul(page_size);
-    // Apple's internal/external counters describe backing type, while the
-    // active/inactive counters describe page-queue state and therefore overlap.
-    // Treat anonymous, wired and compressor storage as used; file-backed pages
-    // remain reclaimable cache. Purgeable pages are reclaimable as well.
-    let used_pages = macos_used_pages(&stats);
-    let used = used_pages.saturating_mul(page_size).min(total);
-    let available = total.saturating_sub(used);
+    let cached = u64::from(stats.inactive_count).saturating_mul(page_size);
+    // Snow Leopard predates compressed and internal/external VM counters.
+    // Inactive pages are reclaimable; used is active+wired (plus accounting
+    // differences), with free and inactive memory available to applications.
+    let available = free.saturating_add(cached).min(total);
+    let used = total.saturating_sub(available);
     let swap = sysctl_value::<XswUsage>("vm.swapusage").unwrap_or_default();
     Ok(MemorySample {
         total,
@@ -314,13 +281,6 @@ pub(super) fn collect_memory(
             Vec::new()
         },
     })
-}
-
-fn macos_used_pages(stats: &VmStatistics64) -> u64 {
-    u64::from(stats.internal_page_count)
-        .saturating_add(u64::from(stats.wire_count))
-        .saturating_add(u64::from(stats.compressor_page_count))
-        .saturating_sub(u64::from(stats.purgeable_count))
 }
 
 fn collect_disks(
@@ -390,6 +350,7 @@ fn collect_disk_io(
     // Only retain baselines sampled this interval. A telemetry gap must not
     // turn several intervals of I/O into a single refresh's rate.
     let mut next = HashMap::new();
+    let mut physical_drives = HashSet::new();
     let Ok(class) = CString::new("IOMediaBSDClient") else {
         previous.clear();
         return;
@@ -421,6 +382,23 @@ fn collect_disk_io(
                 && let Some(disk) = disks.iter_mut().find(|disk| &disk.mount == mount)
                 && let Some((read, write, total_time)) = io_registry_disk_statistics(volume)
             {
+                // The 10.6 driver reports whole-drive bytes, not partition I/O.
+                // Assign them to just one mounted volume per physical drive.
+                let physical = format!(
+                    "disk{}",
+                    bsd_name
+                        .trim_start_matches("disk")
+                        .chars()
+                        .take_while(char::is_ascii_digit)
+                        .collect::<String>()
+                );
+                if !physical_drives.insert(physical) {
+                    unsafe {
+                        IOObjectRelease(volume);
+                        IOObjectRelease(drive);
+                    };
+                    continue;
+                }
                 let current = super::DiskCounters {
                     sectors_read: read,
                     sectors_written: write,
@@ -509,76 +487,33 @@ fn macos_disk_counter_delta(
 }
 
 fn io_registry_disk_statistics(entry: u32) -> Option<(u64, u64, Option<u64>)> {
-    let mut properties = ptr::null();
-    if unsafe { IORegistryEntryCreateCFProperties(entry, &mut properties, ptr::null(), 0) }
-        != KERN_SUCCESS
-        || properties.is_null()
-    {
-        return None;
-    }
-    let statistics = unsafe { cf_dictionary_value(properties, "Statistics") };
-    let result = statistics.and_then(|statistics| unsafe {
-        let read = cf_dictionary_u64(statistics, "Bytes read from block device")
-            .or_else(|| cf_dictionary_u64(statistics, "Bytes (Read)"))?;
-        let write = cf_dictionary_u64(statistics, "Bytes written to block device")
-            .or_else(|| cf_dictionary_u64(statistics, "Bytes (Write)"))?;
-        Some((read, write))
-    });
-    unsafe { CFRelease(properties) };
-    let (read, write) = result?;
-    Some((read, write, io_registry_ancestor_total_time(entry)))
-}
-
-fn io_registry_ancestor_total_time(entry: u32) -> Option<u64> {
-    let mut current = 0_u32;
-    if unsafe { IORegistryEntryGetParentEntry(entry, c"IOService".as_ptr(), &mut current) }
-        != KERN_SUCCESS
-        || current == 0
-    {
-        return None;
-    }
-    for _ in 0..64 {
-        if let Some(total) = io_registry_total_time(current) {
+    let mut current = entry;
+    unsafe { IOObjectRetain(current) };
+    for _ in 0..20 {
+        let stats = io_registry_property(current, "Statistics");
+        let result = stats.and_then(|stats| {
+            let result = unsafe {
+                cf_dictionary_u64(stats, "Bytes (Read)")
+                    .zip(cf_dictionary_u64(stats, "Bytes (Write)"))
+            };
+            unsafe { CFRelease(stats) };
+            result
+        });
+        if let Some((read, write)) = result {
             unsafe { IOObjectRelease(current) };
-            return Some(total);
+            return Some((read, write, None));
         }
-        let mut parent = 0_u32;
-        let got_parent =
-            unsafe { IORegistryEntryGetParentEntry(current, c"IOService".as_ptr(), &mut parent) }
-                == KERN_SUCCESS;
+        let mut parent = 0;
+        let status =
+            unsafe { IORegistryEntryGetParentEntry(current, c"IOService".as_ptr(), &mut parent) };
         unsafe { IOObjectRelease(current) };
-        if !got_parent || parent == 0 {
+        if status != 0 || parent == 0 {
             return None;
         }
         current = parent;
     }
     unsafe { IOObjectRelease(current) };
     None
-}
-
-fn io_registry_total_time(entry: u32) -> Option<u64> {
-    let mut properties = ptr::null();
-    if unsafe { IORegistryEntryCreateCFProperties(entry, &mut properties, ptr::null(), 0) }
-        != KERN_SUCCESS
-        || properties.is_null()
-    {
-        return None;
-    }
-    let result = unsafe {
-        cf_dictionary_value(properties, "Statistics").and_then(|statistics| {
-            let read = cf_dictionary_u64(statistics, "Total Time (Read)");
-            let write = cf_dictionary_u64(statistics, "Total Time (Write)");
-            match (read, write) {
-                (None, None) => None,
-                (read, write) => Some(
-                    read.unwrap_or_default()
-                        .saturating_add(write.unwrap_or_default()),
-                ),
-            }
-        })
-    };
-    unsafe { CFRelease(properties) };
-    result
 }
 
 pub(super) fn collect_network(
@@ -847,35 +782,10 @@ pub(super) fn collect_processes(
                 mem::size_of::<ProcBsdInfo>() as c_int,
             )
         } == mem::size_of::<ProcBsdInfo>() as c_int;
+        // 10.6 libproc only enumerates accessible (normally same-user)
+        // processes. Its newer short-BSD flavor is not available on this OS.
         if !got_full_bsd {
-            // macOS denies the full BSD record for a number of protected
-            // processes, but still exposes the short record. Keep those
-            // processes in the list with the metadata that is available.
-            let mut short = ProcBsdShortInfo::default();
-            if unsafe {
-                proc_pidinfo(
-                    pid,
-                    PROC_PIDT_SHORTBSDINFO,
-                    0,
-                    (&mut short as *mut ProcBsdShortInfo).cast(),
-                    mem::size_of::<ProcBsdShortInfo>() as c_int,
-                )
-            } != mem::size_of::<ProcBsdShortInfo>() as c_int
-            {
-                continue;
-            }
-            bsd.pid = short.pid;
-            bsd.parent_pid = short.parent_pid;
-            bsd.process_group = short.process_group;
-            bsd.status = short.status;
-            bsd.flags = short.flags;
-            bsd.uid = short.uid;
-            bsd.gid = short.gid;
-            bsd.real_uid = short.real_uid;
-            bsd.real_gid = short.real_gid;
-            bsd.saved_uid = short.saved_uid;
-            bsd.saved_gid = short.saved_gid;
-            bsd.command = short.command;
+            continue;
         }
         let mut task = ProcTaskInfo::default();
         let got_task = unsafe {
@@ -1049,109 +959,10 @@ fn process_arguments(pid: c_int, buffer: &mut [u8]) -> Option<String> {
     (!arguments.is_empty()).then(|| arguments.join(" "))
 }
 
-fn process_io(pid: c_int) -> (u64, u64) {
-    // Disk counters have been available since V2. Requesting V6 needlessly
-    // disables them on older macOS releases that reject that flavor.
-    let mut usage = RusageInfoV2::default();
-    if unsafe { proc_pid_rusage(pid, 2, (&mut usage as *mut RusageInfoV2).cast()) } == 0 {
-        (usage.diskio_bytesread, usage.diskio_byteswritten)
-    } else {
-        (0, 0)
-    }
-}
-
-fn read_battery() -> Option<BatterySample> {
-    unsafe {
-        let info = IOPSCopyPowerSourcesInfo();
-        if info.is_null() {
-            return None;
-        }
-        let list = IOPSCopyPowerSourcesList(info);
-        if list.is_null() || CFArrayGetCount(list) == 0 {
-            if !list.is_null() {
-                CFRelease(list);
-            }
-            CFRelease(info);
-            return None;
-        }
-        let mut description: *const c_void = ptr::null();
-        for index in 0..CFArrayGetCount(list) {
-            let source = CFArrayGetValueAtIndex(list, index);
-            let candidate = IOPSGetPowerSourceDescription(info, source);
-            if candidate.is_null() {
-                continue;
-            }
-            if description.is_null() {
-                description = candidate;
-            }
-            if cf_dictionary_value(candidate, "Type")
-                .and_then(|value| cf_string_to_string(value))
-                .as_deref()
-                == Some("InternalBattery")
-            {
-                description = candidate;
-                break;
-            }
-        }
-        if description.is_null() {
-            CFRelease(list);
-            CFRelease(info);
-            return None;
-        }
-        let current = i64::from(cf_dictionary_i32(description, "Current Capacity").unwrap_or(0));
-        let maximum = i64::from(cf_dictionary_i32(description, "Max Capacity").unwrap_or(100));
-        let percent = battery_percent(current, maximum);
-        let charging = cf_dictionary_bool(description, "Is Charging").unwrap_or(false);
-        let charged = cf_dictionary_bool(description, "Is Charged").unwrap_or(false);
-        let power_state = cf_dictionary_value(description, "Power Source State")
-            .and_then(|value| cf_string_to_string(value));
-        let minutes = if charging {
-            cf_dictionary_i32(description, "Time to Full Charge")
-        } else if power_state.as_deref() == Some("Battery Power") {
-            cf_dictionary_i32(description, "Time to Empty")
-        } else {
-            None
-        }
-        .filter(|value| *value > 0);
-        CFRelease(list);
-        CFRelease(info);
-        Some(BatterySample {
-            percent,
-            status: if charged || (percent == 100 && !charging) {
-                "full"
-            } else if charging {
-                "charging"
-            } else if power_state.as_deref() == Some("Battery Power") {
-                "discharging"
-            } else {
-                "unknown"
-            }
-            .to_string(),
-            watts: None,
-            seconds: minutes.map(|minutes| minutes as u64 * 60),
-        })
-    }
-}
-
-fn battery_percent(current: i64, maximum: i64) -> u8 {
-    if maximum <= 0 {
-        return 0;
-    }
-    current
-        .saturating_mul(100)
-        .saturating_add(maximum / 2)
-        .checked_div(maximum)
-        .unwrap_or(0)
-        .clamp(0, 100) as u8
-}
-
-unsafe fn cf_dictionary_i32(dictionary: *const c_void, key: &str) -> Option<i32> {
-    let value = unsafe { cf_dictionary_value(dictionary, key) }?;
-    if unsafe { !cf_is_type(value, CFNumberGetTypeID()) } {
-        return None;
-    }
-    let mut result = 0_i32;
-    unsafe { CFNumberGetValue(value, 3, (&mut result as *mut i32).cast()) }.then_some(result)
+// Snow Leopard has no proc_pid_rusage API. Zero is the existing process
+// model's unavailable sentinel; the detail panel hides disk-I/O on this port.
+fn process_io(_pid: c_int) -> (u64, u64) {
+    (0, 0)
 }
 
 fn cf_string(value: &str) -> Option<*const c_void> {
@@ -1205,11 +1016,6 @@ unsafe fn cf_dictionary_i64(dictionary: *const c_void, key: &str) -> Option<i64>
 
 unsafe fn cf_dictionary_u64(dictionary: *const c_void, key: &str) -> Option<u64> {
     u64::try_from(unsafe { cf_dictionary_i64(dictionary, key) }?).ok()
-}
-
-unsafe fn cf_dictionary_bool(dictionary: *const c_void, key: &str) -> Option<bool> {
-    let value = unsafe { cf_dictionary_value(dictionary, key) }?;
-    unsafe { cf_is_type(value, CFBooleanGetTypeID()).then(|| CFBooleanGetValue(value)) }
 }
 
 unsafe fn cf_is_type(value: *const c_void, expected: usize) -> bool {
@@ -1320,15 +1126,6 @@ struct VmStatistics64 {
     purges: u64,
     purgeable_count: u32,
     speculative_count: u32,
-    decompressions: u64,
-    compressions: u64,
-    swapins: u64,
-    swapouts: u64,
-    compressor_page_count: u32,
-    throttled_count: u32,
-    external_page_count: u32,
-    internal_page_count: u32,
-    total_uncompressed_pages_in_compressor: u64,
 }
 
 #[repr(C)]
@@ -1478,24 +1275,6 @@ struct ProcBsdInfo {
 
 #[repr(C)]
 #[derive(Default)]
-struct ProcBsdShortInfo {
-    pid: u32,
-    parent_pid: u32,
-    process_group: u32,
-    status: u32,
-    command: [c_char; 16],
-    flags: u32,
-    uid: u32,
-    gid: u32,
-    real_uid: u32,
-    real_gid: u32,
-    saved_uid: u32,
-    saved_gid: u32,
-    reserved: u32,
-}
-
-#[repr(C)]
-#[derive(Default)]
 struct ProcTaskInfo {
     virtual_size: u64,
     resident_size: u64,
@@ -1522,30 +1301,6 @@ struct ProcTaskInfo {
 struct MachTimebaseInfo {
     numer: u32,
     denom: u32,
-}
-
-#[repr(C)]
-#[derive(Default)]
-struct RusageInfoV2 {
-    uuid: [u8; 16],
-    user_time: u64,
-    system_time: u64,
-    package_idle_wakeups: u64,
-    interrupt_wakeups: u64,
-    pageins: u64,
-    wired_size: u64,
-    resident_size: u64,
-    physical_footprint: u64,
-    process_start: u64,
-    process_exit: u64,
-    child_user_time: u64,
-    child_system_time: u64,
-    child_package_idle_wakeups: u64,
-    child_interrupt_wakeups: u64,
-    child_pageins: u64,
-    child_elapsed: u64,
-    diskio_bytesread: u64,
-    diskio_byteswritten: u64,
 }
 
 // pw_name is the first member on Darwin; no later fields are accessed.
@@ -1610,7 +1365,6 @@ unsafe extern "C" {
     ) -> c_int;
     fn proc_name(pid: c_int, buffer: *mut c_void, buffer_size: u32) -> c_int;
     fn proc_pidpath(pid: c_int, buffer: *mut c_void, buffer_size: u32) -> c_int;
-    fn proc_pid_rusage(pid: c_int, flavor: c_int, buffer: *mut c_void) -> c_int;
     fn getpwuid(uid: u32) -> *mut Passwd;
 }
 
@@ -1629,6 +1383,7 @@ unsafe extern "C" {
     ) -> c_int;
     fn IOIteratorNext(iterator: u32) -> u32;
     fn IOObjectRelease(object: u32) -> c_int;
+    fn IOObjectRetain(object: u32) -> c_int;
     fn IORegistryEntryGetParentEntry(entry: u32, plane: *const c_char, parent: *mut u32) -> c_int;
     fn IORegistryEntryCreateCFProperty(
         entry: u32,
@@ -1636,15 +1391,7 @@ unsafe extern "C" {
         allocator: *const c_void,
         options: u32,
     ) -> *const c_void;
-    fn IORegistryEntryCreateCFProperties(
-        entry: u32,
-        properties: *mut *const c_void,
-        allocator: *const c_void,
-        options: u32,
-    ) -> c_int;
-    fn IOPSCopyPowerSourcesInfo() -> *const c_void;
-    fn IOPSCopyPowerSourcesList(info: *const c_void) -> *const c_void;
-    fn IOPSGetPowerSourceDescription(info: *const c_void, source: *const c_void) -> *const c_void;
+
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -1655,8 +1402,6 @@ unsafe extern "C" {
     fn CFDictionaryGetTypeID() -> usize;
     fn CFNumberGetTypeID() -> usize;
     fn CFStringGetTypeID() -> usize;
-    fn CFArrayGetCount(array: *const c_void) -> isize;
-    fn CFArrayGetValueAtIndex(array: *const c_void, index: isize) -> *const c_void;
     fn CFDictionaryGetValue(dictionary: *const c_void, key: *const c_void) -> *const c_void;
     fn CFStringCreateWithCString(
         allocator: *const c_void,
@@ -1740,13 +1485,6 @@ mod tests {
     }
 
     #[test]
-    fn process_disk_usage_matches_the_darwin_v2_layout() {
-        assert_eq!(mem::size_of::<RusageInfoV2>(), 160);
-        assert_eq!(mem::offset_of!(RusageInfoV2, diskio_bytesread), 144);
-        assert_eq!(mem::offset_of!(RusageInfoV2, diskio_byteswritten), 152);
-    }
-
-    #[test]
     #[ignore = "requires live Mach APIs; run with --test-threads=1 for port reference accounting"]
     fn live_refresh_releases_host_ports_and_disabled_disk_baselines() {
         unsafe extern "C" {
@@ -1800,25 +1538,9 @@ mod tests {
     }
 
     #[test]
-    fn memory_categories_do_not_mix_page_state_with_backing_type() {
-        let stats = VmStatistics64 {
-            internal_page_count: 100,
-            wire_count: 20,
-            compressor_page_count: 30,
-            purgeable_count: 10,
-            external_page_count: 200,
-            active_count: 999,
-            ..VmStatistics64::default()
-        };
-        assert_eq!(macos_used_pages(&stats), 140);
-    }
-
-    #[test]
-    fn battery_capacity_uses_the_source_reported_maximum() {
-        assert_eq!(battery_percent(2_500, 5_000), 50);
-        assert_eq!(battery_percent(95, 100), 95);
-        assert_eq!(battery_percent(1, 0), 0);
-        assert_eq!(battery_percent(6_000, 5_000), 100);
+    fn snow_leopard_vm_abi_matches_the_10_6_sdk() {
+        assert_eq!(mem::size_of::<VmStatistics64>(), 96);
+        assert_eq!(mem::offset_of!(VmStatistics64, speculative_count), 92);
     }
 
     #[test]
@@ -1856,20 +1578,14 @@ mod tests {
         let first = collector.collect(&config, None).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
         let pid = std::process::id();
-        let mut usage = RusageInfoV2::default();
-        assert_eq!(
-            unsafe { proc_pid_rusage(pid as c_int, 2, (&mut usage as *mut RusageInfoV2).cast()) },
-            0
-        );
-        assert!(usage.resident_size > 0);
         let sample = collector.collect(&config, Some(pid)).unwrap();
         let process = sample
             .processes
             .iter()
             .find(|process| process.pid == pid)
             .unwrap();
-        assert!(process.read_bytes >= usage.diskio_bytesread);
-        assert!(process.write_bytes >= usage.diskio_byteswritten);
+        assert_eq!((process.read_bytes, process.write_bytes), (0, 0));
+        assert!(process.memory > 0);
 
         assert!(!sample.cpu.name.is_empty());
         assert!(!sample.cpu.frequency.is_empty());
@@ -1881,7 +1597,7 @@ mod tests {
             collector
                 .previous_disks
                 .values()
-                .any(|counters| counters.activity_valid)
+                .all(|counters| !counters.activity_valid)
         );
         assert!(!sample.network.interfaces.is_empty());
         let native_network = interface_counters64().unwrap();
@@ -1902,8 +1618,12 @@ mod tests {
                 .any(|process| process.pid == std::process::id())
         );
         assert_eq!(sample.process_count, sample.processes.len());
-        let host_process_count = unsafe { proc_listallpids(ptr::null_mut(), 0) } as usize;
-        assert!(sample.process_count >= host_process_count / 2);
+        // The null-buffer query includes substantial kernel headroom on 10.6.
+        // Compare against a filled PID list, not that capacity estimate.
+        let mut pids = vec![0_i32; unsafe { proc_listallpids(ptr::null_mut(), 0) } as usize + 32];
+        let visible =
+            unsafe { proc_listallpids(pids.as_mut_ptr().cast(), (pids.len() * 4) as c_int) };
+        assert!(sample.process_count >= (visible as usize).saturating_sub(8));
         assert!(
             sample
                 .processes
@@ -1911,28 +1631,20 @@ mod tests {
                 .any(|process| process.user.parse::<u32>().is_err())
         );
         assert_eq!(first.cpu.cores.len(), sample.cpu.cores.len());
-        #[cfg(target_arch = "aarch64")]
-        {
-            assert!(sample.cpu.temperature.is_some());
-            assert_eq!(sample.gpus.len(), 1);
-            assert!(sample.gpus[0].support.utilization);
-            assert!(sample.gpus[0].support.gpu_clock);
-            assert!(sample.gpus[0].gpu_clock_mhz > 0);
-            assert!(sample.gpus[0].support.power_state);
-            assert_eq!(sample.gpus[0].power_limit_mw, 0);
-            assert!(sample.gpus[0].support.memory_total);
-            assert!(sample.gpus[0].support.memory_used);
-            assert!(sample.gpus[0].support.unified_memory);
-            assert!(sample.gpus[0].support.encoder_sessions);
-            assert!(sample.gpus[0].support.decoder_sessions);
-            assert_eq!(sample.gpus[0].memory_total, sample.memory.total);
-            assert!(sample.gpus[0].memory_used <= sample.gpus[0].memory_total);
-            if sample.cpu.name.contains("A18") {
-                assert!(sample.gpus[0].name.contains("5-core GPU"));
-                assert!(sample.gpus[0].temperature_c > 0);
-                assert!(sample.gpus[0].support.memory_utilization);
-                assert!(sample.gpus[0].memory_utilization <= 100);
-            }
-        }
+        assert!(sample.cpu.temperature.is_some());
+        eprintln!(
+            "LIVE cpu={} cores={} frequency={} temp={:?} memory={}/{} available={} disks={:?} network={} processes={} gpus={:?}",
+            sample.cpu.name,
+            sample.cpu.cores.len(),
+            sample.cpu.frequency,
+            sample.cpu.temperature,
+            sample.memory.used,
+            sample.memory.total,
+            sample.memory.available,
+            sample.memory.disks,
+            sample.network.selected,
+            sample.process_count,
+            sample.gpus
+        );
     }
 }

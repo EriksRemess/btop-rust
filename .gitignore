@@ -1,2 +1,6 @@
 /target/
 
+
+# Cross-build helper caches.
+__pycache__/
+*.py[cod]

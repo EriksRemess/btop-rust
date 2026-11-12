@@ -27,8 +27,11 @@ const OPTIONS_GENERAL: &[&str] = &[
     "clock_format",
     "base_10_sizes",
     "background_update",
+    #[cfg(not(target_os = "macos"))]
     "show_battery",
+    #[cfg(not(target_os = "macos"))]
     "selected_battery",
+    #[cfg(not(target_os = "macos"))]
     "show_battery_watts",
     "log_level",
     "save_config_on_exit",
@@ -42,27 +45,41 @@ const OPTIONS_CPU: &[&str] = &[
     "cpu_single_graph",
     "show_gpu_info",
     "check_temp",
+    #[cfg(not(target_os = "macos"))]
     "cpu_sensor",
+    #[cfg(not(target_os = "macos"))]
     "show_coretemp",
+    #[cfg(not(target_os = "macos"))]
     "cpu_core_map",
     "temp_scale",
     "show_cpu_freq",
+    #[cfg(not(target_os = "macos"))]
     "freq_mode",
     "custom_cpu_name",
     "show_uptime",
+    #[cfg(not(target_os = "macos"))]
     "show_cpu_watts",
 ];
 const OPTIONS_GPU: &[&str] = &[
+    #[cfg(not(target_os = "macos"))]
     "nvml_measure_pcie_speeds",
+    #[cfg(not(target_os = "macos"))]
     "rsmi_measure_pcie_speeds",
     "graph_symbol_gpu",
+    #[cfg(not(target_os = "macos"))]
     "gpu_mirror_graph",
+    #[cfg(not(target_os = "macos"))]
     "shown_gpus",
     "custom_gpu_name0",
+    #[cfg(not(target_os = "macos"))]
     "custom_gpu_name1",
+    #[cfg(not(target_os = "macos"))]
     "custom_gpu_name2",
+    #[cfg(not(target_os = "macos"))]
     "custom_gpu_name3",
+    #[cfg(not(target_os = "macos"))]
     "custom_gpu_name4",
+    #[cfg(not(target_os = "macos"))]
     "custom_gpu_name5",
 ];
 const OPTIONS_MEM: &[&str] = &[
@@ -76,11 +93,15 @@ const OPTIONS_MEM: &[&str] = &[
     "io_graph_speeds",
     "show_swap",
     "swap_disk",
+    #[cfg(not(target_os = "macos"))]
     "only_physical",
+    #[cfg(not(target_os = "macos"))]
     "use_fstab",
+    #[cfg(not(target_os = "macos"))]
     "zfs_hide_datasets",
     "disk_free_priv",
     "disks_filter",
+    #[cfg(not(target_os = "macos"))]
     "zfs_arc_cached",
 ];
 const OPTIONS_NET: &[&str] = &[
@@ -107,6 +128,7 @@ const OPTIONS_PROC: &[&str] = &[
     "proc_mem_bytes",
     "keep_dead_proc_usage",
     "proc_cpu_graphs",
+    #[cfg(not(target_os = "macos"))]
     "proc_filter_kernel",
     "proc_follow_detailed",
 ];
@@ -5626,10 +5648,12 @@ fn draw_process_details(
     let labels = [
         ("Status:", process_state(process.state).to_string()),
         ("Elapsed:", units::duration(process.elapsed_seconds)),
+        #[cfg(not(target_os = "macos"))]
         (
             "IO/R:",
             units::bytes(process.read_bytes, app.config.base_10_sizes),
         ),
+        #[cfg(not(target_os = "macos"))]
         (
             "IO/W:",
             units::bytes(process.write_bytes, app.config.base_10_sizes),
@@ -5639,7 +5663,7 @@ fn draw_process_details(
         ("Threads:", process.threads.to_string()),
         ("Nice:", process.nice.to_string()),
     ];
-    let item_count = (details_width.saturating_sub(2) / 10).clamp(1, 8);
+    let item_count = (details_width.saturating_sub(2) / 10).clamp(1, labels.len());
     let item_width = details_width.saturating_sub(2) / item_count;
     for (index, (label, value)) in labels.iter().take(item_count).enumerate() {
         let x = details_x + 1 + index * item_width;
@@ -10446,7 +10470,10 @@ mod tests {
         app.overlay = Overlay::Options;
         app.options_selected = 9;
         let area = app.options_area().unwrap();
+        #[cfg(not(target_os = "macos"))]
         assert_eq!((area.x, area.y, area.w, area.h), (50, 11, 78, 46));
+        #[cfg(target_os = "macos")]
+        assert_eq!((area.x, area.y, area.w, area.h), (50, 14, 78, 40));
 
         let mut canvas = Canvas::new(180, 60);
         draw_options(&mut canvas, &app, 0, 0, 9);
