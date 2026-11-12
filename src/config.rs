@@ -579,6 +579,23 @@ fn write_config_atomically(path: &Path, output: &[u8]) -> Result<(), String> {
         let result = (|| -> std::io::Result<()> {
             file.write_all(output)?;
             if let Ok(metadata) = fs::metadata(path) {
+                // Atomic replacement must preserve ownership as well as mode.
+                // A sudo invocation may otherwise publish a root-owned file in
+                // the invoking user's configuration directory.
+                #[cfg(unix)]
+                {
+                    use std::os::fd::AsRawFd;
+                    use std::os::unix::fs::MetadataExt;
+                    unsafe extern "C" {
+                        fn fchown(fd: i32, owner: u32, group: u32) -> i32;
+                    }
+                    let created = file.metadata()?;
+                    if (created.uid(), created.gid()) != (metadata.uid(), metadata.gid())
+                        && unsafe { fchown(file.as_raw_fd(), metadata.uid(), metadata.gid()) } != 0
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
                 file.set_permissions(metadata.permissions())?;
             }
             file.sync_all()?;
@@ -894,6 +911,55 @@ mod tests {
             0o640
         );
         crate::test_remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires sudo to verify replacement of another user's config"]
+    fn elevated_save_preserves_original_owner() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+        unsafe extern "C" {
+            fn geteuid() -> u32;
+            fn fchown(fd: i32, owner: u32, group: u32) -> i32;
+        }
+        assert_eq!(unsafe { geteuid() }, 0, "run this test through sudo");
+        let uid = std::env::var("SUDO_UID").unwrap().parse::<u32>().unwrap();
+        let gid = std::env::var("SUDO_GID").unwrap().parse::<u32>().unwrap();
+        assert_ne!(uid, 0);
+        // Exclusive mode-0700 creation keeps this privileged fixture private.
+        let directory = std::env::temp_dir().join(format!(
+            "btoprs-owner-save-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .unwrap();
+        let path = directory.join("test.conf");
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o640)
+            .open(&path)
+            .unwrap();
+        file.write_all(b"update_ms = 1700\n").unwrap();
+        assert_eq!(unsafe { fchown(file.as_raw_fd(), uid, gid) }, 0);
+        let original = file.metadata().unwrap();
+        drop(file);
+        let mut config = Config::load(Some(&path)).unwrap();
+        config.set_value("update_ms", "3100");
+        config.save().unwrap();
+        let saved = fs::metadata(&path).unwrap();
+        assert_eq!((saved.uid(), saved.gid()), (uid, gid));
+        assert_eq!(saved.permissions().mode(), original.permissions().mode());
+        assert_eq!(Config::load(Some(&path)).unwrap().update_ms, 3100);
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir(directory).unwrap();
     }
 
     #[cfg(unix)]

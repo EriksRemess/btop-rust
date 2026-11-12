@@ -22,7 +22,9 @@ python3 scripts/snow-leopard/build.py \
 
 The executable is `target/snow-leopard/cargo/x86_64-apple-darwin/release/btoprs`.
 Copy it to `~/.local/bin/btoprs` on the Mac. No Rust installation, MacPorts
-runtime libraries or administrator access is needed on the target.
+runtime libraries or administrator access is needed on the target. Running
+through sudo reveals additional protected processes; saving an existing config
+preserves its original owner, group and permissions.
 
 This is an application-specific legacy port, outside Rust's official macOS
 minimum. The build reconstructs std with pthread-key TLS, supplies the small

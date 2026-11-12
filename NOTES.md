@@ -117,3 +117,22 @@ attributes. Do not direct test key events at a user's existing terminal.
 
 These checks establish this specific application/toolchain/hardware combination,
 not general Rust support for macOS 10.6 or untested GPU drivers.
+
+### Sudo configuration regression
+
+Atomic config replacement preserves the existing file's UID/GID as well as its
+mode. If ownership cannot be retained, saving fails without replacing the old
+file. This prevents a sudo-run monitor from leaving a root-owned replacement in
+the invoking user's configuration directory.
+
+An additional ignored test was run with sudo on the physical iMac. It creates
+an isolated mode-0700 temporary fixture, changes its config owner to SUDO_UID/
+SUDO_GID, saves through the actual Config API and verifies ownership, mode and
+new contents before cleanup:
+
+```console
+sudo ./btoprs-tests config::tests::elevated_save_preserves_original_owner --ignored --exact --test-threads=1
+```
+
+The user's already affected file was repaired by changing only its ownership;
+its saved contents were retained.
