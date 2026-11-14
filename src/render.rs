@@ -8,7 +8,7 @@ use crate::gpu::GpuSample;
 use crate::terminal::{Key, Size};
 use crate::{theme, units};
 
-const HISTORY: usize = 240;
+const MIN_HISTORY: usize = 240;
 
 const OPTIONS_GENERAL: &[&str] = &[
     "color_theme",
@@ -122,6 +122,7 @@ const OPTION_CATEGORIES: [&[&str]; 6] = [
 pub struct AppState {
     pub config: Config,
     pub sample: Sample,
+    history_limit: usize,
     pub cpu_history: VecDeque<f64>,
     cpu_watts_max: f64,
     cpu_field_histories: HashMap<String, VecDeque<f64>>,
@@ -359,6 +360,7 @@ impl AppState {
             filter_buffer: config.process_filter.clone(),
             config,
             sample: Sample::default(),
+            history_limit: MIN_HISTORY,
             cpu_history: VecDeque::new(),
             cpu_watts_max: 0.0,
             cpu_field_histories: HashMap::new(),
@@ -436,6 +438,8 @@ impl AppState {
     }
 
     pub fn update(&mut self, mut sample: Sample) {
+        let history_limit = self.history_limit;
+        let push = |history: &mut VecDeque<f64>, value| push_history(history, value, history_limit);
         if self.config.process_tree && !self.process_tree_active {
             let threshold = self
                 .config
@@ -458,7 +462,7 @@ impl AppState {
         self.core_histories
             .resize_with(sample.cpu.cores.len(), VecDeque::new);
         for (history, value) in self.core_histories.iter_mut().zip(&sample.cpu.cores) {
-            push(history, *value);
+            push_history(history, *value, MIN_HISTORY);
         }
         self.core_temperature_histories
             .resize_with(sample.cpu.core_temperatures.len(), VecDeque::new);
@@ -468,7 +472,7 @@ impl AppState {
             .zip(&sample.cpu.core_temperatures)
         {
             if let Some(temperature) = temperature {
-                push(history, *temperature);
+                push_history(history, *temperature, MIN_HISTORY);
             }
         }
         if let Some(temperature) = sample.cpu.temperature {
@@ -592,9 +596,10 @@ impl AppState {
             } else {
                 process.cpu.round()
             };
-            push(
+            push_history(
                 self.process_cpu_histories.entry(process.pid).or_default(),
                 graph_value,
+                MIN_HISTORY,
             );
         }
         if self.detailed_history_pid != self.detailed_pid {
@@ -2025,6 +2030,9 @@ impl Renderer {
 
     pub fn render(&mut self, size: Size, app: &mut AppState) -> String {
         let render_started = Instant::now();
+        // Two samples per column cover braille/block graphs. Keep the wider
+        // history when the terminal temporarily shrinks or changes graph style.
+        app.history_limit = app.history_limit.max(usize::from(size.cols) * 2);
         app.draw_times_us = [0; 6];
         let selected_option = app.editing_option.or_else(|| app.current_option());
         app.clear_mouse_regions();
@@ -9071,9 +9079,9 @@ fn ratio(part: u64, total: u64) -> f64 {
         part as f64 * 100.0 / total as f64
     }
 }
-fn push(history: &mut VecDeque<f64>, value: f64) {
+fn push_history(history: &mut VecDeque<f64>, value: f64, limit: usize) {
     history.push_back(value);
-    if history.len() > HISTORY {
+    if history.len() > limit {
         history.pop_front();
     }
 }
@@ -11139,6 +11147,122 @@ mod tests {
 
         assert!(canvas.cells[10..19].iter().all(|cell| cell.ch == ' '));
         assert_ne!(canvas.cells[19].ch, ' ');
+    }
+
+    #[test]
+    fn cpu_and_gpu_graphs_fill_after_widening() {
+        for symbol in [GraphSymbol::Braille, GraphSymbol::Block, GraphSymbol::Tty] {
+            let mut app = app();
+            app.config.set_value("shown_boxes", "cpu gpu0");
+            let mut sample = Sample::default();
+            sample.cpu.total = 100.0;
+            sample.cpu.cores = vec![100.0];
+            let mut gpu = GpuSample {
+                utilization: 100,
+                ..GpuSample::default()
+            };
+            gpu.support.utilization = true;
+            sample.gpus.push(gpu);
+            app.update(sample.clone());
+            let mut renderer = Renderer::new();
+            renderer.render(
+                Size {
+                    cols: 120,
+                    rows: 30,
+                },
+                &mut app,
+            );
+            for _ in 0..300 {
+                app.update(sample.clone());
+            }
+
+            let cpu_before = app.cpu_history.clone();
+            let gpu_before = app.gpu_histories[0].utilization.clone();
+            renderer.render(
+                Size {
+                    cols: 400,
+                    rows: 30,
+                },
+                &mut app,
+            );
+            assert_eq!(app.cpu_history, cpu_before);
+            assert_eq!(app.gpu_histories[0].utilization, gpu_before);
+            for _ in 0..800 {
+                app.update(sample.clone());
+            }
+
+            let mut canvas = Canvas::new(400, 12);
+            canvas.graph_symbol = symbol;
+            draw_cpu(&mut canvas, Rect::new(0, 0, 400, 12), &mut app);
+            assert_ne!(canvas.cells[5 * 400 + 1].ch, ' ', "{symbol:?} CPU");
+            let mut canvas = Canvas::new(400, 12);
+            canvas.graph_symbol = symbol;
+            draw_gpu(&mut canvas, Rect::new(0, 0, 400, 12), &app, 0);
+            assert_ne!(canvas.cells[5 * 400 + 1].ch, ' ', "{symbol:?} GPU");
+
+            for size in [Size { cols: 80, rows: 24 }, Size { cols: 2, rows: 2 }] {
+                renderer.render(size, &mut app);
+                app.update(sample.clone());
+            }
+            renderer.render(
+                Size {
+                    cols: 400,
+                    rows: 30,
+                },
+                &mut app,
+            );
+            assert_eq!(app.cpu_history.len(), 800);
+            assert_eq!(app.gpu_histories[0].utilization.len(), 800);
+        }
+    }
+
+    #[test]
+    fn wide_histories_keep_latest_samples_and_bound_small_graphs() {
+        let mut app = app();
+        let mut renderer = Renderer::new();
+        renderer.render(
+            Size {
+                cols: 400,
+                rows: 30,
+            },
+            &mut app,
+        );
+        app.detailed_pid = Some(42);
+        let mut sample = Sample::default();
+        sample.cpu.fields.insert("user".into(), 50.0);
+        sample.cpu.cores = vec![50.0];
+        sample.cpu.core_temperatures = vec![Some(60.0)];
+        sample.memory.total = 100;
+        sample.memory.used = 50;
+        sample.memory.disks.push(crate::collect::DiskSample {
+            mount: "/".into(),
+            io_activity: Some(50.0),
+            ..crate::collect::DiskSample::default()
+        });
+        sample.network.connected = true;
+        sample.network.selected = "test0".into();
+        sample.processes.push(ProcessSample {
+            pid: 42,
+            cpu: 50.0,
+            memory: 50,
+            ..ProcessSample::default()
+        });
+        for speed in 0..1_000 {
+            sample.network.download_per_second = speed;
+            app.update(sample.clone());
+        }
+
+        let expected: VecDeque<_> = (200..1_000).map(f64::from).collect();
+        assert_eq!(app.download_history, expected);
+        assert_eq!(app.network_histories["test0"].download, expected);
+        assert_eq!(app.cpu_field_histories["user"].len(), 800);
+        assert_eq!(app.mem_history.len(), 800);
+        assert_eq!(app.disk_histories["/"].activity.len(), 800);
+        assert_eq!(app.detailed_cpu_history.len(), 800);
+        assert_eq!(app.detailed_memory_history.len(), 800);
+        assert_eq!(app.core_histories[0].len(), 240);
+        assert_eq!(app.core_temperature_histories[0].len(), 240);
+        assert_eq!(app.process_cpu_histories[&42].len(), 240);
     }
 
     #[test]
