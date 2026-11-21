@@ -17,8 +17,8 @@ btoprs
 Press `Esc` to open the menu and `q` or `Ctrl-C` to quit. Run `btoprs --help`
 for command-line options.
 
-On Linux with an NVIDIA GPU, press `v` or click `gpu View` in the process
-footer to show a separate GPU processes panel. It displays GPU utilization,
+On Linux, press `v` or click `gpu view` in the process footer to open GPU
+processes for supported NVIDIA, AMD (`amdgpu`), and Intel (`i915` or `xe`) GPUs. It displays GPU utilization,
 GPU memory, CPU utilization, and host RAM, with device IDs and VRAM percentage
 when space permits. Add `gpu_proc` to `shown_boxes` or a preset to show it on startup.
 
@@ -27,7 +27,10 @@ Each panel has independent sorting, filtering, selection, scrolling, and pause.
 GPU tree view keeps ancestors for context. Enter opens details inside the selected
 panel, including per-device GPU readings when space permits. `—` means unavailable.
 GPU panel settings are in the Processes options menu. These controls and the
-panel appear only when a GPU backend successfully supports process queries.
+panel appear when a GPU driver supplies per-process data. On AMD and Intel,
+the list covers processes whose DRM file descriptors you can read. GPU memory
+includes resident system and device-local buffers. VRAM percentage uses only
+device-local bytes and requires a known VRAM capacity.
 
 ## Make it yours
 

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::collect::ProcessSample;
 use crate::gpu::GpuSample;
@@ -7,6 +7,10 @@ use crate::gpu::GpuSample;
 pub struct Snapshot {
     pub available: bool,
     pub complete: bool,
+    pub unreadable: HashSet<u32>,
+    // DRM can report both system and device-local resident memory.
+    // NVML reports only device memory and uses the primary byte count.
+    pub dedicated: Option<HashMap<u32, Option<u64>>>,
     pub processes: HashMap<u32, Option<u64>>,
     pub utilization: Option<HashMap<u32, Option<u32>>>,
 }
@@ -17,6 +21,7 @@ pub fn available(gpus: &[GpuSample]) -> bool {
 
 #[derive(Debug, Clone, Default)]
 pub struct Usage {
+    pub dedicated_bytes: Option<u64>,
     pub bytes: Option<u64>,
     pub utilization: Option<u32>,
     pub devices: Vec<DeviceUsage>,
@@ -56,24 +61,31 @@ pub fn attach(
                 });
             }
         }
-        // NVML identifies processes only by PID. Recheck identity after its
-        // query so an exited/replaced process cannot receive another's memory.
+        // Driver data is keyed by PID. Confirm identity after sampling.
         if !memory.devices.is_empty()
             && (process.start_time.is_none() || current_start(process.pid) != process.start_time)
         {
             process.gpu = Usage::default();
             continue;
         }
-        if complete {
+        let readable = devices
+            .iter()
+            .all(|(_, _, data)| !data.unreadable.contains(&process.pid));
+        if readable && complete {
+            memory.dedicated_bytes = devices.iter().try_fold(0_u64, |total, (_, _, data)| {
+                let bytes = data.dedicated.as_ref().unwrap_or(&data.processes);
+                total.checked_add(bytes.get(&process.pid).copied().unwrap_or(Some(0))?)
+            });
             memory.bytes = memory
                 .devices
                 .iter()
                 .try_fold(0_u64, |total, device| total.checked_add(device.bytes?));
         }
-        if !devices.is_empty()
+        if readable
+            && !devices.is_empty()
             && devices
                 .iter()
-                .all(|(_, _, data)| data.utilization.is_some())
+                .all(|(_, _, data)| data.complete || data.utilization.is_some())
         {
             memory.utilization = memory.devices.iter().try_fold(0_u32, |total, device| {
                 total.checked_add(device.utilization?)
@@ -166,6 +178,24 @@ mod tests {
         attach(&mut processes, &[first, second], |_| Some(10));
         assert_eq!(processes[0].gpu.utilization, None);
         assert_eq!(processes[0].gpu.devices[0].utilization, Some(60));
+    }
+
+    #[test]
+    fn unrelated_memory_only_gpu_does_not_hide_measured_utilization() {
+        let mut processes = [process(1), process(2)];
+        let mut measured = gpu(&[(1, Some(100))], true);
+        measured.process_usage.as_mut().unwrap().utilization = Some(HashMap::from([(1, Some(35))]));
+        let mut memory_only = gpu(&[(2, Some(200))], true);
+        attach(
+            &mut processes,
+            &[measured.clone(), memory_only.clone()],
+            |_| Some(10),
+        );
+        assert_eq!(processes[0].gpu.utilization, Some(35));
+        assert_eq!(processes[1].gpu.utilization, None);
+        memory_only.process_usage.as_mut().unwrap().complete = false;
+        attach(&mut processes, &[measured, memory_only], |_| Some(10));
+        assert_eq!(processes[0].gpu.utilization, None);
     }
 
     #[test]

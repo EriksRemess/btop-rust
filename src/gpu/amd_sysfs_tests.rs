@@ -23,8 +23,8 @@ impl Fixture {
         let collector = GpuCollector {
             nvml: None,
             rsmi: None,
-            amd_sysfs: discover_amd_sysfs_at(&root),
-            intel: None,
+            amd_sysfs: discover_amd_sysfs_at(&root, None),
+            intel: Vec::new(),
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             apple: None,
             shown: "amd".into(),
@@ -39,7 +39,7 @@ impl Fixture {
     }
 
     fn sample(&mut self) -> GpuSample {
-        self.collector.collect(&self.config, false).remove(0)
+        self.collector.collect(&self.config, false, &[]).remove(0)
     }
 }
 

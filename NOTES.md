@@ -24,22 +24,33 @@ Linux data comes from procfs, sysfs, perf events, and dynamically loaded GPU
 interfaces. Desktop entries and icons are Linux installation artifacts and are
 not installed on macOS.
 
-Per-process GPU telemetry currently supports NVIDIA through optional NVML process
-queries. Graphics and compute entries are merged by PID and GPU instance;
-duplicate reports are counted once. The process column sums reported NVIDIA
-devices only, and remains unavailable when a device query is incomplete or a
-memory value is unavailable. Device totals can include allocations not
-attributable to a process. PID start times are rechecked after GPU collection.
-GPU utilization uses the latest per-process SM sample from the past second;
-idle processes show zero, unsupported queries remain unavailable. Utilization
-is summed across reported NVIDIA devices and can exceed 100% with multiple GPUs.
-An initial process-query probe enables the feature even when the GPU is idle.
-Failed probes retry every ten seconds; after support is established, process
-collection runs only when the panel is requested or process details need it.
-Transient sample failures remain unavailable readings without hiding the feature.
-Without a supported backend, the process toggle, panel, options, and GPU detail
-row are hidden; saved GPU process settings are preserved. AMD/Intel per-process
-data is not yet implemented, so this feature is also hidden on Windows and macOS.
+NVIDIA process telemetry uses optional NVML queries. Graphics and compute
+entries are merged by PID and GPU instance. Utilization uses the latest SM
+sample from the past second.
+
+AMD `amdgpu` and Intel `i915` and `xe` process telemetry uses Linux DRM client
+records in `/proc/<pid>/fdinfo`. Graphics and compute activity comes from
+engine-time deltas on AMD and i915, and from busy and total cycle deltas on Xe.
+Multiple engines in one class are normalized by the reported capacity. AMD
+compute-unit occupancy supplements these readings when KFD exposes it.
+Utilization needs two comparable counter readings. GPU memory sums resident
+buffers across regions. VRAM percentage uses only device-local resident bytes
+and requires known capacity. Shared buffers or clients can appear in more than
+one process. Duplicate descriptors within a process count once per GPU.
+See the [Linux DRM client usage specification](https://docs.kernel.org/gpu/drm-usage-stats.html).
+
+DRM device numbers come from sysfs, so a readable client can still be
+attributed when its render node is hidden. On mixed AMD systems, sysfs supplies
+additional cards when all ROCm SMI devices can be matched by PCI address.
+The collector matches each client to its device and rechecks PID start times
+after sampling. A user's process visibility depends on procfs permissions.
+Missing counters and incomplete readings display as `—`. GPU utilization across
+multiple devices can exceed 100%. The GPU process panel and controls appear
+after a successful probe, including on an idle GPU with readable counters.
+Failed probes retry every ten seconds. Once support is established, collection
+runs when the panel is requested or process details are open. Saved settings
+are preserved when process telemetry is unavailable. The GPU process panel is
+currently available on Linux.
 
 ### macOS
 
@@ -100,7 +111,10 @@ values are omitted or left unavailable rather than synthesized.
 
 The regular suite covers collectors, configuration, menus, mouse controls,
 rendering, responsive layouts, and terminal input. Additional ignored tests can
-exercise live macOS and NVIDIA APIs on suitable hosts. Before release, run:
+exercise native APIs on suitable hosts. On a Linux machine with an AMD or Intel
+GPU that exposes DRM client accounting, run
+`cargo test collects_live_drm_processes -- --ignored` to check detection and
+process attribution with a real render client. Before release, run:
 
 ```console
 cargo test --all-targets

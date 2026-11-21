@@ -136,7 +136,7 @@ pub(super) fn draw_gpu_process_rows(
             .map_or(theme::LOW, |value| metric(f64::from(value)));
         let memory_percent = process
             .gpu
-            .bytes
+            .dedicated_bytes
             .zip(capacity)
             .map(|(bytes, capacity)| ratio(bytes, capacity));
         let memory_style = memory_percent.map_or(theme::LOW, metric);

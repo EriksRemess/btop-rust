@@ -154,6 +154,7 @@ impl GpuProcessPanel {
                         process.cpu = 0.0;
                         process.memory = 0;
                         process.gpu.bytes = Some(0);
+                        process.gpu.dedicated_bytes = Some(0);
                         process.gpu.utilization = Some(0);
                         for device in &mut process.gpu.devices {
                             device.bytes = Some(0);

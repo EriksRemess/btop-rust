@@ -371,7 +371,7 @@ impl Collector {
         let started = Instant::now();
         let collect_gpu_processes =
             config.gpu_processes_shown() || detailed_pids.iter().any(Option::is_some);
-        let gpus = self.gpus.collect(config, collect_gpu_processes);
+        let gpus = self.gpus.collect(config, collect_gpu_processes, &processes);
         crate::process_gpu::attach(&mut processes, &gpus, |pid| {
             fs::read(format!("/proc/{pid}/stat"))
                 .ok()

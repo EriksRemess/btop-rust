@@ -118,7 +118,12 @@ impl GpuCollector {
         }
     }
 
-    pub fn collect(&mut self, config: &Config, _collect_processes: bool) -> Vec<GpuSample> {
+    pub fn collect(
+        &mut self,
+        config: &Config,
+        _collect_processes: bool,
+        _processes: &[crate::collect::ProcessSample],
+    ) -> Vec<GpuSample> {
         let shown = config.value("shown_gpus").unwrap_or("nvidia");
         if shown != self.shown {
             *self = Self::new(config);

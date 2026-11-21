@@ -23,6 +23,8 @@ fn fixture(name: &str) -> (IntelGpu, [fs::File; 3]) {
     let (energy, energy_writer) = counter(1000, &format!("{name}-energy"));
     (
         IntelGpu {
+            #[cfg(target_os = "linux")]
+            drm: None,
             name: "test GPU".into(),
             busy: vec![busy],
             frequency: Some(frequency),

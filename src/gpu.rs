@@ -16,6 +16,8 @@ pub(crate) mod macos;
 mod vulkan;
 
 #[cfg(target_os = "linux")]
+mod drm_process;
+#[cfg(target_os = "linux")]
 mod process_usage;
 
 #[cfg(test)]
@@ -127,7 +129,7 @@ pub struct GpuCollector {
     nvml: Option<Nvml>,
     rsmi: Option<Rsmi>,
     amd_sysfs: Vec<AmdSysfsDevice>,
-    intel: Option<IntelGpu>,
+    intel: Vec<IntelGpu>,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     apple: Option<macos::AppleGpuCollector>,
     shown: String,
@@ -142,16 +144,16 @@ impl GpuCollector {
             .to_string();
         let nvml = shown.contains("nvidia").then(Nvml::load).flatten();
         let rsmi = shown.contains("amd").then(Rsmi::load).flatten();
-        let amd_sysfs = if rsmi.is_none() {
-            if shown.contains("amd") {
-                discover_amd_sysfs()
-            } else {
-                Vec::new()
-            }
+        let amd_sysfs = if shown.contains("amd") {
+            discover_amd_sysfs(rsmi.as_ref())
         } else {
             Vec::new()
         };
-        let intel = shown.contains("intel").then(IntelGpu::load).flatten();
+        let intel = if shown.contains("intel") {
+            IntelGpu::load()
+        } else {
+            Vec::new()
+        };
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         let apple = shown
             .contains("apple")
@@ -169,8 +171,14 @@ impl GpuCollector {
         }
     }
 
-    pub fn collect(&mut self, config: &Config, collect_processes: bool) -> Vec<GpuSample> {
-        let _ = collect_processes;
+    pub fn collect(
+        &mut self,
+        config: &Config,
+        collect_processes: bool,
+        processes: &[crate::collect::ProcessSample],
+    ) -> Vec<GpuSample> {
+        #[cfg(not(target_os = "linux"))]
+        let _ = (collect_processes, processes);
         let shown = config
             .value("shown_gpus")
             .unwrap_or("nvidia amd intel apple");
@@ -208,6 +216,8 @@ impl GpuCollector {
                 }
             }
         }
+        #[cfg(target_os = "linux")]
+        let amd_start = samples.len();
         if let Some(rsmi) = &self.rsmi {
             samples.extend(rsmi.collect(check_temperature, rsmi_pcie));
         }
@@ -216,8 +226,34 @@ impl GpuCollector {
                 .iter_mut()
                 .map(|device| device.collect(check_temperature)),
         );
-        if let Some(intel) = &mut self.intel {
-            samples.push(intel.collect());
+        #[cfg(target_os = "linux")]
+        let intel_start = samples.len();
+        samples.extend(self.intel.iter_mut().map(IntelGpu::collect));
+        #[cfg(target_os = "linux")]
+        {
+            let amd_devices = self
+                .rsmi
+                .iter_mut()
+                .flat_map(|rsmi| rsmi.devices.iter_mut().map(|device| &mut device.drm))
+                .chain(self.amd_sysfs.iter_mut().map(|device| &mut device.drm));
+            let mut devices: Vec<_> = (amd_start..intel_start)
+                .zip(amd_devices)
+                .chain((intel_start..).zip(self.intel.iter_mut().map(|gpu| &mut gpu.drm)))
+                .filter_map(|(index, device)| Some((index, device.as_mut()?)))
+                .collect();
+            drm_process::collect(
+                &mut devices,
+                &mut samples,
+                processes,
+                collect_processes,
+                Path::new("/proc"),
+                Instant::now(),
+            );
+            for (index, device) in devices.into_iter().rev() {
+                if device.awaiting_telemetry() {
+                    samples.remove(index);
+                }
+            }
         }
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         if let Some(apple) = &mut self.apple {
@@ -231,7 +267,7 @@ impl GpuCollector {
         {
             (shown.contains("nvidia") && self.nvml.is_none())
                 || (shown.contains("amd") && self.rsmi.is_none() && self.amd_sysfs.is_empty())
-                || (shown.contains("intel") && self.intel.is_none())
+                || (shown.contains("intel") && self.intel.is_empty())
         }
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
@@ -253,11 +289,9 @@ impl GpuCollector {
             }
             if shown.contains("amd") && self.rsmi.is_none() && self.amd_sysfs.is_empty() {
                 self.rsmi = Rsmi::load();
-                if self.rsmi.is_none() {
-                    self.amd_sysfs = discover_amd_sysfs();
-                }
+                self.amd_sysfs = discover_amd_sysfs(self.rsmi.as_ref());
             }
-            if shown.contains("intel") && self.intel.is_none() {
+            if shown.contains("intel") && self.intel.is_empty() {
                 self.intel = IntelGpu::load();
             }
         }
@@ -670,6 +704,8 @@ fn rsmi_init_guard(
 }
 
 struct Rsmi {
+    #[cfg(target_os = "linux")]
+    devices: Vec<drm_process::RsmiDevice>,
     _library: DynamicLibrary,
     functions: RsmiFunctions,
     count: u32,
@@ -679,6 +715,20 @@ struct Rsmi {
 }
 
 impl Rsmi {
+    fn sysfs_paths(&self) -> Option<Vec<&Path>> {
+        #[cfg(target_os = "linux")]
+        {
+            self.devices
+                .iter()
+                .map(|device| device.sysfs_path.as_deref())
+                .collect()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+    }
+
     fn load() -> Option<Self> {
         let library = DynamicLibrary::open(&[
             "/opt/rocm/lib/librocm_smi64.so",
@@ -773,7 +823,11 @@ impl Rsmi {
             let _ = unsafe { (functions.temperature)(index, 0, 1, &mut temperature) };
             temperature_limits.push(temperature / 1000);
         }
+        #[cfg(target_os = "linux")]
+        let devices = drm_process::rsmi_devices(&library, count);
         Some(Self {
+            #[cfg(target_os = "linux")]
+            devices,
             _library: DropGuard::dismiss(library),
             functions,
             count,
@@ -896,6 +950,8 @@ const RSMI_CLOCK_SYSTEM: c_int = 0;
 const RSMI_CLOCK_MEMORY: c_int = 4;
 
 struct AmdSysfsDevice {
+    #[cfg(target_os = "linux")]
+    drm: Option<drm_process::Device>,
     name: String,
     driver_label: Option<String>,
     device: PathBuf,
@@ -1122,8 +1178,11 @@ fn system_pci_databases() -> impl Iterator<Item = String> {
     .filter_map(|path| fs::read_to_string(path).ok())
 }
 
-fn discover_amd_sysfs() -> Vec<AmdSysfsDevice> {
-    let mut devices = discover_amd_sysfs_at(Path::new("/sys/class/drm"));
+fn discover_amd_sysfs(rsmi: Option<&Rsmi>) -> Vec<AmdSysfsDevice> {
+    let mut devices = discover_amd_sysfs_at(Path::new("/sys/class/drm"), rsmi);
+    if devices.is_empty() {
+        return devices;
+    }
     #[cfg(target_os = "linux")]
     for device in &mut devices {
         if device.name.starts_with("AMD GPU (1002:") {
@@ -1134,9 +1193,8 @@ fn discover_amd_sysfs() -> Vec<AmdSysfsDevice> {
         }
     }
     #[cfg(target_os = "linux")]
-    if !devices.is_empty()
-        && let Ok(names) = vulkan::devices()
-            .inspect_err(|error| logger::debug(&format!("GPU name query: {error}")))
+    if let Ok(names) =
+        vulkan::devices().inspect_err(|error| logger::debug(&format!("GPU name query: {error}")))
     {
         for device in &mut devices {
             let id = read_trimmed(device.device.join("device"))
@@ -1175,19 +1233,28 @@ fn discover_amd_sysfs() -> Vec<AmdSysfsDevice> {
     devices
 }
 
-fn discover_amd_sysfs_at(root: &Path) -> Vec<AmdSysfsDevice> {
-    let Ok(entries) = fs::read_dir(root) else {
-        return Vec::new();
+fn discover_amd_sysfs_at(root: &Path, rsmi: Option<&Rsmi>) -> Vec<AmdSysfsDevice> {
+    let managed = if let Some(rsmi) = rsmi {
+        let Some(paths) = rsmi.sysfs_paths() else {
+            return Vec::new();
+        };
+        paths
+    } else {
+        Vec::new()
     };
     let mut devices = Vec::new();
-    for entry in entries.flatten() {
-        let card_name = entry.file_name().to_string_lossy().into_owned();
-        if !is_card_node(&card_name) {
-            continue;
-        }
-        let device = entry.path().join("device");
+    for card in drm_cards(root) {
+        let device = card.join("device");
         if read_trimmed(device.join("vendor")).as_deref() != Some("0x1002") {
             continue;
+        }
+        if !managed.is_empty() {
+            let Ok(path) = fs::canonicalize(&device) else {
+                continue;
+            };
+            if managed.contains(&path.as_path()) {
+                continue;
+            }
         }
         let driver = fs::read_link(device.join("driver")).ok().and_then(|path| {
             path.file_name()
@@ -1210,8 +1277,14 @@ fn discover_amd_sysfs_at(root: &Path) -> Vec<AmdSysfsDevice> {
                     || path.join("power1_average").exists()
                     || path.join("power1_input").exists()
             });
+        #[cfg(target_os = "linux")]
+        let drm = drm_process::Device::discover(&device, !has_signal);
+        #[cfg(target_os = "linux")]
+        let has_signal = has_signal || drm.is_some();
         if has_signal {
             devices.push(AmdSysfsDevice {
+                #[cfg(target_os = "linux")]
+                drm,
                 name: amd_sysfs_name(&device, id),
                 driver_label: None,
                 device,
@@ -1286,6 +1359,8 @@ impl Drop for PmuCounter {
 }
 
 struct IntelGpu {
+    #[cfg(target_os = "linux")]
+    drm: Option<drm_process::Device>,
     name: String,
     busy: Vec<PmuCounter>,
     frequency: Option<PmuCounter>,
@@ -1296,22 +1371,50 @@ struct IntelGpu {
 }
 
 impl IntelGpu {
-    fn load() -> Option<Self> {
+    fn load() -> Vec<Self> {
         Self::load_at(
             Path::new("/sys/class/drm"),
-            Path::new("/sys/bus/event_source/devices/i915"),
+            Path::new("/sys/bus/event_source/devices"),
         )
     }
 
-    fn load_at(drm_root: &Path, pmu_root: &Path) -> Option<Self> {
-        let (name, card) = discover_intel_device(drm_root)?;
+    fn load_at(drm_root: &Path, pmus: &Path) -> Vec<Self> {
+        let cards = discover_intel_devices(drm_root);
+        let single = cards.len() == 1;
+        cards
+            .into_iter()
+            .filter_map(|(name, card)| {
+                let device = card.join("device");
+                let address = fs::canonicalize(&device).ok();
+                let slot = address
+                    .as_deref()
+                    .and_then(Path::file_name)
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("");
+                let mut pmu = pmus.join(format!("i915_{}", slot.replace(':', "_")));
+                let uses_i915 = fs::read_link(device.join("driver"))
+                    .is_ok_and(|driver| driver.ends_with("i915"));
+                if !pmu.exists() && uses_i915 && (single || slot == "0000:00:02.0") {
+                    pmu = pmus.join("i915");
+                }
+                Self::from_card(name, card, &pmu)
+            })
+            .collect()
+    }
+
+    fn from_card(name: String, card: PathBuf, pmu_root: &Path) -> Option<Self> {
         // `gt_act_freq_mhz` commonly reads zero while an integrated GPU is
         // idle. Prefer the current requested clock so a frequency-only panel
         // remains informative even without PMU access.
-        let sysfs_frequency = ["gt_cur_freq_mhz", "gt_act_freq_mhz"]
-            .into_iter()
-            .map(|name| card.join(name))
-            .find(|path| read_integer(path).is_some());
+        let sysfs_frequency = [
+            "gt_cur_freq_mhz",
+            "gt_act_freq_mhz",
+            "device/tile0/gt0/freq0/cur_freq",
+            "device/tile0/gt0/freq0/act_freq",
+        ]
+        .into_iter()
+        .map(|name| card.join(name))
+        .find(|path| read_integer(path).is_some());
         let pmu_type = read_trimmed(pmu_root.join("type")).and_then(|value| value.parse().ok());
         let events = pmu_root.join("events");
         let mut busy = Vec::new();
@@ -1332,7 +1435,15 @@ impl IntelGpu {
             .unwrap_or(1.0);
         let energy = pmu_type
             .and_then(|kind| PmuCounter::open(kind, &events.join("energy-gpu"), energy_scale));
-        if busy.is_empty() && frequency.is_none() && sysfs_frequency.is_none() && energy.is_none() {
+        let available = !busy.is_empty()
+            || frequency.is_some()
+            || sysfs_frequency.is_some()
+            || energy.is_some();
+        #[cfg(target_os = "linux")]
+        let drm = drm_process::Device::discover(&card.join("device"), !available);
+        #[cfg(target_os = "linux")]
+        let available = available || drm.is_some();
+        if !available {
             return None;
         }
         if busy.is_empty() && pmu_type.is_some() {
@@ -1342,6 +1453,8 @@ impl IntelGpu {
             );
         }
         Some(Self {
+            #[cfg(target_os = "linux")]
+            drm,
             name,
             busy,
             frequency,
@@ -1400,28 +1513,21 @@ impl IntelGpu {
     }
 }
 
-fn discover_intel_device(root: &Path) -> Option<(String, PathBuf)> {
-    let entries = fs::read_dir(root).ok()?;
-    for entry in entries.flatten() {
-        let card = entry.file_name().to_string_lossy().into_owned();
-        if !is_card_node(&card) {
-            continue;
-        }
-        let device = entry.path().join("device");
+fn discover_intel_devices(root: &Path) -> Vec<(String, PathBuf)> {
+    let mut cards = Vec::new();
+    for card in drm_cards(root) {
+        let device = card.join("device");
         if read_trimmed(device.join("vendor")).as_deref() == Some("0x8086") {
             let id = read_trimmed(device.join("device")).unwrap_or_else(|| "0x0000".into());
-            if let Ok(device_id) = u16::from_str_radix(id.trim_start_matches("0x"), 16)
-                && let Some(name) = intel_device_name(device_id)
-            {
-                return Some((name, entry.path()));
-            }
-            return Some((
-                format!("Intel GPU (8086:{})", id.trim_start_matches("0x")),
-                entry.path(),
-            ));
+            let id = id.trim_start_matches("0x");
+            let name = u16::from_str_radix(id, 16)
+                .ok()
+                .and_then(intel_device_name)
+                .unwrap_or_else(|| format!("Intel GPU (8086:{id})"));
+            cards.push((name, card));
         }
     }
-    None
+    cards
 }
 
 pub fn diagnostics() -> String {
@@ -1436,7 +1542,7 @@ pub fn diagnostics() -> String {
                 "\nVulkan device information\n  unavailable: {error}\n"
             )),
         }
-        let devices = discover_amd_sysfs_at(Path::new("/sys/class/drm"));
+        let devices = discover_amd_sysfs_at(Path::new("/sys/class/drm"), None);
         if !devices.is_empty() {
             output.push_str("\nAMD GPU naming\n");
             if let Err(error) = &names {
@@ -1493,29 +1599,35 @@ pub fn diagnostics() -> String {
 fn intel_diagnostics() -> String {
     #[cfg(target_os = "linux")]
     {
-        let Some(mut intel) = IntelGpu::load() else {
+        let cards = IntelGpu::load();
+        if cards.is_empty() {
             return "\nGPU\n  Intel GPU: not detected or no readable telemetry\n".into();
         };
-        let sample = intel.collect();
-        format!(
-            "\nGPU\n  device: {}\n  frequency: {}\n  utilization: {}\n  power: {}\n",
-            sample.name,
-            if sample.support.gpu_clock {
-                format!("available ({} MHz)", sample.gpu_clock_mhz)
-            } else {
-                "unavailable".into()
-            },
-            if sample.support.utilization {
-                "available"
-            } else {
-                "unavailable (i915 PMU access denied or unsupported)"
-            },
-            if sample.support.power {
-                "available"
-            } else {
-                "unsupported (no accessible i915 energy event)"
-            }
-        )
+        cards
+            .into_iter()
+            .map(|mut intel| {
+                let sample = intel.collect();
+                format!(
+                    "\nGPU\n  device: {}\n  frequency: {}\n  utilization: {}\n  power: {}\n",
+                    sample.name,
+                    if sample.support.gpu_clock {
+                        format!("available ({} MHz)", sample.gpu_clock_mhz)
+                    } else {
+                        "unavailable".into()
+                    },
+                    if sample.support.utilization {
+                        "available"
+                    } else {
+                        "unavailable (i915 PMU access denied or unsupported)"
+                    },
+                    if sample.support.power {
+                        "available"
+                    } else {
+                        "unsupported (no accessible i915 energy event)"
+                    }
+                )
+            })
+            .collect()
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -1574,10 +1686,24 @@ fn parse_perf_config(value: &str) -> Option<u64> {
     })
 }
 
-fn is_card_node(name: &str) -> bool {
-    name.strip_prefix("card").is_some_and(|suffix| {
-        !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
-    })
+fn drm_card_index(name: &str) -> Option<u32> {
+    let suffix = name.strip_prefix("card")?;
+    suffix
+        .bytes()
+        .all(|byte| byte.is_ascii_digit())
+        .then(|| suffix.parse().ok())
+        .flatten()
+}
+
+fn drm_cards(root: &Path) -> impl Iterator<Item = PathBuf> {
+    let mut cards: Vec<_> = fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| Some((drm_card_index(entry.file_name().to_str()?)?, entry.path())))
+        .collect();
+    cards.sort_unstable_by_key(|(index, _)| *index);
+    cards.into_iter().map(|(_, path)| path)
 }
 
 fn read_trimmed(path: impl AsRef<Path>) -> Option<String> {
@@ -1638,6 +1764,7 @@ mod tests {
         let file = fs::File::open(&path).unwrap();
         fs::remove_file(&path).unwrap();
         let mut collector = IntelGpu {
+            drm: None,
             name: "test".into(),
             busy: Vec::new(),
             energy: None,
@@ -1685,7 +1812,7 @@ mod tests {
             nvml: None,
             rsmi: None,
             amd_sysfs: Vec::new(),
-            intel: None,
+            intel: Vec::new(),
             apple: None,
             shown: String::new(),
             next_probe: Instant::now(),
@@ -1751,15 +1878,27 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("btop-rust-intel-test-{}", std::process::id()));
         let drm = root.join("drm");
-        let card = drm.join("card1");
+        let card = drm.join("card2");
         let device = card.join("device");
         fs::create_dir_all(&device).unwrap();
         fs::write(device.join("vendor"), "0x8086\n").unwrap();
         fs::write(device.join("device"), "0x1912\n").unwrap();
         fs::write(card.join("gt_cur_freq_mhz"), "350\n").unwrap();
 
-        let mut intel = IntelGpu::load_at(&drm, &root.join("missing-pmu")).unwrap();
-        let sample = intel.collect();
+        let xe = drm.join("card10/device");
+        let frequency = xe.join("tile0/gt0/freq0");
+        fs::create_dir_all(&frequency).unwrap();
+        fs::write(xe.join("vendor"), "0x8086").unwrap();
+        fs::write(xe.join("device"), "0xe202").unwrap();
+        fs::write(frequency.join("cur_freq"), "600").unwrap();
+
+        let mut cards = IntelGpu::load_at(&drm, &root.join("missing-pmu"));
+        assert_eq!(cards.len(), 2);
+        let xe = cards[1].collect();
+        assert!(xe.name.contains("Battlemage"));
+        assert!(xe.support.gpu_clock);
+        assert_eq!(xe.gpu_clock_mhz, 600);
+        let sample = cards[0].collect();
         assert!(sample.name.contains("Skylake"));
         assert_eq!(sample.gpu_clock_mhz, 350);
         assert!(sample.support.gpu_clock);
@@ -1802,7 +1941,7 @@ mod tests {
         fs::write(device.join("device"), "0x1638\n").unwrap();
         fs::write(device.join("gpu_busy_percent"), "12\n").unwrap();
         symlink("/sys/bus/pci/drivers/amdgpu", device.join("driver")).unwrap();
-        let mut devices = discover_amd_sysfs_at(&root);
+        let mut devices = discover_amd_sysfs_at(&root, None);
         assert_eq!(devices.len(), 1);
         let database =
             "1002  AMD\n\t1638  Cezanne [Radeon Vega Series / Radeon Vega Mobile Series]\n";
@@ -1846,7 +1985,7 @@ mod tests {
         fs::write(hwmon.join("freq1_input"), "1800000000\n").unwrap();
         fs::write(hwmon.join("power1_average"), "35000000\n").unwrap();
 
-        let mut devices = discover_amd_sysfs_at(&root);
+        let mut devices = discover_amd_sysfs_at(&root, None);
         assert_eq!(devices.len(), 1);
         let sample = devices[0].collect(true);
         assert_eq!(sample.name, "AMD Radeon Test Graphics");

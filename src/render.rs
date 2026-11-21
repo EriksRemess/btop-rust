@@ -6485,7 +6485,7 @@ fn draw_processes(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
         canvas.control_footer(
             area.x + 13,
             area.bottom() - 1,
-            "gpu View",
+            "gpu view",
             &[4],
             app.gpu_processes_visible(),
             theme::PROC_BOX,
@@ -7337,10 +7337,7 @@ fn draw_help(canvas: &mut Canvas, page: usize) {
         ("e", "Toggle processes tree view."),
         ("E", "Collapse/expand all processes in tree view."),
         ("%", "Toggle host RAM between bytes and percent."),
-        (
-            "v / V",
-            "Toggle GPU processes panel; click gpu View button.",
-        ),
+        ("v / V", "Show or hide the GPU processes panel (gpu view)."),
         ("Tab", "Switch keyboard focus between process panels."),
         (
             "Selected +, -",
@@ -9108,6 +9105,7 @@ struct ProcessResources {
     cumulative_cpu: f64,
     memory: u64,
     gpu: Option<u64>,
+    dedicated_gpu: Option<u64>,
     gpu_utilization: Option<u32>,
     threads: u32,
 }
@@ -9187,6 +9185,7 @@ fn aggregate_tree_resources(
                     cumulative_cpu: process.cumulative_cpu,
                     memory: process.memory,
                     gpu: process.gpu.bytes,
+                    dedicated_gpu: process.gpu.dedicated_bytes,
                     gpu_utilization: process.gpu.utilization,
                     threads: process.threads,
                 };
@@ -9206,6 +9205,10 @@ fn aggregate_tree_resources(
                                 .gpu
                                 .zip(child.gpu)
                                 .and_then(|(parent, child)| parent.checked_add(child));
+                            resources.dedicated_gpu = resources
+                                .dedicated_gpu
+                                .zip(child.dedicated_gpu)
+                                .and_then(|(a, b)| a.checked_add(b));
                             resources.gpu_utilization = resources
                                 .gpu_utilization
                                 .zip(child.gpu_utilization)
@@ -9246,6 +9249,7 @@ fn aggregate_tree_resources(
             process.cumulative_cpu = resources.cumulative_cpu;
             process.memory = resources.memory;
             process.gpu.bytes = resources.gpu;
+            process.gpu.dedicated_bytes = resources.dedicated_gpu;
             process.gpu.utilization = resources.gpu_utilization;
             process.threads = resources.threads;
         }

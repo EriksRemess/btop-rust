@@ -62,32 +62,38 @@ unsafe extern "C" fn clock(_: u32, _: c_int, output: *mut RsmiFrequenciesV6) -> 
     }
 }
 
+fn fixture() -> Rsmi {
+    Rsmi {
+        #[cfg(target_os = "linux")]
+        devices: vec![drm_process::RsmiDevice::default()],
+        _library: DynamicLibrary {
+            handle: ptr::null_mut(),
+        },
+        functions: RsmiFunctions {
+            shutdown,
+            name,
+            power_cap: power,
+            temperature,
+            busy: uint,
+            memory_busy: uint,
+            clock: RsmiClock::V6(clock),
+            power,
+            memory_total: memory,
+            memory_used: memory,
+            pcie,
+        },
+        count: 1,
+        names: vec!["test GPU".into()],
+        power_limits: vec![100],
+        temperature_limits: vec![90],
+    }
+}
+
 #[test]
 fn rsmi_metrics_follow_current_read_success_and_recover() {
     for initial in [true, false] {
         AVAILABLE.set(initial);
-        let rsmi = Rsmi {
-            _library: DynamicLibrary {
-                handle: ptr::null_mut(),
-            },
-            functions: RsmiFunctions {
-                shutdown,
-                name,
-                power_cap: power,
-                temperature,
-                busy: uint,
-                memory_busy: uint,
-                clock: RsmiClock::V6(clock),
-                power,
-                memory_total: memory,
-                memory_used: memory,
-                pcie,
-            },
-            count: 1,
-            names: vec!["test GPU".into()],
-            power_limits: vec![100],
-            temperature_limits: vec![90],
-        };
+        let rsmi = fixture();
         for succeeds in [initial, !initial, initial] {
             AVAILABLE.set(succeeds);
             let sample = rsmi.collect(true, true).remove(0);
@@ -114,4 +120,34 @@ fn rsmi_metrics_follow_current_read_success_and_recover() {
         assert!(!sample.support.temperature);
         assert!(!sample.support.pcie);
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn sysfs_includes_amd_cards_missing_from_rsmi() {
+    use std::os::unix::fs::symlink;
+    let root = std::env::temp_dir().join(format!("btoprs-mixed-amd-{}", std::process::id()));
+    fs::create_dir(&root).unwrap();
+    let root = DropGuard::new(root, |p| fs::remove_dir_all(p).unwrap());
+    let paths = [root.join("0000:03:00.0"), root.join("0000:0b:00.0")];
+    for (index, path) in paths.iter().enumerate() {
+        fs::create_dir_all(path.join("drm/renderD128")).unwrap();
+        fs::write(path.join("drm/renderD128/dev"), "1:3").unwrap();
+        fs::write(path.join("vendor"), "0x1002").unwrap();
+        fs::write(path.join("product_name"), format!("AMD {index}")).unwrap();
+        fs::write(path.join("gpu_busy_percent"), "10").unwrap();
+        symlink("drivers/amdgpu", path.join("driver")).unwrap();
+        let card = root.join(format!("card{index}"));
+        fs::create_dir(&card).unwrap();
+        symlink(path, card.join("device")).unwrap();
+    }
+    let mut rsmi = fixture();
+    assert!(
+        discover_amd_sysfs_at(&root, Some(&rsmi)).is_empty(),
+        "an unresolved RSMI identity must not double-count cards"
+    );
+    rsmi.devices[0].sysfs_path = Some(paths[0].clone());
+    let extra = discover_amd_sysfs_at(&root, Some(&rsmi));
+    assert_eq!(extra.len(), 1);
+    assert_eq!(fs::canonicalize(&extra[0].device).unwrap(), paths[1]);
 }

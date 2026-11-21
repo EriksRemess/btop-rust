@@ -200,7 +200,7 @@ fn merge(graphics: Option<Vec<ProcessInfo>>, compute: Option<Vec<ProcessInfo>>) 
         available,
         complete,
         processes,
-        utilization: None,
+        ..Snapshot::default()
     }
 }
 

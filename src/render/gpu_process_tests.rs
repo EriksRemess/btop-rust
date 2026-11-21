@@ -13,6 +13,7 @@ fn process(pid: u32, parent: u32, bytes: Option<u64>, active: bool) -> ProcessSa
         memory: 1_048_576,
         cpu: 7.0,
         gpu: Usage {
+            dedicated_bytes: bytes,
             bytes,
             utilization: active.then_some(25),
             devices: if active {
@@ -139,7 +140,7 @@ fn unsupported_backends_hide_gpu_process_ui_and_ignore_its_shortcut() {
                 Size { cols: 44, rows: 16 }
             );
             let frame = Renderer::new().render(size, &mut app);
-            assert!(!frame.contains("gpu View") && !frame.contains("gpu proc"));
+            assert!(!frame.contains("gpu view") && !frame.contains("gpu proc"));
             assert!(app.gpu_process_panel.area.is_none());
             assert!(
                 !app.process_control_hitboxes
@@ -289,14 +290,21 @@ fn gpu_panel_uses_the_process_graph_symbol_override() {
 }
 
 #[test]
-fn gpu_vram_percentage_requires_all_device_capacities() {
+fn gpu_vram_percentage_uses_dedicated_bytes_and_requires_all_device_capacities() {
     let mut app = app();
+    let process = app
+        .gpu_process_panel
+        .processes
+        .iter_mut()
+        .find(|p| p.pid == 20)
+        .unwrap();
+    process.gpu.dedicated_bytes = Some(1_048_576);
     app.sample.gpus[0].support.memory_total = true;
     let mut second = app.sample.gpus[0].clone();
     second.memory_total = 0;
     second.support.memory_total = false;
     app.sample.gpus.push(second);
-    for (known, expected) in [(false, "—"), (true, "6%")] {
+    for (known, expected) in [(false, "—"), (true, "3%")] {
         app.sample.gpus[1].support.memory_total = known;
         if known {
             app.sample.gpus[1].memory_total = 16_777_216;
