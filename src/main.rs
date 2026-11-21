@@ -293,9 +293,7 @@ fn run() -> Result<u8, String> {
     let mut config = Config::load(cli.config_file.as_deref())?;
     config.apply_cli(&cli);
     let tty_name = current_tty();
-    if cli.force_tty.is_none() && !config.tty_mode && auto_tty_mode(tty_name.as_deref()) {
-        config.tty_mode = true;
-    }
+    apply_auto_tty_mode(&mut config, &cli, tty_name.as_deref());
     logger::init();
     logger::set_level(config.value("log_level").unwrap_or("WARNING"), cli.debug);
     if cli.debug {
@@ -365,7 +363,7 @@ fn run() -> Result<u8, String> {
             match terminal.read_key(wait)? {
                 Some(key) => {
                     if key == terminal::Key::CtrlR {
-                        if let Err(error) = reload_config(&mut app.config, &cli) {
+                        if let Err(error) = reload_config(&mut app, &cli, tty_name.as_deref()) {
                             logger::warning(&format!("Could not reload configuration: {error}"));
                         }
                         terminal
@@ -410,13 +408,20 @@ fn run() -> Result<u8, String> {
     Ok(exit_code)
 }
 
-fn reload_config(config: &mut Config, cli: &Cli) -> Result<(), String> {
+fn apply_auto_tty_mode(config: &mut Config, cli: &Cli, tty_name: Option<&str>) {
+    if cli.force_tty.is_none() && !config.tty_mode && auto_tty_mode(tty_name) {
+        config.tty_mode = true;
+    }
+}
+
+fn reload_config(app: &mut AppState, cli: &Cli, tty_name: Option<&str>) -> Result<(), String> {
     // Load into a temporary copy so a malformed or unreadable file cannot
     // partially replace the live settings.
-    let mut reloaded = config.clone();
+    let mut reloaded = app.config.clone();
     reloaded.reload()?;
     reloaded.apply_cli(cli);
-    *config = reloaded;
+    apply_auto_tty_mode(&mut reloaded, cli, tty_name);
+    app.replace_config(reloaded);
     Ok(())
 }
 
@@ -490,7 +495,7 @@ fn handle_pending_signals(
     }
     let mut redraw = pending & SIGNAL_REDRAW != 0;
     if pending & SIGNAL_RELOAD != 0 {
-        if let Err(error) = reload_config(&mut app.config, cli) {
+        if let Err(error) = reload_config(app, cli, current_tty().as_deref()) {
             logger::warning(&format!("Could not reload configuration: {error}"));
         }
         terminal.apply_settings(!app.config.disable_mouse, app.config.terminal_sync)?;
@@ -533,6 +538,72 @@ fn suspend_process() -> Result<(), String> {
 mod tests {
     use super::{CollectionClock, auto_tty_mode, locale_is_utf8};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn configuration_reload_requests_fresh_data_and_preserves_cli_overrides() {
+        let path =
+            std::env::temp_dir().join(format!("btoprs-reload-data-{}.conf", std::process::id()));
+        let cleanup = std::mem::DropGuard::new(path, |path| {
+            let _ = std::fs::remove_file(path);
+        });
+        std::fs::write(&*cleanup, "update_ms = 86400000\nnet_iface = \"old0\"\n").unwrap();
+        let cli = crate::Cli {
+            filter: Some("worker".into()),
+            ..crate::Cli::default()
+        };
+        let mut app = crate::AppState::new(crate::Config::load(Some(&cleanup)).unwrap());
+        std::fs::write(&*cleanup, "update_ms = 86400000\nnet_iface = \"new0\"\n").unwrap();
+        super::reload_config(&mut app, &cli, None).unwrap();
+        assert_eq!(app.config.net_iface.as_deref(), Some("new0"));
+        assert_eq!(app.config.process_filter, "worker");
+        assert!(app.take_collection_request());
+        std::fs::write(&*cleanup, [0xff]).unwrap();
+        assert!(super::reload_config(&mut app, &cli, None).is_err());
+        assert_eq!(app.config.net_iface.as_deref(), Some("new0"));
+        assert_eq!(app.config.process_filter, "worker");
+        assert!(!app.take_collection_request());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn configuration_reload_keeps_automatic_console_mode() {
+        let path =
+            std::env::temp_dir().join(format!("btoprs-reload-tty-{}.conf", std::process::id()));
+        let cleanup = std::mem::DropGuard::new(path, |path| {
+            let _ = std::fs::remove_file(path);
+        });
+        std::fs::write(&*cleanup, "force_tty = false\n").unwrap();
+        let mut app = crate::AppState::new(crate::Config::load(Some(&cleanup)).unwrap());
+        app.config.tty_mode = true;
+        for (override_mode, expected) in [(None, true), (Some(false), false), (Some(true), true)] {
+            let cli = crate::Cli {
+                force_tty: override_mode,
+                ..crate::Cli::default()
+            };
+            super::reload_config(&mut app, &cli, Some("/dev/tty1")).unwrap();
+            assert_eq!(app.config.tty_mode, expected, "{override_mode:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn with_empty_env(test_name: &str, variable: &str, check: impl FnOnce()) {
+        if std::env::var_os("BTOPRS_EMPTY_ENV_TEST_CHILD").is_some() {
+            check();
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test_name, "--nocapture"])
+            .env("BTOPRS_EMPTY_ENV_TEST_CHILD", "1")
+            .env(variable, "")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[cfg(unix)]
     #[test]

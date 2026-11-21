@@ -15,6 +15,22 @@ pub(crate) mod macos;
 #[cfg(target_os = "linux")]
 mod vulkan;
 
+#[cfg(test)]
+#[path = "gpu/nvml_tests.rs"]
+mod nvml_tests;
+
+#[cfg(test)]
+#[path = "gpu/rsmi_tests.rs"]
+mod rsmi_tests;
+
+#[cfg(test)]
+#[path = "gpu/intel_tests.rs"]
+mod intel_tests;
+
+#[cfg(test)]
+#[path = "gpu/amd_sysfs_tests.rs"]
+mod amd_sysfs_tests;
+
 #[derive(Debug, Clone, Default)]
 pub struct GpuSupport {
     pub utilization: bool,
@@ -174,7 +190,11 @@ impl GpuCollector {
         if let Some(rsmi) = &self.rsmi {
             samples.extend(rsmi.collect(check_temperature, rsmi_pcie));
         }
-        samples.extend(self.amd_sysfs.iter_mut().map(AmdSysfsDevice::collect));
+        samples.extend(
+            self.amd_sysfs
+                .iter_mut()
+                .map(|device| device.collect(check_temperature)),
+        );
         if let Some(intel) = &mut self.intel {
             samples.push(intel.collect());
         }
@@ -324,7 +344,6 @@ struct Nvml {
     names: Vec<String>,
     power_limits: Vec<u64>,
     temperature_limits: Vec<i64>,
-    supports: Vec<GpuSupport>,
 }
 
 impl Nvml {
@@ -393,32 +412,17 @@ impl Nvml {
             unsafe { shutdown() };
             return None;
         }
-        let mut backend = Self {
+        Some(Self {
             _library: library,
             functions,
             devices,
             names,
             power_limits,
             temperature_limits,
-            supports: Vec::new(),
-        };
-        backend.supports = backend
-            .collect_unchecked(true, true)
-            .into_iter()
-            .map(|sample| sample.support)
-            .collect();
-        Some(backend)
+        })
     }
 
     fn collect(&self, check_temperature: bool, measure_pcie: bool) -> Vec<GpuSample> {
-        let mut samples = self.collect_unchecked(check_temperature, measure_pcie);
-        for (sample, support) in samples.iter_mut().zip(&self.supports) {
-            sample.support.clone_from(support);
-        }
-        samples
-    }
-
-    fn collect_unchecked(&self, check_temperature: bool, measure_pcie: bool) -> Vec<GpuSample> {
         self.devices
             .iter()
             .enumerate()
@@ -470,8 +474,6 @@ impl Nvml {
                         sample.temperature_c = i64::from(temperature);
                         sample.support.temperature = true;
                     }
-                } else {
-                    sample.support.temperature = true;
                 }
                 let mut memory = NvmlMemory::default();
                 if unsafe { (self.functions.get_memory)(device, &mut memory) } == NVML_SUCCESS {
@@ -645,7 +647,6 @@ struct Rsmi {
     names: Vec<String>,
     power_limits: Vec<u64>,
     temperature_limits: Vec<i64>,
-    supports: Vec<GpuSupport>,
 }
 
 impl Rsmi {
@@ -743,32 +744,17 @@ impl Rsmi {
             let _ = unsafe { (functions.temperature)(index, 0, 1, &mut temperature) };
             temperature_limits.push(temperature / 1000);
         }
-        let mut backend = Self {
+        Some(Self {
             _library: DropGuard::dismiss(library),
             functions,
             count,
             names,
             power_limits,
             temperature_limits,
-            supports: Vec::new(),
-        };
-        backend.supports = backend
-            .collect_unchecked(true, true)
-            .into_iter()
-            .map(|sample| sample.support)
-            .collect();
-        Some(backend)
+        })
     }
 
     fn collect(&self, check_temperature: bool, measure_pcie: bool) -> Vec<GpuSample> {
-        let mut samples = self.collect_unchecked(check_temperature, measure_pcie);
-        for (sample, support) in samples.iter_mut().zip(&self.supports) {
-            sample.support.clone_from(support);
-        }
-        samples
-    }
-
-    fn collect_unchecked(&self, check_temperature: bool, measure_pcie: bool) -> Vec<GpuSample> {
         (0..self.count)
             .map(|index| {
                 let mut sample = GpuSample {
@@ -802,8 +788,6 @@ impl Rsmi {
                         sample.temperature_c = temperature / 1000;
                         sample.support.temperature = true;
                     }
-                } else {
-                    sample.support.temperature = true;
                 }
                 sample.support.memory_total =
                     rsmi_memory(self.functions.memory_total, index, &mut sample.memory_total);
@@ -887,31 +871,39 @@ struct AmdSysfsDevice {
     driver_label: Option<String>,
     device: PathBuf,
     hwmon: Option<PathBuf>,
-    power: Option<PathBuf>,
     power_max_mw: u64,
 }
 
 impl AmdSysfsDevice {
-    fn collect(&mut self) -> GpuSample {
+    fn collect(&mut self, check_temperature: bool) -> GpuSample {
         let busy = read_integer(self.device.join("gpu_busy_percent"));
         let total = read_integer(self.device.join("mem_info_vram_total"));
         let used = read_integer(self.device.join("mem_info_vram_used"));
-        let temperature = self
-            .hwmon
-            .as_ref()
-            .and_then(|path| read_integer(path.join("temp1_input")));
+        let temperature = check_temperature
+            .then(|| {
+                self.hwmon
+                    .as_ref()
+                    .and_then(|path| read_integer(path.join("temp1_input")))
+            })
+            .flatten();
         let clock = self
             .hwmon
             .as_ref()
-            .and_then(|path| read_integer(path.join("freq1_input")));
-        let power = self.power.as_ref().and_then(read_integer);
-        let power_mw = power.unwrap_or(0).max(0) as u64 / 1000;
+            .and_then(|path| read_integer(path.join("freq1_input")))
+            .filter(|hz| *hz >= 0)
+            .and_then(|hz| u32::try_from(hz / 1_000_000).ok());
+        let power = self.hwmon.as_ref().and_then(|path| {
+            ["power1_average", "power1_input"]
+                .into_iter()
+                .find_map(|name| read_integer(path.join(name)).filter(|power| *power >= 0))
+        });
+        let power_mw = power.unwrap_or(0) as u64 / 1000;
         self.power_max_mw = self.power_max_mw.max(power_mw);
         GpuSample {
             name: self.name.clone(),
             driver_label: self.driver_label.clone(),
             utilization: busy.unwrap_or(0).clamp(0, 100) as u32,
-            gpu_clock_mhz: clock.unwrap_or(0).max(0) as u32 / 1_000_000,
+            gpu_clock_mhz: clock.unwrap_or(0),
             power_mw,
             power_limit_mw: self.power_max_mw,
             temperature_c: temperature.unwrap_or(0) / 1000,
@@ -1181,18 +1173,13 @@ fn discover_amd_sysfs_at(root: &Path) -> Vec<AmdSysfsDevice> {
             .ok()
             .and_then(|mut entries| entries.find_map(Result::ok))
             .map(|entry| entry.path());
-        let power = hwmon.as_ref().and_then(|path| {
-            ["power1_average", "power1_input"]
-                .into_iter()
-                .map(|name| path.join(name))
-                .find(|candidate| candidate.exists())
-        });
         let has_signal = device.join("gpu_busy_percent").exists()
             || device.join("mem_info_vram_total").exists()
             || hwmon.as_ref().is_some_and(|path| {
                 path.join("temp1_input").exists()
                     || path.join("freq1_input").exists()
-                    || power.is_some()
+                    || path.join("power1_average").exists()
+                    || path.join("power1_input").exists()
             });
         if has_signal {
             devices.push(AmdSysfsDevice {
@@ -1200,7 +1187,6 @@ fn discover_amd_sysfs_at(root: &Path) -> Vec<AmdSysfsDevice> {
                 driver_label: None,
                 device,
                 hwmon,
-                power,
                 power_max_mw: 0,
             });
         }
@@ -1210,7 +1196,7 @@ fn discover_amd_sysfs_at(root: &Path) -> Vec<AmdSysfsDevice> {
 
 struct PmuCounter {
     fd: RawFd,
-    previous: u64,
+    previous: Option<u64>,
     scale: f64,
 }
 
@@ -1238,10 +1224,10 @@ impl PmuCounter {
         }
         let mut counter = Self {
             fd,
-            previous: 0,
+            previous: None,
             scale,
         };
-        counter.previous = counter.read().unwrap_or(0);
+        counter.previous = counter.read();
         Some(counter)
     }
 
@@ -1257,11 +1243,10 @@ impl PmuCounter {
         (count == mem::size_of::<u64>() as isize).then_some(value)
     }
 
-    fn delta(&mut self) -> u64 {
-        let current = self.read().unwrap_or(self.previous);
-        let delta = current.saturating_sub(self.previous);
-        self.previous = current;
-        delta
+    fn delta(&mut self) -> Option<u64> {
+        let current = self.read();
+        let previous = mem::replace(&mut self.previous, current);
+        current?.checked_sub(previous?)
     }
 }
 
@@ -1344,38 +1329,41 @@ impl IntelGpu {
         let utilization = self
             .busy
             .iter_mut()
-            .map(|counter| counter.delta() as f64 / 1e9 / elapsed * 100.0)
-            .fold(0.0, f64::max)
-            .round()
-            .clamp(0.0, 100.0) as u32;
+            .filter_map(PmuCounter::delta)
+            .max()
+            .map(|delta| {
+                (delta as f64 / 1e9 / elapsed * 100.0)
+                    .round()
+                    .clamp(0.0, 100.0) as u32
+            });
         let gpu_clock_mhz = self
             .frequency
             .as_mut()
+            .and_then(PmuCounter::delta)
             // i915 integrates MHz over seconds; only busy counters use nanoseconds.
-            .map(|counter| (counter.delta() as f64 / elapsed).round() as u32)
+            .map(|delta| (delta as f64 / elapsed).round() as u32)
             .or_else(|| {
                 self.sysfs_frequency
                     .as_ref()
                     .and_then(read_integer)
                     .and_then(|value| u32::try_from(value).ok())
-            })
-            .unwrap_or(0);
-        let power_mw = self
-            .energy
-            .as_mut()
-            .map(|counter| (counter.delta() as f64 * counter.scale / elapsed * 1000.0) as u64)
-            .unwrap_or(0);
-        self.max_power_mw = self.max_power_mw.max(power_mw);
+            });
+        let power_mw = self.energy.as_mut().and_then(|counter| {
+            counter
+                .delta()
+                .map(|delta| (delta as f64 * counter.scale / elapsed * 1000.0) as u64)
+        });
+        self.max_power_mw = self.max_power_mw.max(power_mw.unwrap_or(0));
         GpuSample {
             name: self.name.clone(),
-            utilization,
-            gpu_clock_mhz,
-            power_mw,
+            utilization: utilization.unwrap_or(0),
+            gpu_clock_mhz: gpu_clock_mhz.unwrap_or(0),
+            power_mw: power_mw.unwrap_or(0),
             power_limit_mw: self.max_power_mw,
             support: GpuSupport {
-                utilization: !self.busy.is_empty(),
-                gpu_clock: self.frequency.is_some() || self.sysfs_frequency.is_some(),
-                power: self.energy.is_some(),
+                utilization: utilization.is_some(),
+                gpu_clock: gpu_clock_mhz.is_some(),
+                power: power_mw.is_some(),
                 ..GpuSupport::default()
             },
             ..GpuSample::default()
@@ -1627,7 +1615,7 @@ mod tests {
             max_power_mw: 0,
             frequency: Some(PmuCounter {
                 fd: file.into_raw_fd(),
-                previous: 1000,
+                previous: Some(1000),
                 scale: 1.0,
             }),
             sysfs_frequency: None,
@@ -1791,7 +1779,7 @@ mod tests {
             "1002  AMD\n\t1638  Cezanne [Radeon Vega Series / Radeon Vega Mobile Series]\n";
         apply_amd_database_names(&mut devices, database);
         assert_eq!(devices[0].name, "AMD Radeon Vega (Cezanne)");
-        assert_eq!(devices[0].collect().utilization, 12);
+        assert_eq!(devices[0].collect(true).utilization, 12);
         devices[0].name = "Driver Supplied Name".into();
         apply_amd_database_names(&mut devices, database);
         assert_eq!(devices[0].name, "Driver Supplied Name");
@@ -1831,7 +1819,7 @@ mod tests {
 
         let mut devices = discover_amd_sysfs_at(&root);
         assert_eq!(devices.len(), 1);
-        let sample = devices[0].collect();
+        let sample = devices[0].collect(true);
         assert_eq!(sample.name, "AMD Radeon Test Graphics");
         assert_eq!(sample.utilization, 42);
         assert_eq!(sample.temperature_c, 51);

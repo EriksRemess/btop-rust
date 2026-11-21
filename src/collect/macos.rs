@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{
     BatterySample, Collector, CpuSample, CpuTicks, DiskSample, MemorySample, NetworkSample,
-    ProcessSample, update_network_counter,
+    ProcessCounters, ProcessSample, update_network_counter,
 };
 use crate::config::Config;
 
@@ -890,18 +890,20 @@ pub(super) fn collect_processes(
         let cpu_time = if got_task {
             task.total_user.saturating_add(task.total_system)
         } else {
-            collector
-                .previous_processes
-                .get(&(pid as u32))
-                .copied()
-                .unwrap_or(0)
+            0
         };
-        next_times.insert(pid as u32, cpu_time);
-        let delta = collector
-            .previous_processes
-            .get(&(pid as u32))
-            .map(|old| cpu_time.saturating_sub(*old))
-            .unwrap_or(0);
+        let counters = ProcessCounters {
+            ticks: cpu_time,
+            start_time: got_full_bsd.then_some(
+                u128::from(bsd.start_seconds) * 1_000_000 + u128::from(bsd.start_microseconds),
+            ),
+        };
+        let delta = if got_task {
+            next_times.insert(pid as u32, counters);
+            counters.delta_since(collector.previous_processes.get(&(pid as u32)))
+        } else {
+            0
+        };
         let mut cpu = delta as f64 * timebase * 100.0 / interval_ns;
         if config.process_per_core {
             cpu *= cores.max(1) as f64;
@@ -936,6 +938,7 @@ pub(super) fn collect_processes(
         });
         processes.push(ProcessSample {
             pid: pid as u32,
+            start_time: counters.start_time,
             parent: bsd.parent_pid,
             name,
             command,

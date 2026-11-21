@@ -645,13 +645,7 @@ pub(super) fn collect_cpu(
         .enumerate()
         .map(|(index, now)| {
             let old = collector.previous_cpu.get(index).copied().unwrap_or(*now);
-            let total = now.total.saturating_sub(old.total);
-            let busy = now.busy.saturating_sub(old.busy);
-            if total == 0 {
-                0.0
-            } else {
-                busy as f64 * 100.0 / total as f64
-            }
+            now.usage_since(old)
         })
         .collect();
     let old_total = collector.previous_cpu.first().copied().unwrap_or(aggregate);
@@ -1237,6 +1231,7 @@ pub(super) fn collect_processes(
         });
         let mut ticks = 0u64;
         let mut creation_ticks = now;
+        let mut got_times = false;
         let mut memory = 0u64;
         let mut command = String::new();
         let mut user = String::new();
@@ -1261,6 +1256,7 @@ pub(super) fn collect_processes(
             {
                 ticks = kernel.ticks().saturating_add(user_time.ticks());
                 creation_ticks = creation.ticks();
+                got_times = true;
             }
             let mut counters = MaybeUninit::<ProcessMemoryCounters>::zeroed();
             if unsafe {
@@ -1295,14 +1291,16 @@ pub(super) fn collect_processes(
                 }
             }
         }
-        next_ticks.insert(pid, ticks);
-        let delta = ticks.saturating_sub(
-            collector
-                .previous_processes
-                .get(&pid)
-                .copied()
-                .unwrap_or(ticks),
-        );
+        let delta = if got_times {
+            let counters = ProcessCounters {
+                ticks,
+                start_time: Some(u128::from(creation_ticks)),
+            };
+            next_ticks.insert(pid, counters);
+            counters.delta_since(collector.previous_processes.get(&pid))
+        } else {
+            0
+        };
         let mut cpu = if total_delta == 0 {
             0.0
         } else {
@@ -1314,6 +1312,7 @@ pub(super) fn collect_processes(
         let elapsed_ticks = now.saturating_sub(creation_ticks).max(1);
         processes.push(ProcessSample {
             pid,
+            start_time: got_times.then_some(u128::from(creation_ticks)),
             parent: entry.parent_process_id,
             name,
             command,

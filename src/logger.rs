@@ -138,6 +138,7 @@ fn log_path() -> Option<PathBuf> {
     }
     #[cfg(unix)]
     std::env::var_os("XDG_STATE_HOME")
+        .filter(|path| !path.is_empty())
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
         .map(|path| path.join("btop.log"))
@@ -220,6 +221,19 @@ fn utc_timestamp() -> String {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[cfg(unix)]
+    #[test]
+    fn empty_xdg_uses_home() {
+        crate::tests::with_empty_env(
+            "logger::tests::empty_xdg_uses_home",
+            "XDG_STATE_HOME",
+            || {
+                let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+                assert_eq!(log_path(), Some(home.join(".local/state/btop.log")));
+            },
+        );
+    }
 
     #[test]
     fn utc_log_timestamp_has_reference_shape() {

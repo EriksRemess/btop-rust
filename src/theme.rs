@@ -307,7 +307,7 @@ fn theme_directories(custom_dir: Option<&Path>) -> Vec<PathBuf> {
     } else if let Some(home) = std::env::var_os("HOME") {
         directories.push(Path::new(&home).join(".config/btop/themes"));
     }
-    if let Some(data_home) = std::env::var_os("XDG_DATA_HOME") {
+    if let Some(data_home) = std::env::var_os("XDG_DATA_HOME").filter(|path| !path.is_empty()) {
         directories.push(Path::new(&data_home).join("btoprs/themes"));
         directories.push(Path::new(&data_home).join("btop/themes"));
     } else if let Some(home) = std::env::var_os("HOME") {
@@ -761,6 +761,17 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn empty_xdg_uses_home() {
+        crate::tests::with_empty_env("theme::tests::empty_xdg_uses_home", "XDG_DATA_HOME", || {
+            let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+            let directories = theme_directories(None);
+            assert!(directories.contains(&home.join(".local/share/btoprs/themes")));
+            assert!(!directories.contains(&PathBuf::from("btoprs/themes")));
+        });
+    }
 
     #[test]
     fn installing_themes_does_not_shadow_other_search_directories() {

@@ -29,6 +29,14 @@ const ICRNL: c_uint = 0x0000_0100;
 #[cfg(target_os = "macos")]
 const ICRNL: c_ulong = 0x0000_0100;
 #[cfg(target_os = "linux")]
+const ISTRIP: c_uint = 0x0000_0020;
+#[cfg(target_os = "macos")]
+const ISTRIP: c_ulong = 0x0000_0020;
+#[cfg(target_os = "linux")]
+const IGNCR: c_uint = 0x0000_0080;
+#[cfg(target_os = "macos")]
+const IGNCR: c_ulong = 0x0000_0080;
+#[cfg(target_os = "linux")]
 const OPOST: c_uint = 0x0000_0001;
 #[cfg(target_os = "macos")]
 const OPOST: c_ulong = 0x0000_0001;
@@ -45,6 +53,9 @@ const TIOCGWINSZ: c_ulong = 0x5413;
 #[cfg(target_os = "macos")]
 const TIOCGWINSZ: c_ulong = 0x4008_7468;
 const POLLIN: c_short = 0x0001;
+const POLLERR: c_short = 0x0008;
+const POLLHUP: c_short = 0x0010;
+const POLLNVAL: c_short = 0x0020;
 const F_GETFL: c_int = 3;
 const F_SETFL: c_int = 4;
 #[cfg(target_os = "linux")]
@@ -136,14 +147,14 @@ pub unsafe fn restore_after_crash() {
     // default re-raise. Make this best-effort write nonblocking.
     unsafe {
         let flags = fcntl(STDOUT, F_GETFL);
-        if flags >= 0 {
-            fcntl(STDOUT, F_SETFL, flags | O_NONBLOCK);
+        if flags >= 0 && fcntl(STDOUT, F_SETFL, flags | O_NONBLOCK) == 0 {
+            write(
+                STDOUT,
+                CRASH_RESTORE_SEQUENCE.as_ptr().cast(),
+                CRASH_RESTORE_SEQUENCE.len(),
+            );
+            fcntl(STDOUT, F_SETFL, flags);
         }
-        write(
-            STDOUT,
-            CRASH_RESTORE_SEQUENCE.as_ptr().cast(),
-            CRASH_RESTORE_SEQUENCE.len(),
-        );
     }
 }
 
@@ -205,7 +216,7 @@ impl Terminal {
         }
         let original = unsafe { original.assume_init() };
         let mut raw = original;
-        raw.c_iflag &= !(IXON | ICRNL);
+        raw.c_iflag &= !(IXON | ICRNL | ISTRIP | IGNCR);
         raw.c_oflag |= OPOST;
         raw.c_lflag &= !(ICANON | ECHO | ISIG);
         raw.c_cc[VMIN] = 0;
@@ -344,6 +355,9 @@ impl Terminal {
                 None
             });
         }
+        if fd.revents & (POLLERR | POLLHUP | POLLNVAL) != 0 {
+            return Err("terminal input disconnected or unavailable".into());
+        }
         // A terminal writes mouse reports as escape sequences. Drain everything
         // currently available, as btop does, so a busy wheel cannot leave a
         // report split at an arbitrary fixed-size read boundary.
@@ -417,6 +431,15 @@ fn take_key_after_sequence_timeout(bytes: &mut Vec<u8>) -> Option<Key> {
 }
 
 fn take_key_inner(bytes: &mut Vec<u8>, sequence_timed_out: bool) -> Option<Key> {
+    if matches!(bytes.as_slice(), [0x1b, b'[' | b'O', ..]) {
+        let end = escape_sequence_length(bytes).unwrap_or(bytes.len());
+        if let Some(interrupted) = bytes[2..end].iter().position(u8::is_ascii_control) {
+            // An interrupted report must not swallow Ctrl-C or the start of
+            // the next escape sequence along with its abandoned prefix.
+            bytes.drain(..interrupted + 2);
+            return Some(Key::Unknown);
+        }
+    }
     if escape_sequence_is_incomplete(bytes) {
         if !sequence_timed_out {
             return None;
@@ -502,7 +525,10 @@ fn parse_sgr_mouse(bytes: &[u8]) -> Option<(Key, usize)> {
     let [0x1b, b'[', b'<', rest @ ..] = bytes else {
         return None;
     };
-    let end = rest.iter().position(|byte| matches!(byte, b'M' | b'm'))?;
+    let end = escape_sequence_length(bytes)? - 4;
+    if !matches!(rest[end], b'M' | b'm') {
+        return Some((Key::Unknown, end + 4));
+    }
     let pressed = rest[end] == b'M';
     let fields = std::str::from_utf8(&rest[..end]).ok().and_then(|text| {
         text.split(';')
@@ -542,10 +568,27 @@ fn escape_sequence_is_incomplete(bytes: &[u8]) -> bool {
 
 fn escape_sequence_length(bytes: &[u8]) -> Option<usize> {
     match bytes {
-        [0x1b, b'[', b'<', rest @ ..] => rest
-            .iter()
-            .position(|byte| matches!(byte, b'M' | b'm'))
-            .map(|end| end + 4),
+        [0x1b, b'[', b'<', rest @ ..] => {
+            let boundary = rest
+                .iter()
+                .position(u8::is_ascii_control)
+                .unwrap_or(rest.len());
+            let rest = &rest[..boundary];
+            if let Some(end) = rest.iter().position(|byte| (0x40..=0x7e).contains(byte)) {
+                let mut fields = rest[..end].split(|byte| *byte == b';');
+                if (0..3).all(|_| {
+                    fields.next().is_some_and(|field| {
+                        !field.is_empty() && field.iter().all(u8::is_ascii_digit)
+                    })
+                }) && fields.next().is_none()
+                {
+                    return Some(end + 4);
+                }
+            }
+            rest.iter()
+                .position(|byte| matches!(byte, b'M' | b'm'))
+                .map(|end| end + 4)
+        }
         [0x1b, b'[', rest @ ..] => rest
             .iter()
             .position(|byte| (0x40..=0x7e).contains(byte))
@@ -567,6 +610,162 @@ fn utf8_sequence_width(first: u8) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn raw_input_preserves_unicode_and_enter_with_inherited_translations() {
+        use std::io::BufRead;
+        use std::os::fd::{FromRawFd, OwnedFd};
+        const CHILD: &str = "BTOPRS_RAW_INPUT_TRANSLATIONS_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let mut inherited = MaybeUninit::<Termios>::uninit();
+            assert_eq!(unsafe { tcgetattr(STDIN, inherited.as_mut_ptr()) }, 0);
+            let mut inherited = unsafe { inherited.assume_init() };
+            inherited.c_iflag |= 0x0020 | 0x0080; // ISTRIP and IGNCR.
+            assert_eq!(unsafe { tcsetattr(STDIN, TCSANOW, &inherited) }, 0);
+            let mut terminal = Terminal::enter(false, false).unwrap();
+            eprintln!("ready");
+            for expected in [Key::Char('ā'), Key::Enter] {
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                let actual = loop {
+                    if let Some(key) = terminal.read_key(Duration::from_millis(25)).unwrap() {
+                        break Some(key);
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        break None;
+                    }
+                };
+                assert_eq!(actual, Some(expected));
+            }
+            terminal.leave().unwrap();
+            let mut restored = MaybeUninit::<Termios>::uninit();
+            assert_eq!(unsafe { tcgetattr(STDIN, restored.as_mut_ptr()) }, 0);
+            assert_eq!(unsafe { restored.assume_init() }.c_iflag, inherited.c_iflag);
+            return;
+        }
+        #[link(name = "util")]
+        unsafe extern "C" {
+            fn openpty(
+                master: *mut c_int,
+                slave: *mut c_int,
+                name: *mut std::os::raw::c_char,
+                termios: *const Termios,
+                size: *const WinSize,
+            ) -> c_int;
+        }
+        let (mut master, mut slave) = (-1, -1);
+        assert_eq!(
+            unsafe {
+                openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        let mut master = unsafe { std::fs::File::from_raw_fd(master) };
+        let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "terminal::tests::raw_input_preserves_unicode_and_enter_with_inherited_translations", "--nocapture"])
+            .env(CHILD, "1")
+            .stdin(std::process::Stdio::from(slave))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut errors = std::io::BufReader::new(child.stderr.take().unwrap());
+        let mut output = String::new();
+        errors.read_line(&mut output).unwrap();
+        assert_eq!(output.trim(), "ready");
+        master.write_all("ā\r".as_bytes()).unwrap();
+        errors.read_to_string(&mut output).unwrap();
+        assert!(child.wait().unwrap().success(), "{output}");
+    }
+
+    #[test]
+    fn disconnected_input_reports_an_error() {
+        const CHILD: &str = "BTOPRS_DISCONNECTED_INPUT_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let mut terminal = Terminal {
+                original: unsafe { std::mem::zeroed() },
+                active: false,
+                pending: Vec::new(),
+                mouse_enabled: false,
+                synchronized: false,
+            };
+            assert!(terminal.read_key(Duration::from_secs(1)).is_err());
+            return;
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "terminal::tests::disconnected_input_reports_an_error",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        drop(child.stdin.take());
+        let result = child.wait_with_output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    #[test]
+    fn malformed_mouse_reports_preserve_following_keys() {
+        for report in [
+            b"\x1b[<0;12;7X".as_slice(),
+            b"\x1b[<65;12;7~",
+            b"\x1b[<0;12;7Z",
+        ] {
+            let mut bytes = [report, b"q\x1b[A"].concat();
+            assert_eq!(take_key(&mut bytes), Some(Key::Unknown));
+            assert_eq!(take_key(&mut bytes), Some(Key::Char('q')));
+            assert_eq!(take_key(&mut bytes), Some(Key::Up));
+            assert!(bytes.is_empty());
+        }
+    }
+
+    #[test]
+    fn crash_restore_preserves_shared_stdout_flags() {
+        use std::os::fd::AsRawFd;
+        const CHILD: &str = "BTOPRS_CRASH_RESTORE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            unsafe { restore_after_crash() };
+            return;
+        }
+        let path = std::env::temp_dir().join(format!("btoprs-crash-flags-{}", std::process::id()));
+        let cleanup = std::mem::DropGuard::new(path, |path| {
+            let _ = std::fs::remove_file(path);
+        });
+        let file = std::fs::File::create(&*cleanup).unwrap();
+        let original = unsafe { fcntl(file.as_raw_fd(), F_GETFL) };
+        assert!(original >= 0);
+        for flags in [original, original | O_NONBLOCK] {
+            assert_eq!(unsafe { fcntl(file.as_raw_fd(), F_SETFL, flags) }, 0);
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "terminal::tests::crash_restore_preserves_shared_stdout_flags",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .stdout(file.try_clone().unwrap())
+                .output()
+                .unwrap();
+            assert!(result.status.success(), "{:?}", result);
+            assert_eq!(unsafe { fcntl(file.as_raw_fd(), F_GETFL) }, flags);
+        }
+    }
 
     #[test]
     fn incomplete_utf8_expires_and_does_not_hold_ascii_keys() {
@@ -649,6 +848,30 @@ mod tests {
         assert_eq!(take_key(&mut partial), None);
         partial.push(0xac);
         assert_eq!(take_key(&mut partial), Some(Key::Char('€')));
+    }
+
+    #[test]
+    fn interrupted_escape_sequences_preserve_control_and_following_keys() {
+        for prefix in [b"\x1b[".as_slice(), b"\x1b[<65;90", b"\x1bO"] {
+            for (suffix, key) in [
+                (b"\x03".as_slice(), Key::CtrlC),
+                (b"\x1b[A".as_slice(), Key::Up),
+                (
+                    b"\x1b[<0;12;7M".as_slice(),
+                    Key::Mouse {
+                        button: 0,
+                        x: 11,
+                        y: 6,
+                        pressed: true,
+                    },
+                ),
+            ] {
+                let mut bytes = [prefix, suffix].concat();
+                assert_eq!(take_key(&mut bytes), Some(Key::Unknown), "{prefix:?}");
+                assert_eq!(take_key(&mut bytes), Some(key), "{prefix:?}");
+                assert!(bytes.is_empty());
+            }
+        }
     }
 
     #[test]

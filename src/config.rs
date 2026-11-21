@@ -465,6 +465,11 @@ impl Config {
         {
             return Ok(());
         }
+        if !self.read_only
+            && let Some(path) = self.source_path.clone()
+        {
+            self.set_read_only_from(&path);
+        }
         if self.read_only {
             return Ok(());
         }
@@ -505,6 +510,16 @@ impl Config {
     }
 
     fn set_read_only_from(&mut self, path: &Path) {
+        if fs::metadata(path)
+            .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().readonly())
+        {
+            self.read_only = true;
+            self.warnings.push(format!(
+                "`{}` is read-only; config changes are not persistent",
+                path.display()
+            ));
+            return;
+        }
         let Some(parent) = path.parent() else {
             return;
         };
@@ -620,7 +635,7 @@ fn default_path() -> Option<PathBuf> {
             .map(|path| path.join("btoprs/btoprs.conf"))
     }
     #[cfg(unix)]
-    if let Some(path) = std::env::var_os("XDG_CONFIG_HOME") {
+    if let Some(path) = std::env::var_os("XDG_CONFIG_HOME").filter(|path| !path.is_empty()) {
         Some(PathBuf::from(path).join("btoprs/btoprs.conf"))
     } else {
         std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/btoprs/btoprs.conf"))
@@ -718,7 +733,7 @@ const BOOLS: &[&str] = &[
     "gpu_mirror_graph",
 ];
 
-fn valid_config_value(name: &str, value: &str) -> Result<(), String> {
+pub(crate) fn valid_config_value(name: &str, value: &str) -> Result<(), String> {
     if BOOLS.contains(&name) {
         return parse_bool(value)
             .map(|_| ())
@@ -757,7 +772,9 @@ fn valid_config_value(name: &str, value: &str) -> Result<(), String> {
         "proc_sorting" => valid_choice(&[
             "pid",
             "name",
+            "program",
             "command",
+            "arguments",
             "threads",
             "user",
             "memory",
@@ -816,6 +833,22 @@ fn valid_preset(preset: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn empty_xdg_uses_home() {
+        crate::tests::with_empty_env(
+            "config::tests::empty_xdg_uses_home",
+            "XDG_CONFIG_HOME",
+            || {
+                let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+                assert_eq!(
+                    default_path(),
+                    Some(home.join(".config/btoprs/btoprs.conf"))
+                );
+            },
+        );
+    }
+
     #[test]
     fn boolean_options_are_identified_by_schema_not_their_text() {
         let mut config = Config::default();
@@ -864,6 +897,30 @@ mod tests {
             assert_eq!(config.shown, [false; 4]);
         }
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn documented_process_sort_aliases_load_and_round_trip() {
+        let path =
+            std::env::temp_dir().join(format!("btoprs-sort-aliases-{}.conf", std::process::id()));
+        let cleanup = std::mem::DropGuard::new(path, |path| {
+            let _ = fs::remove_file(path);
+        });
+        for (value, expected) in [
+            ("program", "name"),
+            ("arguments", "command"),
+            ("name", "name"),
+            ("command", "command"),
+        ] {
+            fs::write(&*cleanup, format!("proc_sorting = \"{value}\"\n")).unwrap();
+            let mut config = Config::load(Some(&cleanup)).unwrap();
+            assert!(config.warnings.is_empty(), "{:?}", config.warnings);
+            assert_eq!(config.process_sort.label(), expected);
+            config.save().unwrap();
+            config.reload().unwrap();
+            assert!(config.warnings.is_empty(), "{:?}", config.warnings);
+            assert_eq!(config.process_sort.label(), expected);
+        }
     }
 
     #[test]
@@ -1074,6 +1131,27 @@ mod tests {
 
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_config_file_is_loaded_but_not_replaced() {
+        let path =
+            std::env::temp_dir().join(format!("btoprs-read-only-file-{}.conf", std::process::id()));
+        let cleanup = std::mem::DropGuard::new(path, |path| {
+            let _ = fs::remove_file(path);
+        });
+        let original = "update_ms = 1700\nsave_config_on_exit = true\n";
+        fs::write(&*cleanup, original).unwrap();
+        for initial_mode in [0o444, 0o644] {
+            fs::set_permissions(&*cleanup, fs::Permissions::from_mode(initial_mode)).unwrap();
+            let mut config = Config::load(Some(&cleanup)).unwrap();
+            assert_eq!(config.update_ms, 1700);
+            fs::set_permissions(&*cleanup, fs::Permissions::from_mode(0o444)).unwrap();
+            config.set_value("update_ms", "3100");
+            config.save().unwrap();
+            assert_eq!(fs::read_to_string(&*cleanup).unwrap(), original);
+        }
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::fs;
+use std::io::Read;
 use std::os::raw::{c_char, c_int, c_long, c_uint, c_ulong};
 use std::path::{Path, PathBuf};
 use std::ptr;
@@ -84,6 +85,7 @@ pub struct NetworkSample {
 #[derive(Debug, Clone, Default)]
 pub struct ProcessSample {
     pub pid: u32,
+    pub start_time: Option<u128>,
     pub parent: u32,
     pub name: String,
     pub command: String,
@@ -116,6 +118,32 @@ struct CpuTicks {
     busy: u64,
     total: u64,
     fields: [u64; 10],
+}
+
+impl CpuTicks {
+    fn usage_since(self, old: Self) -> f64 {
+        let total = self.total.saturating_sub(old.total);
+        let busy = self.busy.saturating_sub(old.busy);
+        if total == 0 {
+            0.0
+        } else {
+            (busy as f64 * 100.0 / total as f64).clamp(0.0, 100.0)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProcessCounters {
+    ticks: u64,
+    start_time: Option<u128>,
+}
+
+impl ProcessCounters {
+    fn delta_since(self, previous: Option<&Self>) -> u64 {
+        previous
+            .filter(|old| old.start_time == self.start_time)
+            .map_or(0, |old| self.ticks.saturating_sub(old.ticks))
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -246,7 +274,7 @@ pub fn diagnostics() -> String {
 
 pub struct Collector {
     previous_cpu: Vec<CpuTicks>,
-    previous_processes: HashMap<u32, u64>,
+    previous_processes: HashMap<u32, ProcessCounters>,
     previous_network: HashMap<String, NetworkCounters>,
     previous_disks: HashMap<String, DiskCounters>,
     last_sample: Instant,
@@ -373,13 +401,7 @@ impl Collector {
                     return 0.0;
                 };
                 let old = self.previous_cpu.get(index).copied().unwrap_or_default();
-                let total = now.total.saturating_sub(old.total);
-                let busy = now.busy.saturating_sub(old.busy);
-                if total == 0 {
-                    0.0
-                } else {
-                    busy as f64 * 100.0 / total as f64
-                }
+                now.usage_since(old)
             })
             .collect();
         let total_delta = current
@@ -607,8 +629,27 @@ impl Collector {
             #[cfg(target_os = "macos")]
             return macos::collect_processes(self, total_delta, cores, config, detailed_pid);
         }
-        let entries =
-            fs::read_dir("/proc").map_err(|e| format!("could not enumerate /proc: {e}"))?;
+        self.collect_processes_at(
+            Path::new("/proc"),
+            total_delta,
+            cores,
+            total_memory,
+            config,
+            detailed_pid,
+        )
+    }
+
+    fn collect_processes_at(
+        &mut self,
+        root: &Path,
+        total_delta: u64,
+        cores: usize,
+        total_memory: u64,
+        config: &Config,
+        detailed_pid: Option<u32>,
+    ) -> Result<Vec<ProcessSample>, String> {
+        let entries = fs::read_dir(root)
+            .map_err(|e| format!("could not enumerate {}: {e}", root.display()))?;
         let mut next_ticks = HashMap::new();
         let mut result = Vec::new();
         let clock_ticks = clock_ticks() as f64;
@@ -629,9 +670,12 @@ impl Collector {
                 continue;
             };
             let ticks = raw.user_ticks.saturating_add(raw.system_ticks);
-            next_ticks.insert(pid, ticks);
-            let delta =
-                ticks.saturating_sub(self.previous_processes.get(&pid).copied().unwrap_or(ticks));
+            let counters = ProcessCounters {
+                ticks,
+                start_time: Some(u128::from(raw.start_ticks)),
+            };
+            next_ticks.insert(pid, counters);
+            let delta = counters.delta_since(self.previous_processes.get(&pid));
             let mut cpu = if total_delta == 0 {
                 0.0
             } else {
@@ -644,17 +688,14 @@ impl Collector {
             let elapsed_ticks = (uptime_ticks - raw.start_ticks as f64).max(1.0);
             let cumulative_cpu = ticks as f64 * 100.0 / elapsed_ticks;
             let elapsed_seconds = (elapsed_ticks / clock_ticks) as u64;
-            let status = fs::read_to_string(entry.path().join("status")).unwrap_or_default();
-            let uid = status
-                .lines()
-                .find_map(|line| {
-                    line.strip_prefix("Uid:")?
-                        .split_whitespace()
-                        .next()?
-                        .parse::<u32>()
-                        .ok()
-                })
-                .unwrap_or(0);
+            let status = fs::read(entry.path().join("status")).unwrap_or_default();
+            let uid = String::from_utf8_lossy(&status).lines().find_map(|line| {
+                line.strip_prefix("Uid:")?
+                    .split_whitespace()
+                    .next()?
+                    .parse::<u32>()
+                    .ok()
+            });
             let stat_memory = raw.rss_pages.saturating_mul(page_size);
             let memory = if detailed_pid == Some(pid)
                 && config.bool_value("proc_info_smaps").unwrap_or(false)
@@ -665,18 +706,8 @@ impl Collector {
             } else {
                 stat_memory
             };
-            let command_bytes = fs::read(entry.path().join("cmdline")).unwrap_or_default();
-            let kernel_thread = pid == 2 || raw.parent == 2;
-            let command = (!command_bytes.is_empty())
-                .then(|| {
-                    let bytes = &command_bytes[..command_bytes.len().min(1_000)];
-                    String::from_utf8_lossy(bytes)
-                        .split('\0')
-                        .filter(|v| !v.is_empty())
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                })
-                .filter(|v| !v.is_empty())
+            let command = fs::File::open(entry.path().join("cmdline"))
+                .and_then(read_process_command)
                 .unwrap_or_default();
             let (read_bytes, write_bytes) = if detailed_pid == Some(pid) {
                 read_process_io(pid)
@@ -685,21 +716,25 @@ impl Collector {
             };
             result.push(ProcessSample {
                 pid,
+                start_time: counters.start_time,
                 parent: raw.parent,
                 name: raw.name,
                 command,
-                user: self
-                    .users
-                    .get(&uid)
-                    .cloned()
-                    .unwrap_or_else(|| uid.to_string()),
+                user: uid
+                    .map(|uid| {
+                        self.users
+                            .get(&uid)
+                            .cloned()
+                            .unwrap_or_else(|| uid.to_string())
+                    })
+                    .unwrap_or_default(),
                 state: raw.state,
                 threads: raw.threads,
                 memory,
                 cpu,
                 cumulative_cpu,
                 nice: raw.nice,
-                kernel_thread,
+                kernel_thread: raw.kernel_thread,
                 elapsed_seconds,
                 read_bytes,
                 write_bytes,
@@ -712,6 +747,16 @@ impl Collector {
 
 fn elapsed_us(started: Instant) -> u64 {
     started.elapsed().as_micros().min(u64::MAX as u128) as u64
+}
+
+fn read_process_command(reader: impl Read) -> std::io::Result<String> {
+    let mut bytes = Vec::with_capacity(1_000);
+    reader.take(1_000).read_to_end(&mut bytes)?;
+    Ok(String::from_utf8_lossy(&bytes)
+        .split('\0')
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join(" "))
 }
 
 fn read_smaps_rss(path: &Path) -> Option<u64> {
@@ -813,6 +858,7 @@ struct RawProcess {
     rss_pages: u64,
     nice: i32,
     start_ticks: u64,
+    kernel_thread: bool,
 }
 
 fn parse_process_stat(_pid: u32, stat: &[u8]) -> Option<RawProcess> {
@@ -833,6 +879,7 @@ fn parse_process_stat(_pid: u32, stat: &[u8]) -> Option<RawProcess> {
         rss_pages: rest.get(21)?.parse::<i64>().ok()?.max(0) as u64,
         nice: rest.get(16)?.parse().ok()?,
         start_ticks: rest.get(19)?.parse().ok()?,
+        kernel_thread: rest.get(6)?.parse::<u32>().ok()? & 0x0020_0000 != 0, // PF_KTHREAD
     })
 }
 
@@ -1129,7 +1176,8 @@ fn decode_mount_field(value: &str) -> String {
     while index < bytes.len() {
         if bytes[index] == b'\\'
             && index + 3 < bytes.len()
-            && bytes[index + 1..=index + 3]
+            && matches!(bytes[index + 1], b'0'..=b'3')
+            && bytes[index + 2..=index + 3]
                 .iter()
                 .all(|byte| matches!(byte, b'0'..=b'7'))
         {
@@ -1766,9 +1814,11 @@ fn read_battery_at(root: &Path, selected: &str) -> Option<BatterySample> {
         .or_else(|| batteries.first())?;
 
     let energy_now = read_number(path.join("energy_now"));
-    let energy_full = read_number(path.join("energy_full"));
+    let energy_full =
+        read_number(path.join("energy_full")).filter(|value| value.is_finite() && *value > 0.0);
     let charge_now = read_number(path.join("charge_now"));
-    let charge_full = read_number(path.join("charge_full"));
+    let charge_full =
+        read_number(path.join("charge_full")).filter(|value| value.is_finite() && *value > 0.0);
     let power_now = read_number(path.join("power_now")).filter(|value| *value >= 0.0);
     let current_now = read_number(path.join("current_now")).filter(|value| *value >= 0.0);
     let voltage_now = read_number(path.join("voltage_now")).filter(|value| *value >= 0.0);
@@ -1842,8 +1892,9 @@ fn power_supply_online(root: &Path) -> Option<f64> {
 fn power_supply_time(path: &Path, names: &[&str]) -> Option<u64> {
     names
         .iter()
-        .find_map(|name| read_number(path.join(name)))
-        .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+        .find_map(|name| {
+            read_number(path.join(name)).filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+        })
         .map(|seconds| seconds as u64)
 }
 
@@ -2061,6 +2112,153 @@ fn stat_vfs(path: &Path) -> Option<(u64, u64, u64)> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn process_command_reads_only_the_displayed_prefix() {
+        let mut reader = std::io::Cursor::new(vec![b'a'; 4096]);
+        assert_eq!(
+            read_process_command(&mut reader).unwrap(),
+            "a".repeat(1_000)
+        );
+        assert_eq!(reader.position(), 1_000);
+        assert_eq!(
+            read_process_command(b"program\0arg\0\0".as_slice()).unwrap(),
+            "program arg"
+        );
+        assert_eq!(read_process_command(b"\0\0".as_slice()).unwrap(), "");
+        assert_eq!(
+            read_process_command(b"x\xff\0".as_slice()).unwrap(),
+            "x\u{fffd}"
+        );
+    }
+
+    #[test]
+    fn cpu_usage_stays_bounded_when_iowait_decreases() {
+        let ticks = |text| parse_cpu_stat(text).unwrap()[0].unwrap();
+        let first = ticks("cpu 100 0 0 100 100 0 0 0 0 0\n");
+        let second = ticks("cpu 200 0 0 100 50 0 0 0 0 0\n");
+        assert_eq!(second.usage_since(first), 100.0);
+        let third = ticks("cpu 250 0 0 150 50 0 0 0 0 0\n");
+        assert_eq!(third.usage_since(second), 50.0);
+        assert_eq!(third.usage_since(third), 0.0);
+        assert_eq!(first.usage_since(third), 0.0);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn process_fixture(root: &Path, pid: u32, parent: u32, flags: u32, ticks: u64, start: u64) {
+        let path = root.join(pid.to_string());
+        fs::create_dir_all(&path).unwrap();
+        let mut fields = vec!["0".to_string(); 22];
+        fields[0] = "S".into();
+        fields[1] = parent.to_string();
+        fields[6] = flags.to_string();
+        fields[11] = ticks.to_string();
+        fields[17] = "1".into();
+        fields[19] = start.to_string();
+        fs::write(
+            path.join("stat"),
+            format!("{pid} (test process) {}", fields.join(" ")),
+        )
+        .unwrap();
+        fs::write(path.join("status"), "Uid:\t1234\t1234\t1234\t1234\n").unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kernel_threads_are_identified_by_flags_not_namespace_pids() {
+        let root = std::env::temp_dir().join(format!("btoprs-kthread-{}", std::process::id()));
+        let cleanup = std::mem::DropGuard::new(root, |root| {
+            let _ = fs::remove_dir_all(root);
+        });
+        process_fixture(&cleanup, 2, 1, 0, 0, 1);
+        process_fixture(&cleanup, 3, 2, 0, 0, 1);
+        process_fixture(&cleanup, 44, 1, 0x0020_0000, 0, 1);
+        let mut config = Config::default();
+        config.set_value("shown_gpus", "");
+        let mut collector = Collector::new(&config).unwrap();
+        let processes = collector
+            .collect_processes_at(&cleanup, 100, 1, 1000, &config, None)
+            .unwrap();
+        for pid in [2, 3] {
+            assert!(
+                !processes
+                    .iter()
+                    .find(|process| process.pid == pid)
+                    .unwrap()
+                    .kernel_thread,
+                "userspace PID {pid} in a container must stay visible"
+            );
+        }
+        assert!(
+            processes
+                .iter()
+                .find(|process| process.pid == 44)
+                .unwrap()
+                .kernel_thread
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reused_process_ids_start_a_fresh_cpu_baseline() {
+        let root = std::env::temp_dir().join(format!("btoprs-pid-reuse-{}", std::process::id()));
+        let cleanup = std::mem::DropGuard::new(root, |root| {
+            let _ = fs::remove_dir_all(root);
+        });
+        let mut config = Config::default();
+        config.set_value("shown_gpus", "");
+        let mut collector = Collector::new(&config).unwrap();
+        for (start, ticks, expected) in [
+            (10, 100, 0.0),
+            (10, 125, 25.0),
+            (20, 200, 0.0),
+            (20, 240, 40.0),
+        ] {
+            process_fixture(&cleanup, 42, 1, 0, ticks, start);
+            let processes = collector
+                .collect_processes_at(&cleanup, 100, 1, 1000, &config, None)
+                .unwrap();
+            assert_eq!(processes[0].cpu, expected, "start={start}, ticks={ticks}");
+            assert_eq!(processes[0].start_time, Some(u128::from(start)));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_owners_survive_non_utf8_status_and_missing_uids_stay_unknown() {
+        let root =
+            std::env::temp_dir().join(format!("btoprs-process-owner-{}", std::process::id()));
+        let cleanup = std::mem::DropGuard::new(root, |root| {
+            let _ = fs::remove_dir_all(root);
+        });
+        process_fixture(&cleanup, 42, 1, 0, 0, 1);
+        let mut config = Config::default();
+        config.set_value("shown_gpus", "");
+        let mut collector = Collector::new(&config).unwrap();
+        collector.users = HashMap::from([(0, "root".into()), (1234, "worker".into())]);
+        let status_path = cleanup.join("42/status");
+        for (status, expected) in [
+            (Some(b"Uid:\t0\t0\t0\t0\n".as_slice()), "root"),
+            (
+                Some(b"Name:\tbad\xffname\nUid:\t1234\t1234\t1234\t1234\n".as_slice()),
+                "worker",
+            ),
+            (Some(b"Uid:\t5678\n".as_slice()), "5678"),
+            (Some(b"Name:\tworker\n".as_slice()), ""),
+            (Some(b"Uid:\tinvalid\n".as_slice()), ""),
+            (None, ""),
+        ] {
+            if let Some(status) = status {
+                fs::write(&status_path, status).unwrap();
+            } else {
+                fs::remove_file(&status_path).unwrap();
+            }
+            let processes = collector
+                .collect_processes_at(&cleanup, 100, 1, 1000, &config, None)
+                .unwrap();
+            assert_eq!(processes[0].user, expected, "{status:?}");
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn disabled_linux_metrics_are_skipped_and_disk_baselines_reset() {
@@ -2251,6 +2449,19 @@ mod tests {
     }
 
     #[test]
+    fn mount_fields_preserve_invalid_octal_escapes() {
+        for field in [
+            r"/media/\400",
+            r"/media/\777",
+            r"/media/\078",
+            r"/media/\04",
+        ] {
+            assert_eq!(decode_mount_field(field), field);
+        }
+        assert_eq!(decode_mount_field(r"/media/\303\251"), "/media/é");
+    }
+
+    #[test]
     fn network_counters_keep_totals_across_device_resets() {
         let mut last = 4_000;
         let mut rollover = 0;
@@ -2349,6 +2560,48 @@ mod tests {
         assert_eq!(charging.seconds, Some(4_321));
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn battery_capacity_skips_unusable_energy_before_charge_fallback() {
+        let root =
+            std::env::temp_dir().join(format!("btoprs-battery-capacity-{}", std::process::id()));
+        let cleanup = std::mem::DropGuard::new(root, |root| {
+            let _ = fs::remove_dir_all(root);
+        });
+        let path = cleanup.join("BAT0");
+        fs::create_dir_all(&path).unwrap();
+        for (name, value) in [
+            ("type", "Battery"),
+            ("status", "Discharging"),
+            ("energy_now", "1000"),
+            ("energy_full", "0"),
+            ("charge_now", "2500"),
+            ("charge_full", "5000"),
+        ] {
+            fs::write(path.join(name), value).unwrap();
+        }
+        assert_eq!(read_battery_at(&cleanup, "Auto").unwrap().percent, 50);
+        fs::write(path.join("charge_full"), "0").unwrap();
+        assert!(read_battery_at(&cleanup, "Auto").is_none());
+    }
+
+    #[test]
+    fn battery_time_uses_average_when_current_estimate_is_unavailable() {
+        let root = std::env::temp_dir().join(format!("btoprs-battery-time-{}", std::process::id()));
+        let cleanup = std::mem::DropGuard::new(root, |root| {
+            let _ = fs::remove_dir_all(root);
+        });
+        fs::create_dir_all(&*cleanup).unwrap();
+        fs::write(cleanup.join("time_to_empty_avg"), "1200").unwrap();
+        for value in ["0", "-1", "NaN", "inf"] {
+            fs::write(cleanup.join("time_to_empty_now"), value).unwrap();
+            assert_eq!(
+                power_supply_time(&cleanup, &["time_to_empty_now", "time_to_empty_avg"]),
+                Some(1200),
+                "{value}"
+            );
+        }
     }
 
     #[test]

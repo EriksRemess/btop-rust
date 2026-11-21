@@ -227,16 +227,24 @@ pub fn local_clock_format(format: &str) -> String {
         return String::new();
     }
     let local = unsafe { local.assume_init() };
-    let mut output = [0 as c_char; 64];
     let Ok(format) = std::ffi::CString::new(format) else {
         return String::new();
     };
-    if unsafe { strftime(output.as_mut_ptr(), output.len(), format.as_ptr(), &local) } == 0 {
+    if format.as_bytes().is_empty() {
         return String::new();
     }
-    unsafe { CStr::from_ptr(output.as_ptr()) }
-        .to_string_lossy()
-        .into_owned()
+    let mut output = vec![0 as c_char; 64];
+    loop {
+        if unsafe { strftime(output.as_mut_ptr(), output.len(), format.as_ptr(), &local) } > 0 {
+            return unsafe { CStr::from_ptr(output.as_ptr()) }
+                .to_string_lossy()
+                .into_owned();
+        }
+        if output.len() >= 65_536 {
+            return String::new();
+        }
+        output.resize(output.len() * 2, 0);
+    }
 }
 
 #[cfg(not(unix))]
@@ -327,5 +335,14 @@ mod tests {
         assert_eq!(year.len(), 4);
         assert!(year.chars().all(|ch| ch.is_ascii_digit()));
         assert_eq!(local_clock_format("literal"), "literal");
+    }
+
+    #[test]
+    fn clock_formats_are_not_limited_to_sixty_three_bytes() {
+        for literal in ["x".repeat(200), "界".repeat(64)] {
+            assert_eq!(local_clock_format(&literal), literal);
+        }
+        assert_eq!(local_clock_format(&"%%".repeat(160)), "%".repeat(160));
+        assert_eq!(local_clock_format(""), "");
     }
 }

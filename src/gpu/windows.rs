@@ -1,3 +1,7 @@
+#[cfg(test)]
+#[path = "nvml_tests.rs"]
+mod nvml_tests;
+
 use crate::config::Config;
 use crate::logger;
 use std::ffi::OsString;
@@ -187,7 +191,6 @@ struct Nvml {
     driver_label: Option<String>,
     power_limits: Vec<u64>,
     temperature_limits: Vec<i64>,
-    supports: Vec<GpuSupport>,
 }
 
 impl Nvml {
@@ -277,7 +280,7 @@ impl Nvml {
             unsafe { shutdown() };
             return None;
         }
-        let mut nvml = Self {
+        Some(Self {
             _library: library,
             functions,
             devices,
@@ -285,25 +288,10 @@ impl Nvml {
             driver_label,
             power_limits,
             temperature_limits,
-            supports: Vec::new(),
-        };
-        nvml.supports = nvml
-            .collect_unchecked(true, true)
-            .into_iter()
-            .map(|sample| sample.support)
-            .collect();
-        Some(nvml)
+        })
     }
 
     fn collect(&self, check_temperature: bool, measure_pcie: bool) -> Vec<GpuSample> {
-        let mut samples = self.collect_unchecked(check_temperature, measure_pcie);
-        for (sample, support) in samples.iter_mut().zip(&self.supports) {
-            sample.support.clone_from(support);
-        }
-        samples
-    }
-
-    fn collect_unchecked(&self, check_temperature: bool, measure_pcie: bool) -> Vec<GpuSample> {
         self.devices
             .iter()
             .enumerate()
@@ -356,8 +344,6 @@ impl Nvml {
                         sample.temperature_c = i64::from(temperature);
                         sample.support.temperature = true;
                     }
-                } else {
-                    sample.support.temperature = true;
                 }
                 let mut memory = NvmlMemory::default();
                 if unsafe { (self.functions.get_memory)(device, &mut memory) } == NVML_SUCCESS {

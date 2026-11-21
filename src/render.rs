@@ -170,6 +170,7 @@ pub struct AppState {
     last_size: Option<Size>,
     pub needs_redraw: bool,
     collection_requested: bool,
+    theme_refresh_requested: bool,
     overlay: Overlay,
     filter_editing: bool,
     filter_buffer: String,
@@ -408,6 +409,7 @@ impl AppState {
             last_size: None,
             needs_redraw: true,
             collection_requested: false,
+            theme_refresh_requested: false,
             overlay: Overlay::None,
             filter_editing: false,
             detailed_pid: None,
@@ -531,6 +533,19 @@ impl AppState {
                 history.activity.clear();
             }
         }
+        let interfaces: HashSet<&str> = sample
+            .network
+            .interfaces
+            .iter()
+            .map(String::as_str)
+            .chain(std::iter::once(sample.network.selected.as_str()))
+            .collect();
+        self.network_histories
+            .retain(|interface, _| interfaces.contains(interface.as_str()));
+        self.network_raw_totals
+            .retain(|interface, _| interfaces.contains(interface.as_str()));
+        self.network_offsets
+            .retain(|interface, _| interfaces.contains(interface.as_str()));
         let (download_speed, upload_speed) = if sample.network.connected {
             (
                 sample.network.download_per_second,
@@ -554,18 +569,72 @@ impl AppState {
         self.update_network_scale(&sample.network);
         self.gpu_histories
             .resize_with(sample.gpus.len(), GpuHistory::default);
-        for (gpu, history) in sample.gpus.iter().zip(&mut self.gpu_histories) {
-            push(&mut history.utilization, f64::from(gpu.utilization));
-            push(&mut history.temperature, gpu.temperature_c as f64);
-            push(
-                &mut history.memory_used,
-                ratio(gpu.memory_used, gpu.memory_total).round(),
-            );
-            push(
-                &mut history.memory_utilization,
-                f64::from(gpu.memory_utilization),
-            );
-            push(&mut history.power, ratio(gpu.power_mw, gpu.power_limit_mw));
+        for (index, (gpu, history)) in sample.gpus.iter().zip(&mut self.gpu_histories).enumerate() {
+            if self.sample.gpus.get(index).is_none_or(|previous| {
+                previous.name != gpu.name || previous.driver_label != gpu.driver_label
+            }) {
+                *history = GpuHistory::default();
+            }
+            if gpu.support.utilization {
+                push(&mut history.utilization, f64::from(gpu.utilization));
+            }
+            if gpu.support.temperature {
+                push(&mut history.temperature, gpu.temperature_c as f64);
+            }
+            if gpu.support.memory_total && gpu.support.memory_used {
+                push(
+                    &mut history.memory_used,
+                    ratio(gpu.memory_used, gpu.memory_total).round(),
+                );
+            }
+            if gpu.support.memory_utilization {
+                push(
+                    &mut history.memory_utilization,
+                    f64::from(gpu.memory_utilization),
+                );
+            }
+            if gpu.support.power {
+                push(&mut history.power, ratio(gpu.power_mw, gpu.power_limit_mw));
+            }
+        }
+        let previous_start_times: HashMap<u32, u128> = self
+            .sample
+            .processes
+            .iter()
+            .chain(self.detailed_process.iter())
+            .filter_map(|process| process.start_time.map(|start| (process.pid, start)))
+            .collect();
+        let reused_pids: HashSet<u32> = sample
+            .processes
+            .iter()
+            .filter(|process| {
+                process.start_time.is_some_and(|start| {
+                    previous_start_times
+                        .get(&process.pid)
+                        .is_some_and(|previous| *previous != start)
+                })
+            })
+            .map(|process| process.pid)
+            .collect();
+        if self
+            .selected_pid()
+            .is_some_and(|pid| reused_pids.contains(&pid))
+        {
+            self.process_selected = false;
+        }
+        if self
+            .followed_pid
+            .is_some_and(|pid| reused_pids.contains(&pid))
+        {
+            self.followed_pid = None;
+        }
+        if self
+            .detailed_pid
+            .is_some_and(|pid| reused_pids.contains(&pid))
+        {
+            self.detailed_pid = None;
+            self.detailed_process = None;
+            self.last_selected_process = None;
         }
         if self.config.pause_processes {
             let current_pids: HashSet<u32> =
@@ -576,7 +645,10 @@ impl AppState {
                 .unwrap_or(false);
             sample.processes = std::mem::take(&mut self.sample.processes);
             for process in &mut sample.processes {
-                if process.state == 'X' || !current_pids.contains(&process.pid) {
+                if process.state == 'X'
+                    || !current_pids.contains(&process.pid)
+                    || reused_pids.contains(&process.pid)
+                {
                     process.state = 'X';
                     if !keep_usage {
                         process.cpu = 0.0;
@@ -588,8 +660,10 @@ impl AppState {
         }
         let current_pids: HashSet<u32> =
             sample.processes.iter().map(|process| process.pid).collect();
+        self.collapsed_processes
+            .retain(|pid| current_pids.contains(pid) && !reused_pids.contains(pid));
         self.process_cpu_histories
-            .retain(|pid, _| current_pids.contains(pid));
+            .retain(|pid, _| current_pids.contains(pid) && !reused_pids.contains(pid));
         for process in &sample.processes {
             let graph_value = if (0.1..5.0).contains(&process.cpu) {
                 5.0
@@ -645,6 +719,21 @@ impl AppState {
             sample.network.uploaded = sample.network.uploaded.saturating_sub(*upload_offset);
         }
         self.sample = sample;
+        let pending_operation = match self.overlay {
+            Overlay::Signal { pid, .. } | Overlay::SignalChoose { pid, .. } => {
+                Some((pid, Operation::Signal))
+            }
+            Overlay::Renice { pid, .. } => Some((pid, Operation::Renice)),
+            _ => None,
+        };
+        if let Some((pid, operation)) = pending_operation
+            && (reused_pids.contains(&pid) || !self.process_is_alive(pid))
+        {
+            self.overlay = Overlay::OperationError {
+                operation,
+                errno: if cfg!(windows) { 1168 } else { 3 },
+            };
+        }
     }
 
     pub fn set_debug(&mut self, enabled: bool) {
@@ -709,7 +798,14 @@ impl AppState {
     }
 
     pub fn take_collection_request(&mut self) -> bool {
-        std::mem::take(&mut self.collection_requested)
+        self.should_collect() && std::mem::take(&mut self.collection_requested)
+    }
+
+    pub fn replace_config(&mut self, config: Config) {
+        self.config = config;
+        self.collection_requested = true;
+        self.theme_refresh_requested = true;
+        self.needs_redraw = true;
     }
 
     pub fn detailed_pid(&self) -> Option<u32> {
@@ -1402,23 +1498,19 @@ impl AppState {
         let Some(option) = self.editing_option else {
             return;
         };
-        let valid = if is_integer_option(option) {
-            self.options_buffer.parse::<i64>().is_ok_and(|value| {
-                (option != "update_ms" || (100..=86_400_000).contains(&value))
-                    && (option != "proc_tree_auto_collapse" || (0..=10_000).contains(&value))
-            })
-        } else if option == "shown_boxes" {
-            let boxes: Vec<&str> = self.options_buffer.split_whitespace().collect();
-            boxes.iter().all(|name| {
-                matches!(*name, "cpu" | "mem" | "net" | "proc")
-                    || name
-                        .strip_prefix("gpu")
-                        .and_then(|index| index.parse::<usize>().ok())
-                        .is_some_and(|index| index < self.sample.gpus.len())
-            })
-        } else {
-            true
-        };
+        let valid = crate::config::valid_config_value(option, &self.options_buffer).is_ok()
+            && if option == "shown_boxes" {
+                let boxes: Vec<&str> = self.options_buffer.split_whitespace().collect();
+                boxes.iter().all(|name| {
+                    matches!(*name, "cpu" | "mem" | "net" | "proc")
+                        || name
+                            .strip_prefix("gpu")
+                            .and_then(|index| index.parse::<usize>().ok())
+                            .is_some_and(|index| index < self.sample.gpus.len())
+                })
+            } else {
+                true
+            };
         if valid {
             self.config.set_value(option, self.options_buffer.clone());
             self.editing_option = None;
@@ -1565,8 +1657,7 @@ impl AppState {
 
     fn network_zero_active(&self) -> bool {
         self.network_offsets
-            .get(&self.sample.network.selected)
-            .is_some_and(|(download, upload)| download.saturating_add(*upload) > 0)
+            .contains_key(&self.sample.network.selected)
     }
 
     fn toggle_network_zero(&mut self) {
@@ -1659,14 +1750,21 @@ impl AppState {
     }
 
     fn open_signal(&mut self, signal: i32) {
-        let pid = self
-            .process_selected
-            .then(|| self.visible_pids.get(self.selected_process).copied())
-            .flatten()
-            .or(self.detailed_pid);
-        if let Some(pid) = pid {
+        if let Some(pid) = self.selected_live_pid() {
             self.overlay = Overlay::Signal { pid, signal };
         }
+    }
+
+    fn process_is_alive(&self, pid: u32) -> bool {
+        self.sample
+            .processes
+            .iter()
+            .any(|process| process.pid == pid && !matches!(process.state, 'X' | 'x'))
+    }
+
+    fn selected_live_pid(&self) -> Option<u32> {
+        self.selected_pid()
+            .filter(|pid| self.process_is_alive(*pid))
     }
 
     fn selected_pid(&self) -> Option<u32> {
@@ -1746,21 +1844,28 @@ impl AppState {
     }
 
     fn open_signal_chooser(&mut self) {
-        if let Some(pid) = self.selected_pid() {
+        if let Some(pid) = self.selected_live_pid() {
             self.signal_buffer.clear();
             self.overlay = Overlay::SignalChoose { pid, selected: 0 };
         }
     }
 
     fn open_renice(&mut self) {
-        if let Some(pid) = self.selected_pid() {
+        if let Some(process) = self.selected_live_pid().and_then(|pid| {
+            self.sample
+                .processes
+                .iter()
+                .find(|process| process.pid == pid)
+        }) {
+            let pid = process.pid;
+            let value = process.nice.clamp(-20, 19);
             self.renice_buffer.clear();
-            self.overlay = Overlay::Renice { pid, value: 0 };
+            self.overlay = Overlay::Renice { pid, value };
         }
     }
 
     fn toggle_follow(&mut self) {
-        let selected = self.selected_pid();
+        let selected = self.selected_live_pid();
         if selected.is_some() && selected != self.followed_pid {
             self.followed_pid = selected;
         } else if self.followed_pid.is_some() {
@@ -2065,12 +2170,16 @@ impl Renderer {
             app.dragging_disk_scrollbar = false;
             return too_small(size, needed);
         }
-        if self.theme_name != app.config.color_theme || self.themes_dir != app.config.themes_dir {
+        if app.theme_refresh_requested
+            || self.theme_name != app.config.color_theme
+            || self.themes_dir != app.config.themes_dir
+        {
             self.palette =
                 theme::Palette::load(&app.config.color_theme, app.config.themes_dir.as_deref())
                     .unwrap_or_default();
             self.theme_name.clone_from(&app.config.color_theme);
             self.themes_dir.clone_from(&app.config.themes_dir);
+            app.theme_refresh_requested = false;
         }
         let mut canvas = Canvas::new(size.cols as usize, size.rows as usize);
         canvas.palette.clone_from(&self.palette);
@@ -2089,17 +2198,18 @@ impl Renderer {
         }
         let inline_gpus = inline_gpu_panels(&app.config, &app.sample.gpus, &shown_gpus);
         let lower_visible = app.config.shown[1] || app.config.shown[2] || app.config.shown[3];
+        // Reserve every panel's minimum before assigning percentage-based heights.
+        let lower_minimum = lower_panel_minimum(&app.config);
+        let gpu_minimum: usize = shown_gpus
+            .iter()
+            .map(|index| gpu_height_offset(&app.sample.gpus[*index]) + 4)
+            .sum();
         let cpu_h = if app.config.shown[0] {
             if !lower_visible {
                 if shown_gpus.is_empty() {
                     height
                 } else {
-                    height.saturating_sub(
-                        shown_gpus
-                            .iter()
-                            .map(|index| gpu_height_offset(&app.sample.gpus[*index]) + 4)
-                            .sum::<usize>(),
-                    )
+                    height.saturating_sub(gpu_minimum)
                 }
             } else {
                 let expanded_gpus = shown_gpus
@@ -2115,8 +2225,8 @@ impl Renderer {
                 (height * percentage)
                     .div_ceil(100)
                     .saturating_add(inline_gpus.len())
-                    .max(8)
-                    .min(height)
+                    .max(8 + inline_gpus.len())
+                    .min(height.saturating_sub(gpu_minimum + lower_minimum))
             }
         } else {
             0
@@ -2138,8 +2248,10 @@ impl Renderer {
 
         let mut gpu_y = if cpu_bottom { 0 } else { cpu_h };
         let vertical_end = if cpu_bottom { cpu_y } else { height };
+        let mut remaining_gpu_minimum = gpu_minimum;
         for (position, &index) in shown_gpus.iter().enumerate() {
             let remaining = vertical_end.saturating_sub(gpu_y);
+            remaining_gpu_minimum -= gpu_height_offset(&app.sample.gpus[index]) + 4;
             let gpu_h = gpu_panel_height(
                 &app.sample.gpus[index],
                 cpu_h,
@@ -2148,7 +2260,8 @@ impl Renderer {
                 shown_gpus.len() - position,
                 height,
                 shown_gpus.len(),
-            );
+            )
+            .min(remaining.saturating_sub(lower_minimum + remaining_gpu_minimum));
             if gpu_y + gpu_h > vertical_end {
                 break;
             }
@@ -2177,7 +2290,7 @@ impl Renderer {
         let left_x = if proc_left && proc_visible { proc_w } else { 0 };
         let proc_x = if proc_left { 0 } else { left_w };
         if left_visible {
-            let mem_h = memory_panel_height(
+            let mut mem_h = memory_panel_height(
                 height,
                 cpu_h,
                 gpu_total_height,
@@ -2187,6 +2300,9 @@ impl Renderer {
                 !shown_gpus.is_empty(),
             )
             .min(lower_h);
+            if app.config.shown[1] && app.config.shown[2] {
+                mem_h = mem_h.clamp(10, lower_h - 6);
+            }
             let net_h = lower_h.saturating_sub(mem_h);
             let mem_below_net = app.config.bool_value("mem_below_net").unwrap_or(false);
             let mem_y = if mem_below_net && app.config.shown[2] {
@@ -2335,12 +2451,12 @@ pub fn minimum_size(config: &Config, gpus: &[GpuSample]) -> Size {
         width = width.max(41);
     }
 
-    let mut height = if cpu { 8 } else { 0 };
-    height += if processes {
-        16
+    let mut height = if cpu {
+        8 + inline_gpu_panels(config, gpus, &shown_gpus).len()
     } else {
-        usize::from(memory) * 10 + usize::from(network) * 6
+        0
     };
+    height += lower_panel_minimum(config);
     height += shown_gpus
         .iter()
         .map(|index| gpu_height_offset(&gpus[*index]) + 4)
@@ -2349,6 +2465,14 @@ pub fn minimum_size(config: &Config, gpus: &[GpuSample]) -> Size {
     Size {
         cols: width as u16,
         rows: height as u16,
+    }
+}
+
+fn lower_panel_minimum(config: &Config) -> usize {
+    if config.shown[3] {
+        16
+    } else {
+        usize::from(config.shown[1]) * 10 + usize::from(config.shown[2]) * 6
     }
 }
 
@@ -2469,15 +2593,6 @@ fn draw_cpu(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
         end: preset_x + 1 + units::display_width(&preset),
         action: CpuControlAction::Preset,
     });
-    if !app.config.clock_format.is_empty() {
-        let clock = units::local_clock_format(&app.config.clock_format);
-        let clock_x = area.x + area.w / 2 - units::display_width(&clock) / 2;
-        if cpu_bottom {
-            canvas.footer(clock_x, controls_y, &clock, theme::CPU_BOX);
-        } else {
-            canvas.title(clock_x, controls_y, &clock, theme::CPU_BOX);
-        }
-    }
     let update = format!("- {}ms +", app.config.update_ms);
     let update_x = area.x + area.w.saturating_sub(update.len() + 4);
     let update_enabled = !(app.config.process_tree
@@ -2518,6 +2633,7 @@ fn draw_cpu(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
         end: update_x + update.chars().count() + 1,
         action: CpuControlAction::IncreaseUpdate,
     });
+    let mut clock_left = preset_x + units::display_width(&preset) + 3;
     if let Some(engine) = &app.sample.cpu.container_engine {
         let engine_x = area.x + 28;
         if engine_x + units::display_width(engine) + 2 < update_x {
@@ -2525,6 +2641,25 @@ fn draw_cpu(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
                 canvas.footer_normal(engine_x, controls_y, engine, theme::CPU_BOX);
             } else {
                 canvas.title_normal(engine_x, controls_y, engine, theme::CPU_BOX);
+            }
+            clock_left = engine_x + units::display_width(engine) + 3;
+        }
+    }
+    let clock_right = update_x.saturating_sub(1);
+    let clock_width = clock_right.saturating_sub(clock_left + 2);
+    if clock_width > 0 && !app.config.clock_format.is_empty() {
+        let clock = units::truncate(
+            &sanitize_control(&units::local_clock_format(&app.config.clock_format)),
+            clock_width,
+        );
+        if !clock.is_empty() {
+            let width = units::display_width(&clock) + 2;
+            let centered = area.x + area.w.saturating_sub(width) / 2;
+            let clock_x = centered.clamp(clock_left, clock_right - width);
+            if cpu_bottom {
+                canvas.footer(clock_x, controls_y, &clock, theme::CPU_BOX);
+            } else {
+                canvas.title(clock_x, controls_y, &clock, theme::CPU_BOX);
             }
         }
     }
@@ -5604,6 +5739,7 @@ fn draw_process_details(
         }
     }
     let selected_matches = !app.process_selected
+        || app.visible_pids.is_empty()
         || app.visible_pids.get(app.selected_process).copied() == Some(process.pid);
     let hide_x = area.x + area.w.saturating_sub(10);
     canvas.control_title_state(
@@ -5934,16 +6070,6 @@ fn draw_processes(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
     } else if !app.config.process_tree && app.config.process_sort == ProcessSort::CpuLazy {
         promote_busy_processes(&mut processes);
     }
-    if processes.is_empty() {
-        app.visible_pids.clear();
-        canvas.text(
-            area.x + 2,
-            controls_y + 2,
-            "No matching processes",
-            theme::LOW,
-        );
-        return;
-    }
     let parent_pids: HashSet<u32> = if app.config.process_tree {
         let pids = processes
             .iter()
@@ -6025,6 +6151,15 @@ fn draw_processes(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
             app.detailed_pid = None;
             app.detailed_process = None;
         }
+    }
+    if listed.is_empty() {
+        canvas.text(
+            area.x + 2,
+            controls_y + 2,
+            "No matching processes",
+            theme::LOW,
+        );
+        return;
     }
     let rows = area.bottom().saturating_sub(header_y + 2);
     app.selected_process = app.selected_process.min(listed.len() - 1);
@@ -6190,9 +6325,10 @@ fn draw_processes(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
             let command = cmd_w
                 .map(|width| clip_text(&sanitized_command, width))
                 .unwrap_or_default();
-            let mut combined = format!("{:>8} {name:<prog_w$} ", process.pid);
+            let mut combined = format!("{:>8} {} ", process.pid, left_text(&name, prog_w));
             if let Some(cmd_w) = cmd_w {
-                combined.push_str(&format!("{command:<cmd_w$} "));
+                combined.push_str(&left_text(&command, cmd_w));
+                combined.push(' ');
             }
             (combined, String::new(), name, command)
         };
@@ -6202,12 +6338,12 @@ fn draw_processes(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
         let cpu_graph = if show_graphs { "      " } else { "" };
         let threads = process_threads(process.threads);
         let cpu = process_cpu_percent(process.cpu);
+        let program = left_text(&program, left_w);
+        let padded_user = left_text(&user, user_w);
         let line = if thread_w > 0 {
-            format!(
-                "{program:<left_w$}{threads:>thread_w$} {user:<user_w$} {memory:>5} {cpu_graph}{cpu:>4}  "
-            )
+            format!("{program}{threads:>thread_w$} {padded_user} {memory:>5} {cpu_graph}{cpu:>4}  ")
         } else {
-            format!("{program:<left_w$}{user:<user_w$} {memory:>5} {cpu_graph}{cpu:>4}  ")
+            format!("{program}{padded_user} {memory:>5} {cpu_graph}{cpu:>4}  ")
         };
         if selected || followed {
             canvas.fill(
@@ -6279,13 +6415,13 @@ fn draw_processes(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
                 canvas.text(cursor, y, &format!("{:>8} ", process.pid), general_style);
                 cursor += 9;
                 if process_colors {
-                    canvas.text(cursor, y, &format!("{name_draw:<prog_w$}"), program_style);
+                    canvas.text(cursor, y, &left_text(&name_draw, prog_w), program_style);
                 } else {
-                    canvas.text_bold(cursor, y, &format!("{name_draw:<prog_w$}"), theme::MAIN);
+                    canvas.text_bold(cursor, y, &left_text(&name_draw, prog_w), theme::MAIN);
                 }
                 cursor += prog_w + 1;
                 if let Some(cmd_w) = cmd_w {
-                    canvas.text(cursor, y, &format!("{suffix_draw:<cmd_w$}"), general_style);
+                    canvas.text(cursor, y, &left_text(&suffix_draw, cmd_w), general_style);
                 }
             }
             cursor = columns_x;
@@ -6297,7 +6433,7 @@ fn draw_processes(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
                 }
                 cursor += thread_w + 1;
             }
-            canvas.text(cursor, y, &format!("{user:<user_w$}"), general_style);
+            canvas.text(cursor, y, &padded_user, general_style);
             cursor += user_w + 1;
             if process_colors {
                 canvas.text(cursor, y, &format!("{memory:>5}"), memory_style);
@@ -6536,6 +6672,12 @@ fn center_text(text: &str, width: usize) -> String {
         text,
         " ".repeat(padding / 2)
     )
+}
+
+fn left_text(text: &str, width: usize) -> String {
+    let text = clip_text(text, width);
+    let padding = width.saturating_sub(units::display_width(&text));
+    format!("{text}{}", " ".repeat(padding))
 }
 
 // btop calculates centered terminal coordinates in its one-based coordinate
@@ -7350,16 +7492,11 @@ fn option_description(option: &str) -> &'static [&'static str] {
             "so will show a shorter historical view.",
         ],
         "clock_format" => &[
-            "Draw a clock at top of screen.",
+            "Draw a clock on the CPU panel border.",
             "(Only visible if cpu box is enabled!)",
             "",
             "Formatting according to strftime, empty",
             "string to disable.",
-            "",
-            "Custom formatting options:",
-            "\"/host\" = hostname",
-            "\"/user\" = username",
-            "\"/uptime\" = system uptime",
             "",
             "Examples of strftime formats:",
             "\"%X\" = locale HH:MM:SS",
@@ -7579,9 +7716,6 @@ fn option_description(option: &str) -> &'static [&'static str] {
         ],
         "show_uptime" => &[
             "Shows the system uptime in the CPU box.",
-            "",
-            "Can also be shown in the clock by using",
-            "\"/uptime\" in the formatting.",
             "",
             "True or False.",
         ],
@@ -8588,10 +8722,13 @@ fn auto_collapse_oversized(
     if threshold == 0 || processes.is_empty() {
         return;
     }
-    let root_parent = processes[0].parent;
+    let pids = processes
+        .iter()
+        .map(|process| process.pid)
+        .collect::<HashSet<_>>();
     let root_pids = processes
         .iter()
-        .filter(|process| process.parent == root_parent)
+        .filter(|process| process.pid == process.parent || !pids.contains(&process.parent))
         .map(|process| process.pid)
         .collect::<HashSet<_>>();
     let mut child_counts = HashMap::new();
@@ -8599,7 +8736,7 @@ fn auto_collapse_oversized(
         *child_counts.entry(process.parent).or_insert(0usize) += 1;
     }
     for process in processes {
-        if process.parent == root_parent || root_pids.contains(&process.parent) {
+        if root_pids.contains(&process.pid) || root_pids.contains(&process.parent) {
             continue;
         }
         if child_counts.get(&process.pid).copied().unwrap_or(0) >= threshold {
@@ -9231,6 +9368,9 @@ impl Canvas {
             if x + width > self.width {
                 break;
             }
+            if width == 2 {
+                self.clear_wide_overlap(x + 1, y);
+            }
             self.put(x, y, ch, style);
             if width == 2 {
                 let continuation = &mut self.cells[y * self.width + x + 1];
@@ -9258,6 +9398,9 @@ impl Canvas {
             }
             if x + width > self.width {
                 break;
+            }
+            if width == 2 {
+                self.clear_wide_overlap(x + 1, y);
             }
             self.put_bold(x, y, ch, style);
             if width == 2 {
@@ -9287,6 +9430,9 @@ impl Canvas {
             if x + width > self.width {
                 break;
             }
+            if width == 2 {
+                self.clear_wide_overlap(x + 1, y);
+            }
             self.put_bold_italic(x, y, ch, style);
             if width == 2 {
                 let continuation = &mut self.cells[y * self.width + x + 1];
@@ -9314,6 +9460,9 @@ impl Canvas {
             }
             if x + width > self.width {
                 break;
+            }
+            if width == 2 {
+                self.clear_wide_overlap(x + 1, y);
             }
             self.put_italic(x, y, ch, style);
             if width == 2 {
@@ -9377,20 +9526,7 @@ impl Canvas {
         line_style: theme::Style,
     ) {
         self.put(x, y, '┐', line_style);
-        for (index, ch) in text.chars().enumerate() {
-            let style = if !enabled {
-                theme::LOW
-            } else if hotkeys.contains(&index) {
-                theme::HI
-            } else {
-                theme::TITLE
-            };
-            if bold {
-                self.put_bold(x + 1 + index, y, ch, style);
-            } else {
-                self.put(x + 1 + index, y, ch, style);
-            }
-        }
+        self.control_text(x + 1, y, text, hotkeys, bold, enabled);
         self.put(x + 1 + units::display_width(text), y, '┌', line_style);
     }
     fn control_footer(
@@ -9416,21 +9552,35 @@ impl Canvas {
         line_style: theme::Style,
     ) {
         self.put(x, y, '┘', line_style);
-        for (index, ch) in text.chars().enumerate() {
+        self.control_text(x + 1, y, text, hotkeys, bold, enabled);
+        self.put(x + 1 + units::display_width(text), y, '└', line_style);
+    }
+    fn control_text(
+        &mut self,
+        x: usize,
+        y: usize,
+        text: &str,
+        hotkeys: &[usize],
+        bold: bool,
+        enabled: bool,
+    ) {
+        let mut column = 0;
+        let mut buffer = [0; 4];
+        for ch in text.chars() {
             let style = if !enabled {
                 theme::LOW
-            } else if hotkeys.contains(&index) {
+            } else if hotkeys.contains(&column) {
                 theme::HI
             } else {
                 theme::TITLE
             };
             if bold {
-                self.put_bold(x + 1 + index, y, ch, style);
+                self.text_bold(x + column, y, ch.encode_utf8(&mut buffer), style);
             } else {
-                self.put(x + 1 + index, y, ch, style);
+                self.text(x + column, y, ch.encode_utf8(&mut buffer), style);
             }
+            column += units::char_width(ch);
         }
-        self.put(x + 1 + units::display_width(text), y, '└', line_style);
     }
     fn decorated_label(
         &mut self,
@@ -9502,7 +9652,7 @@ impl Canvas {
                 break;
             }
             if ch != ' ' {
-                self.put_bold(x, y, ch, style);
+                self.text_bold(x, y, &ch.to_string(), style);
             }
             x += width;
         }
@@ -9611,6 +9761,121 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reload_collection_request_waits_for_background_updates_to_resume() {
+        let mut app = app();
+        app.config.set_value("background_update", "false");
+        app.handle_key(Key::Char('o'));
+        app.replace_config(app.config.clone());
+        assert!(!app.take_collection_request());
+        app.handle_key(Key::Escape);
+        assert!(app.take_collection_request());
+        assert!(!app.take_collection_request());
+    }
+
+    #[test]
+    fn unavailable_gpu_metrics_do_not_add_fake_zero_history() {
+        let mut app = app();
+        let mut gpu = GpuSample {
+            name: "test GPU".into(),
+            utilization: 42,
+            memory_utilization: 21,
+            temperature_c: 60,
+            memory_used: 25,
+            memory_total: 100,
+            power_mw: 10,
+            power_limit_mw: 100,
+            ..GpuSample::default()
+        };
+        gpu.support.utilization = true;
+        gpu.support.memory_utilization = true;
+        gpu.support.temperature = true;
+        gpu.support.memory_total = true;
+        gpu.support.memory_used = true;
+        gpu.support.power = true;
+        app.update(Sample {
+            gpus: vec![gpu.clone()],
+            ..Sample::default()
+        });
+        app.update(Sample {
+            gpus: vec![GpuSample {
+                name: gpu.name.clone(),
+                ..GpuSample::default()
+            }],
+            ..Sample::default()
+        });
+        app.update(Sample {
+            gpus: vec![gpu],
+            ..Sample::default()
+        });
+        let history = &app.gpu_histories[0];
+        assert_eq!(history.utilization, VecDeque::from([42.0, 42.0]));
+        assert_eq!(history.memory_utilization, VecDeque::from([21.0, 21.0]));
+        assert_eq!(history.temperature, VecDeque::from([60.0, 60.0]));
+        assert_eq!(history.memory_used, VecDeque::from([25.0, 25.0]));
+        assert_eq!(history.power, VecDeque::from([10.0, 10.0]));
+    }
+
+    #[test]
+    fn replaced_gpu_does_not_inherit_previous_device_history() {
+        let mut app = app();
+        let mut first = GpuSample {
+            name: "first GPU".into(),
+            utilization: 42,
+            ..GpuSample::default()
+        };
+        first.support.utilization = true;
+        app.update(Sample {
+            gpus: vec![first.clone()],
+            ..Sample::default()
+        });
+        app.update(Sample {
+            gpus: vec![first.clone()],
+            ..Sample::default()
+        });
+        first.name = "replacement GPU".into();
+        first.utilization = 15;
+        app.update(Sample {
+            gpus: vec![first],
+            ..Sample::default()
+        });
+        assert_eq!(app.gpu_histories[0].utilization, VecDeque::from([15.0]));
+    }
+
+    #[test]
+    fn configuration_reload_refreshes_the_existing_theme_file() {
+        let root = std::env::temp_dir().join(format!("btoprs-theme-reload-{}", std::process::id()));
+        let cleanup = std::mem::DropGuard::new(root, |root| {
+            let _ = std::fs::remove_dir_all(root);
+        });
+        std::fs::create_dir_all(&*cleanup).unwrap();
+        let config = cleanup.join("test.conf");
+        let theme = cleanup.join("edited.theme");
+        std::fs::write(
+            &config,
+            "color_theme = \"edited.theme\"\nshown_boxes = \"proc\"\n",
+        )
+        .unwrap();
+        let cli = crate::Cli {
+            themes_dir: Some((*cleanup).clone()),
+            ..crate::Cli::default()
+        };
+        let mut app = AppState::new(Config::load(Some(&config)).unwrap());
+        app.config.apply_cli(&cli);
+        let size = Size {
+            cols: 100,
+            rows: 20,
+        };
+        let mut renderer = Renderer::new();
+        std::fs::write(&theme, "theme[title]=\"#123456\"\n").unwrap();
+        assert!(renderer.render(size, &mut app).contains("38;2;18;52;86;"));
+        std::fs::write(&theme, "theme[title]=\"#654321\"\n").unwrap();
+        crate::reload_config(&mut app, &cli, None).unwrap();
+        let updated = renderer.render(size, &mut app);
+        assert!(updated.contains("38;2;101;67;33;"));
+        assert!(!updated.contains("38;2;18;52;86;"));
+    }
+
+    #[test]
     fn ctrl_c_quits_every_overlay_and_text_editor() {
         for overlay in [
             Overlay::None,
@@ -9677,6 +9942,40 @@ mod tests {
         }
         assert_eq!(parse_nice_value("-20"), Some(-20));
         assert_eq!(parse_nice_value("19"), Some(19));
+    }
+
+    #[test]
+    fn renice_dialog_starts_at_the_selected_process_priority() {
+        for nice in [-20, -5, 0, 10, 19] {
+            for detailed in [false, true] {
+                let mut app = app();
+                app.sample.processes = vec![ProcessSample {
+                    pid: 42,
+                    state: 'S',
+                    nice,
+                    ..ProcessSample::default()
+                }];
+                app.visible_pids = vec![42];
+                app.process_selected = !detailed;
+                app.detailed_pid = detailed.then_some(42);
+                app.handle_key(Key::Char('N'));
+                assert_eq!(
+                    app.overlay,
+                    Overlay::Renice {
+                        pid: 42,
+                        value: nice
+                    }
+                );
+                app.handle_key(Key::Up);
+                assert_eq!(
+                    app.overlay,
+                    Overlay::Renice {
+                        pid: 42,
+                        value: if nice == 19 { -20 } else { nice + 1 }
+                    }
+                );
+            }
+        }
     }
 
     #[cfg(windows)]
@@ -9805,6 +10104,68 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn multiple_gpu_layouts_leave_room_for_requested_process_panel() {
+        for gpu_count in 1..=6 {
+            for inline in ["Auto", "On", "Off"] {
+                for cpu_bottom in [false, true] {
+                    let mut app = app();
+                    let boxes = (0..gpu_count)
+                        .map(|index| format!("gpu{index}"))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    app.config
+                        .set_value("shown_boxes", format!("cpu mem net proc {boxes}"));
+                    app.config.set_value("show_gpu_info", inline);
+                    app.config.set_value("cpu_bottom", cpu_bottom.to_string());
+                    let mut gpu = GpuSample::default();
+                    gpu.support.utilization = true;
+                    gpu.support.power = true;
+                    gpu.support.memory_total = true;
+                    gpu.support.memory_used = true;
+                    app.update(Sample {
+                        gpus: vec![gpu; gpu_count],
+                        ..Sample::default()
+                    });
+                    let minimum = minimum_size(&app.config, &app.sample.gpus);
+                    for extra_rows in [0, 1, 5, 20, 80] {
+                        let size = Size {
+                            cols: 120,
+                            rows: minimum.rows + extra_rows,
+                        };
+                        Renderer::new().render(size, &mut app);
+                        assert!(
+                            app.process_area.is_some_and(|area| area.h >= 16),
+                            "{gpu_count} GPUs, {inline}, bottom={cpu_bottom}, rows={}",
+                            size.rows
+                        );
+                        assert!(app.memory_area.is_some_and(|area| area.h >= 10));
+                        assert!(app.network_area.is_some_and(|area| area.h >= 6));
+                        let cpu = app.cpu_area.unwrap();
+                        let process = app.process_area.unwrap();
+                        assert!(cpu.bottom() <= usize::from(size.rows));
+                        assert!(process.bottom() <= usize::from(size.rows));
+                        assert!(cpu.bottom() <= process.y || process.bottom() <= cpu.y);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cpu_only_layout_fits_inline_gpus_at_its_minimum_size() {
+        let mut app = app();
+        app.config.set_value("shown_boxes", "cpu");
+        let mut gpu = GpuSample::default();
+        gpu.support.utilization = true;
+        app.update(Sample {
+            gpus: vec![gpu; 6],
+            ..Sample::default()
+        });
+        let size = minimum_size(&app.config, &app.sample.gpus);
+        Renderer::new().render(size, &mut app);
     }
 
     #[test]
@@ -10106,6 +10467,79 @@ mod tests {
     }
 
     #[test]
+    fn overlapping_wide_text_keeps_every_terminal_column() {
+        for draw in [
+            Canvas::text,
+            Canvas::text_bold,
+            Canvas::text_italic,
+            Canvas::text_bold_italic,
+            Canvas::text_preserve_spaces,
+            Canvas::text_preserve_spaces_bold,
+        ] {
+            let mut canvas = Canvas::new(6, 1);
+            canvas.text(0, 0, "ab界cd", theme::MAIN);
+            draw(&mut canvas, 1, 0, "好", theme::TITLE);
+            let row: String = canvas
+                .cells
+                .iter()
+                .filter(|cell| !cell.continuation)
+                .map(|cell| cell.ch)
+                .collect();
+            assert_eq!(row, "a好 cd");
+            assert_eq!(units::display_width(&row), 6);
+        }
+    }
+
+    #[test]
+    fn network_selector_supports_wide_and_combining_interface_names() {
+        for interface in ["網0", "e\u{301}", "網e\u{301}"] {
+            let mut app = app();
+            app.sample.network.selected = interface.into();
+            let mut canvas = Canvas::new(80, 12);
+            draw_network(&mut canvas, Rect::new(0, 0, 80, 12), &mut app);
+            let next = app
+                .network_hitboxes
+                .iter()
+                .find(|hit| hit.action == NetworkAction::Next)
+                .unwrap();
+            assert_eq!(canvas.cells[next.end - 2].ch, 'n');
+            assert_eq!(canvas.cells[next.end - 1].ch, '→');
+            let row: String = canvas.cells[..80]
+                .iter()
+                .filter(|cell| !cell.continuation)
+                .map(|cell| format!("{}{}", cell.ch, cell.combining))
+                .collect();
+            assert!(row.contains(&format!("←b {interface} n→")), "{row}");
+            assert_eq!(units::display_width(&row), 80);
+        }
+    }
+
+    #[test]
+    fn option_edits_reject_invalid_structured_values() {
+        for (option, invalid, valid) in [
+            ("cpu_core_map", "0:x", "0:1 1:0"),
+            ("io_graph_speeds", "/:fast", "/:100"),
+            ("presets", "cpu:2:bogus", "cpu:0:block,proc:1:tty"),
+        ] {
+            let mut app = app();
+            let original = app.config.value(option).unwrap().to_string();
+            app.editing_option = Some(option);
+            app.options_buffer = invalid.into();
+            app.commit_option_edit();
+            assert_eq!(
+                app.config.value(option),
+                Some(original.as_str()),
+                "{option}"
+            );
+            assert_eq!(app.editing_option, Some(option));
+            app.options_buffer = valid.into();
+            app.commit_option_edit();
+            assert_eq!(app.config.value(option), Some(valid));
+            assert_eq!(app.editing_option, None);
+        }
+    }
+
+    #[test]
     fn terminal_controls_from_rendered_text_are_discarded() {
         let mut canvas = Canvas::new(80, 2);
         canvas.text_bold(0, 0, "safe\x1b]52;c;SGVsbG8=\x07\u{009b}tail", theme::MAIN);
@@ -10226,6 +10660,11 @@ mod tests {
 
         app.config.vim_keys = true;
         app.visible_pids.push(123);
+        app.sample.processes.push(ProcessSample {
+            pid: 123,
+            state: 'S',
+            ..ProcessSample::default()
+        });
         app.handle_key(Key::Char('j'));
         assert!(app.process_selected);
         app.handle_key(Key::Char('K'));
@@ -10236,6 +10675,52 @@ mod tests {
                 signal: 9
             }
         );
+    }
+
+    #[test]
+    fn unicode_process_text_keeps_numeric_columns_aligned() {
+        for tree in [false, true] {
+            for (selected, followed) in [(false, false), (true, false), (false, true)] {
+                let mut tails = Vec::new();
+                for (name, command, user) in [
+                    ("prog", "exec", "user"),
+                    ("程序", "命令", "用户"),
+                    ("e\u{301}", "e\u{301}", "e\u{301}"),
+                ] {
+                    let mut app = app();
+                    app.config.process_tree = tree;
+                    app.process_selected = selected;
+                    app.followed_pid = followed.then_some(42);
+                    app.sample.processes = vec![ProcessSample {
+                        pid: 42,
+                        name: name.into(),
+                        command: command.into(),
+                        user: user.into(),
+                        threads: 12,
+                        memory: 1024 * 1024,
+                        cpu: 37.5,
+                        ..ProcessSample::default()
+                    }];
+                    let mut canvas = Canvas::new(120, 20);
+                    draw_processes(&mut canvas, Rect::new(0, 0, 120, 20), &mut app);
+                    // Thread and resource columns use the same fixed positions;
+                    // the user field is deliberately excluded from comparison.
+                    let row = &canvas.cells[2 * 120..3 * 120];
+                    tails.push((
+                        row[90..94].iter().map(|cell| cell.ch).collect::<String>(),
+                        row[101..119].iter().map(|cell| cell.ch).collect::<String>(),
+                    ));
+                }
+                assert_eq!(
+                    tails[0], tails[1],
+                    "tree={tree}, selected={selected}, followed={followed}"
+                );
+                assert_eq!(
+                    tails[0], tails[2],
+                    "combining: tree={tree}, selected={selected}, followed={followed}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -11735,6 +12220,77 @@ mod tests {
         assert_eq!(detail.state, 'X');
         assert_eq!(detail.elapsed_seconds, 17);
         assert_eq!(detail.cpu, 8.5);
+
+        let mut canvas = Canvas::new(100, 20);
+        draw_processes(&mut canvas, Rect::new(0, 0, 100, 20), &mut app);
+        assert!(canvas_row(&canvas, 0).contains("short-lived"));
+        assert!(canvas_row(&canvas, 10).contains("No matching processes"));
+        app.process_selected = true;
+        draw_processes(&mut canvas, Rect::new(0, 0, 100, 20), &mut app);
+        assert!(
+            app.process_control_hitboxes
+                .iter()
+                .any(|hitbox| { hitbox.y == 0 && hitbox.action == ProcessControlAction::Info })
+        );
+    }
+
+    #[test]
+    fn dead_process_shortcuts_cannot_open_process_operations() {
+        for key in ['t', 'k', 's', 'N', 'F'] {
+            let mut app = app();
+            app.detailed_pid = Some(42);
+            app.detailed_process = Some(ProcessSample {
+                pid: 42,
+                state: 'X',
+                ..ProcessSample::default()
+            });
+            app.handle_key(Key::Char(key));
+            assert_eq!(app.overlay, Overlay::None, "{key}");
+            assert_eq!(app.followed_pid, None, "{key}");
+        }
+    }
+
+    #[test]
+    fn pending_process_operations_expire_when_the_target_exits() {
+        for (overlay, operation) in [
+            (
+                Overlay::Signal {
+                    pid: 42,
+                    signal: 15,
+                },
+                Operation::Signal,
+            ),
+            (
+                Overlay::SignalChoose {
+                    pid: 42,
+                    selected: 9,
+                },
+                Operation::Signal,
+            ),
+            (Overlay::Renice { pid: 42, value: 0 }, Operation::Renice),
+        ] {
+            for paused in [false, true] {
+                let mut app = app();
+                app.update(Sample {
+                    processes: vec![ProcessSample {
+                        pid: 42,
+                        state: 'S',
+                        ..ProcessSample::default()
+                    }],
+                    ..Sample::default()
+                });
+                app.config.pause_processes = paused;
+                app.overlay = overlay;
+                app.update(Sample::default());
+                assert_eq!(
+                    app.overlay,
+                    Overlay::OperationError {
+                        operation,
+                        errno: if cfg!(windows) { 1168 } else { 3 },
+                    }
+                );
+            }
+        }
     }
 
     #[test]
@@ -12761,6 +13317,212 @@ mod tests {
     }
 
     #[test]
+    fn tree_auto_collapse_is_independent_of_enumeration_order() {
+        let mut processes = [
+            (1, 0),
+            (2, 1),
+            (3, 2),
+            (4, 3),
+            (5, 3),
+            (6, 2),
+            (10, 999),
+            (11, 10),
+            (12, 11),
+            (13, 12),
+            (14, 12),
+            (15, 11),
+            (50, 50),
+            (51, 50),
+            (52, 51),
+            (53, 51),
+        ]
+        .into_iter()
+        .map(|(pid, parent)| ProcessSample {
+            pid,
+            parent,
+            ..ProcessSample::default()
+        })
+        .collect::<Vec<_>>();
+        for _ in 0..2 {
+            for _ in 0..processes.len() {
+                let mut collapsed = HashSet::new();
+                auto_collapse_oversized(&processes, 2, &mut collapsed);
+                assert_eq!(collapsed, HashSet::from([3, 12]));
+                processes.rotate_left(1);
+            }
+            processes.reverse();
+        }
+    }
+
+    #[test]
+    fn long_cpu_clocks_preserve_controls_at_narrow_and_wide_sizes() {
+        for width in [60, 80, 200] {
+            for bottom in [false, true] {
+                for engine in [None, Some("docker")] {
+                    let mut app = app();
+                    app.config.set_value("cpu_bottom", bottom.to_string());
+                    app.sample.cpu.container_engine = engine.map(str::to_string);
+                    app.config.clock_format.clear();
+                    let area = Rect::new(0, 0, width, 20);
+                    let mut baseline = Canvas::new(width, 20);
+                    draw_cpu(&mut baseline, area, &mut app);
+                    let controls = app.cpu_control_hitboxes.clone();
+                    for format in [
+                        "W".repeat(63),
+                        "W".repeat(200),
+                        "界".repeat(64),
+                        "%n".repeat(80),
+                    ] {
+                        let mut canvas = Canvas::new(width, 20);
+                        app.config.clock_format = format.clone();
+                        draw_cpu(&mut canvas, area, &mut app);
+                        for control in &controls {
+                            for x in control.start..control.end {
+                                assert_eq!(
+                                    canvas.cells[control.y * width + x].ch,
+                                    baseline.cells[control.y * width + x].ch,
+                                    "width={width}, bottom={bottom}, x={x}"
+                                );
+                            }
+                        }
+                        let y = if bottom { area.h - 1 } else { 0 };
+                        let row = canvas_row(&canvas, y);
+                        if let Some(engine) = engine {
+                            assert!(row.contains(engine));
+                        }
+                        if format.starts_with('W') {
+                            assert!(row.contains('W'), "long clock disappeared at width={width}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reused_pids_do_not_inherit_process_ui_state() {
+        for gap in [false, true] {
+            let mut app = app();
+            app.config.set_value("shown_boxes", "proc");
+            let mut sample = Sample {
+                processes: vec![ProcessSample {
+                    pid: 42,
+                    start_time: Some(10),
+                    name: "old worker".into(),
+                    state: 'S',
+                    cpu: 12.0,
+                    memory: 100,
+                    ..ProcessSample::default()
+                }],
+                ..Sample::default()
+            };
+            app.update(sample.clone());
+            let mut renderer = Renderer::new();
+            let size = Size {
+                cols: 120,
+                rows: 40,
+            };
+            renderer.render(size, &mut app);
+            app.process_selected = true;
+            app.toggle_process_details();
+            app.update(sample.clone());
+            app.collapsed_processes.insert(42);
+            assert_eq!(app.detailed_pid, Some(42));
+            assert_eq!(app.followed_pid, Some(42));
+            assert!(!app.detailed_cpu_history.is_empty());
+            if gap {
+                app.update(Sample::default());
+                renderer.render(size, &mut app);
+            }
+            sample.processes[0].start_time = Some(20);
+            sample.processes[0].name = "replacement".into();
+            sample.processes[0].cpu = 6.0;
+            app.update(sample);
+            assert_eq!(app.detailed_pid, None, "gap={gap}");
+            assert!(app.detailed_process.is_none());
+            assert!(app.detailed_cpu_history.is_empty());
+            assert!(app.detailed_memory_history.is_empty());
+            assert!(!app.process_selected);
+            assert_eq!(app.followed_pid, None);
+            assert!(!app.collapsed_processes.contains(&42));
+            assert_eq!(app.process_cpu_histories[&42], VecDeque::from([6.0]));
+            renderer.render(size, &mut app);
+            assert_eq!(app.detailed_pid, None);
+            app.open_signal(15);
+            assert_eq!(app.overlay, Overlay::None);
+        }
+    }
+
+    #[test]
+    fn reused_pids_cancel_pending_operations_even_when_paused() {
+        for paused in [false, true] {
+            for operation in [
+                ProcessControlAction::Terminate,
+                ProcessControlAction::Signals,
+                ProcessControlAction::Nice,
+            ] {
+                let mut app = app();
+                let mut sample = Sample {
+                    processes: vec![ProcessSample {
+                        pid: 42,
+                        start_time: Some(10),
+                        state: 'S',
+                        name: "original".into(),
+                        cpu: 12.0,
+                        memory: 100,
+                        ..ProcessSample::default()
+                    }],
+                    ..Sample::default()
+                };
+                app.update(sample.clone());
+                app.visible_pids = vec![42];
+                app.process_selected = true;
+                app.activate_process_control(operation);
+                assert_ne!(app.overlay, Overlay::None);
+                app.config.pause_processes = paused;
+                let original_overlay = app.overlay;
+                app.update(sample.clone());
+                assert_eq!(app.overlay, original_overlay);
+                assert!(app.process_selected);
+                sample.processes[0].start_time = Some(20);
+                sample.processes[0].name = "replacement".into();
+                app.update(sample);
+                assert!(
+                    matches!(app.overlay, Overlay::OperationError { .. }),
+                    "{operation:?}, paused={paused}"
+                );
+                assert!(!app.process_selected);
+                if paused {
+                    assert_eq!(app.sample.processes[0].state, 'X');
+                    assert_eq!(app.sample.processes[0].name, "original");
+                    assert_eq!(app.sample.processes[0].cpu, 0.0);
+                    assert_eq!(app.sample.processes[0].memory, 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exited_processes_do_not_leave_collapsed_tree_state() {
+        let mut app = app();
+        app.config.process_tree = true;
+        let sample = Sample {
+            processes: vec![ProcessSample {
+                pid: 42,
+                ..ProcessSample::default()
+            }],
+            ..Sample::default()
+        };
+        app.update(sample.clone());
+        app.collapsed_processes.insert(42);
+        app.update(sample.clone());
+        assert!(app.collapsed_processes.contains(&42));
+        app.update(Sample::default());
+        app.update(sample);
+        assert!(!app.collapsed_processes.contains(&42));
+    }
+
+    #[test]
     fn repeated_tree_collapse_controls_match_source_transitions_while_paused() {
         let process = |pid, parent| ProcessSample {
             pid,
@@ -13100,6 +13862,62 @@ mod tests {
                 "{action:?} control is visible"
             );
         }
+    }
+
+    #[test]
+    fn zero_network_totals_can_be_toggled_before_any_traffic() {
+        let mut app = app();
+        let mut sample = Sample::default();
+        sample.network.selected = "test0".into();
+        sample.network.interfaces = vec!["test0".into()];
+        app.update(sample.clone());
+        app.toggle_network_zero();
+        assert!(app.network_zero_active());
+        sample.network.downloaded = 100;
+        sample.network.uploaded = 50;
+        app.update(sample);
+        app.toggle_network_zero();
+        assert!(!app.network_zero_active());
+        assert_eq!(app.sample.network.downloaded, 100);
+        assert_eq!(app.sample.network.uploaded, 50);
+    }
+
+    #[test]
+    fn removed_network_interfaces_do_not_reuse_old_totals_or_history() {
+        let mut app = app();
+        let mut sample = Sample::default();
+        sample.network.connected = true;
+        sample.network.selected = "usb0".into();
+        sample.network.interfaces = vec!["usb0".into(), "eth0".into()];
+        sample.network.downloaded = 1_000;
+        sample.network.uploaded = 500;
+        sample.network.download_per_second = 100;
+        app.update(sample.clone());
+        app.toggle_network_zero();
+
+        let mut other = Sample::default();
+        other.network.selected = "eth0".into();
+        other
+            .network
+            .interfaces
+            .clone_from(&sample.network.interfaces);
+        app.update(other.clone());
+        app.update(sample.clone());
+        assert!(app.network_zero_active());
+        assert_eq!(app.sample.network.downloaded, 0);
+        assert_eq!(app.download_top, 100);
+
+        other.network.interfaces = vec!["eth0".into()];
+        app.update(other);
+        sample.network.downloaded = 20;
+        sample.network.uploaded = 10;
+        sample.network.download_per_second = 5;
+        app.update(sample);
+        assert_eq!(app.sample.network.downloaded, 20);
+        assert_eq!(app.sample.network.uploaded, 10);
+        assert!(!app.network_zero_active());
+        assert_eq!(app.download_history, VecDeque::from([5.0]));
+        assert_eq!(app.download_top, 5);
     }
 
     #[test]
