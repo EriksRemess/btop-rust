@@ -15,6 +15,9 @@ pub(crate) mod macos;
 #[cfg(target_os = "linux")]
 mod vulkan;
 
+#[cfg(target_os = "linux")]
+mod process_usage;
+
 #[cfg(test)]
 #[path = "gpu/nvml_tests.rs"]
 mod nvml_tests;
@@ -33,6 +36,7 @@ mod amd_sysfs_tests;
 
 #[derive(Debug, Clone, Default)]
 pub struct GpuSupport {
+    pub processes: bool,
     pub utilization: bool,
     pub memory_utilization: bool,
     pub gpu_clock: bool,
@@ -56,6 +60,7 @@ pub struct GpuSupport {
 
 #[derive(Debug, Clone)]
 pub struct GpuSample {
+    pub process_usage: Option<crate::process_gpu::Snapshot>,
     pub name: String,
     pub driver_label: Option<String>,
     pub utilization: u32,
@@ -87,6 +92,7 @@ pub struct GpuSample {
 impl Default for GpuSample {
     fn default() -> Self {
         Self {
+            process_usage: None,
             name: String::new(),
             driver_label: None,
             utilization: 0,
@@ -163,7 +169,8 @@ impl GpuCollector {
         }
     }
 
-    pub fn collect(&mut self, config: &Config) -> Vec<GpuSample> {
+    pub fn collect(&mut self, config: &Config, collect_processes: bool) -> Vec<GpuSample> {
+        let _ = collect_processes;
         let shown = config
             .value("shown_gpus")
             .unwrap_or("nvidia amd intel apple");
@@ -184,8 +191,22 @@ impl GpuCollector {
             .bool_value("rsmi_measure_pcie_speeds")
             .unwrap_or(true);
         let mut samples = Vec::new();
-        if let Some(nvml) = &self.nvml {
+        if let Some(nvml) = &mut self.nvml {
             samples.extend(nvml.collect(check_temperature, nvml_pcie));
+            #[cfg(target_os = "linux")]
+            {
+                let now = Instant::now();
+                for ((sample, device), state) in samples
+                    .iter_mut()
+                    .zip(&nvml.devices)
+                    .zip(&mut nvml.process_states)
+                {
+                    let (supported, usage) =
+                        state.collect(&nvml.process_functions, *device, collect_processes, now);
+                    sample.support.processes = supported;
+                    sample.process_usage = usage;
+                }
+            }
         }
         if let Some(rsmi) = &self.rsmi {
             samples.extend(rsmi.collect(check_temperature, rsmi_pcie));
@@ -266,7 +287,7 @@ impl DynamicLibrary {
         None
     }
 
-    fn symbol<T: Copy>(&self, name: &'static [u8]) -> Option<T> {
+    fn symbol<T: Copy>(&self, name: &[u8]) -> Option<T> {
         let name = CStr::from_bytes_with_nul(name).ok()?;
         if mem::size_of::<T>() != mem::size_of::<*mut c_void>() {
             return None;
@@ -338,6 +359,10 @@ struct NvmlFunctions {
 }
 
 struct Nvml {
+    #[cfg(target_os = "linux")]
+    process_functions: process_usage::Functions,
+    #[cfg(target_os = "linux")]
+    process_states: Vec<process_usage::DeviceState>,
     _library: DynamicLibrary,
     functions: NvmlFunctions,
     devices: Vec<NvmlDevice>,
@@ -413,6 +438,10 @@ impl Nvml {
             return None;
         }
         Some(Self {
+            #[cfg(target_os = "linux")]
+            process_functions: process_usage::Functions::load(&library),
+            #[cfg(target_os = "linux")]
+            process_states: (0..devices.len()).map(|_| Default::default()).collect(),
             _library: library,
             functions,
             devices,

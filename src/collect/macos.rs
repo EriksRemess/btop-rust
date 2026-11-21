@@ -798,7 +798,7 @@ pub(super) fn collect_processes(
     total_delta: u64,
     cores: usize,
     config: &Config,
-    detailed_pid: Option<u32>,
+    detailed_pids: [Option<u32>; 2],
 ) -> Result<Vec<ProcessSample>, String> {
     let count = unsafe { proc_listallpids(ptr::null_mut(), 0) };
     if count <= 0 {
@@ -926,7 +926,7 @@ pub(super) fn collect_processes(
             .unwrap_or_else(|| pid.to_string());
         let command = process_arguments(pid, &mut argument_buffer)
             .unwrap_or_else(|| process_path(pid).unwrap_or_else(|| name.clone()));
-        let (read_bytes, write_bytes) = if detailed_pid == Some(pid as u32) {
+        let (read_bytes, write_bytes) = if detailed_pids.contains(&Some(pid as u32)) {
             process_io(pid)
         } else {
             (0, 0)
@@ -950,6 +950,7 @@ pub(super) fn collect_processes(
                 0
             },
             memory: if got_task { task.resident_size } else { 0 },
+            gpu: Default::default(),
             cpu: (cpu * 10.0).round() / 10.0,
             cumulative_cpu,
             nice: bsd.nice,
@@ -1856,7 +1857,7 @@ mod tests {
     fn live_collector_returns_core_system_data() {
         let config = Config::default();
         let mut collector = Collector::new(&config).unwrap();
-        let first = collector.collect(&config, None).unwrap();
+        let first = collector.collect(&config, [None; 2]).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
         let pid = std::process::id();
         let mut usage = RusageInfoV2::default();
@@ -1865,7 +1866,7 @@ mod tests {
             0
         );
         assert!(usage.resident_size > 0);
-        let sample = collector.collect(&config, Some(pid)).unwrap();
+        let sample = collector.collect(&config, [Some(pid), None]).unwrap();
         let process = sample
             .processes
             .iter()

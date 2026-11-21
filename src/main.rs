@@ -9,6 +9,7 @@ mod gpu;
 #[path = "gpu/windows.rs"]
 mod gpu;
 mod logger;
+mod process_gpu;
 mod render;
 #[cfg(unix)]
 mod terminal;
@@ -347,7 +348,7 @@ fn run() -> Result<u8, String> {
         let size = terminal.size()?;
         let collection_requested = app.take_collection_request();
         if app.should_collect() && (collection_requested || collection_clock.collection_due(now)) {
-            let sample = collector.collect(&app.config, app.detailed_pid())?;
+            let sample = collector.collect(&app.config, app.detailed_pids())?;
             app.update(sample);
             collection_clock.collection_finished(Instant::now());
         }

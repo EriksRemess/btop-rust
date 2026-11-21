@@ -13,6 +13,8 @@ pub enum ProcessSort {
     CpuLazy,
     CpuDirect,
     Memory,
+    GpuMemory,
+    GpuUsage,
     Pid,
     Name,
     Command,
@@ -28,6 +30,17 @@ pub enum GraphSymbol {
 }
 
 impl ProcessSort {
+    pub const GPU_ALL: [Self; 9] = [
+        Self::Pid,
+        Self::Name,
+        Self::Command,
+        Self::Threads,
+        Self::User,
+        Self::Memory,
+        Self::GpuMemory,
+        Self::GpuUsage,
+        Self::CpuDirect,
+    ];
     pub const ALL: [Self; 8] = [
         Self::Pid,
         Self::Name,
@@ -44,6 +57,8 @@ impl ProcessSort {
             Self::CpuLazy => "cpu lazy",
             Self::CpuDirect => "cpu direct",
             Self::Memory => "memory",
+            Self::GpuMemory => "gpu memory",
+            Self::GpuUsage => "gpu usage",
             Self::Pid => "pid",
             Self::Name => "name",
             Self::Command => "command",
@@ -202,6 +217,8 @@ impl Config {
         }
         config.process_sort = match string(&values, "proc_sorting").as_deref() {
             Some("memory") => ProcessSort::Memory,
+            Some("gpu memory") => ProcessSort::GpuMemory,
+            Some("gpu usage") => ProcessSort::GpuUsage,
             Some("pid") => ProcessSort::Pid,
             Some("name") | Some("program") => ProcessSort::Name,
             Some("command") | Some("arguments") => ProcessSort::Command,
@@ -210,6 +227,20 @@ impl Config {
             Some("cpu direct") => ProcessSort::CpuDirect,
             _ => ProcessSort::CpuLazy,
         };
+        if matches!(
+            config.process_sort,
+            ProcessSort::GpuMemory | ProcessSort::GpuUsage
+        ) {
+            config.set_value("gpu_proc_sorting", config.process_sort.label());
+            config.set_value(
+                "proc_sorting",
+                if config.process_sort == ProcessSort::GpuMemory {
+                    "memory"
+                } else {
+                    "cpu direct"
+                },
+            );
+        }
         config.process_reversed =
             boolean(&values, "proc_reversed").unwrap_or(config.process_reversed);
         config.process_filter = string(&values, "proc_filter").unwrap_or_default();
@@ -293,7 +324,9 @@ impl Config {
                 "proc" => self.set_value("proc_left", (position != "0").to_string()),
                 _ => {}
             }
-            let graph_option = if name.starts_with("gpu") {
+            let graph_option = if name == "gpu_proc" {
+                "graph_symbol_proc".to_string()
+            } else if name.starts_with("gpu") {
                 "graph_symbol_gpu".to_string()
             } else {
                 format!("graph_symbol_{name}")
@@ -355,6 +388,13 @@ impl Config {
         self.values.get(key).map(String::as_str)
     }
 
+    pub fn gpu_processes_shown(&self) -> bool {
+        self.value("shown_boxes")
+            .unwrap_or("")
+            .split_whitespace()
+            .any(|name| name == "gpu_proc")
+    }
+
     pub fn bool_value(&self, key: &str) -> Option<bool> {
         BOOLS
             .contains(&key)
@@ -374,6 +414,8 @@ impl Config {
             "proc_sorting" => {
                 self.process_sort = match value.as_str() {
                     "memory" => ProcessSort::Memory,
+                    "gpu memory" => ProcessSort::Memory,
+                    "gpu usage" => ProcessSort::CpuDirect,
                     "pid" => ProcessSort::Pid,
                     "name" | "program" => ProcessSort::Name,
                     "command" | "arguments" => ProcessSort::Command,
@@ -692,6 +734,8 @@ const BOOLS: &[&str] = &[
     "proc_gradient",
     "proc_per_core",
     "proc_mem_bytes",
+    "gpu_proc_reversed",
+    "gpu_proc_tree",
     "proc_cpu_graphs",
     "proc_info_smaps",
     "proc_left",
@@ -769,6 +813,9 @@ pub(crate) fn valid_config_value(name: &str, value: &str) -> Result<(), String> 
         "base_10_bitrate" => valid_choice(&["Auto", "True", "False"]),
         "freq_mode" => valid_choice(&["first", "range", "lowest", "highest", "average"]),
         "temp_scale" => valid_choice(&["celsius", "fahrenheit", "kelvin", "rankine"]),
+        "gpu_proc_sorting" => ProcessSort::GPU_ALL
+            .iter()
+            .any(|sort| sort.label() == value),
         "proc_sorting" => valid_choice(&[
             "pid",
             "name",
@@ -778,11 +825,13 @@ pub(crate) fn valid_config_value(name: &str, value: &str) -> Result<(), String> 
             "threads",
             "user",
             "memory",
+            "gpu memory",
+            "gpu usage",
             "cpu direct",
             "cpu lazy",
         ]),
         "shown_boxes" => value.split_whitespace().all(|item| {
-            matches!(item, "cpu" | "mem" | "net" | "proc")
+            matches!(item, "cpu" | "mem" | "net" | "proc" | "gpu_proc")
                 || item
                     .strip_prefix("gpu")
                     .and_then(|index| index.parse::<u8>().ok())
@@ -815,11 +864,11 @@ fn set_bool(value: &str, target: &mut bool) {
 fn valid_preset(preset: &str) -> bool {
     let boxes: Vec<_> = preset.split(',').collect();
     !boxes.is_empty()
-        && boxes.len() <= 10
+        && boxes.len() <= 11
         && boxes.iter().all(|entry| {
             let values: Vec<_> = entry.split(':').collect();
             values.len() == 3
-                && (matches!(values[0], "cpu" | "mem" | "net" | "proc")
+                && (matches!(values[0], "cpu" | "mem" | "net" | "proc" | "gpu_proc")
                     || values[0]
                         .strip_prefix("gpu")
                         .and_then(|index| index.parse::<u8>().ok())
@@ -832,6 +881,30 @@ fn valid_preset(preset: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gpu_panel_settings_and_presets_round_trip_independently() {
+        let path =
+            std::env::temp_dir().join(format!("btoprs-gpu-panel-{}.conf", std::process::id()));
+        let cleanup = std::mem::DropGuard::new(path, |path| {
+            let _ = fs::remove_file(path);
+        });
+        fs::write(&*cleanup, "shown_boxes = \"proc gpu_proc\"\nproc_sorting = \"memory\"\ngpu_proc_sorting = \"gpu usage\"\ngpu_proc_filter = \"test\"\ngpu_proc_reversed = true\n").unwrap();
+        let mut config = Config::load(Some(&cleanup)).unwrap();
+        assert!(config.gpu_processes_shown());
+        assert_eq!(config.process_sort, ProcessSort::Memory);
+        assert_eq!(config.value("gpu_proc_sorting"), Some("gpu usage"));
+        assert_eq!(config.bool_value("gpu_proc_reversed"), Some(true));
+        config.save().unwrap();
+        config.reload().unwrap();
+        assert!(config.warnings.is_empty());
+        assert_eq!(config.value("gpu_proc_filter"), Some("test"));
+        assert!(valid_preset("proc:0:default,gpu_proc:0:braille"));
+        config.toggle_box("gpu_proc");
+        assert!(!config.gpu_processes_shown());
+        assert!(config.shown[3]);
+        assert_eq!(config.process_sort, ProcessSort::Memory);
+    }
 
     #[cfg(unix)]
     #[test]
@@ -1061,7 +1134,7 @@ mod tests {
     #[test]
     fn default_contract_contains_all_reference_keys() {
         let values = parse_file(Config::default_file());
-        assert_eq!(values.len(), 89);
+        assert_eq!(values.len(), 93);
         assert_eq!(
             values.get("color_theme").map(String::as_str),
             Some("Default")
@@ -1085,7 +1158,7 @@ mod tests {
         let saved = fs::read_to_string(&path).unwrap();
         assert!(saved.contains("update_ms = 3100"));
         assert!(!saved.contains("future_option"));
-        assert_eq!(parse_file(&saved).len(), 89);
+        assert_eq!(parse_file(&saved).len(), 93);
         let _ = fs::remove_file(path);
     }
 

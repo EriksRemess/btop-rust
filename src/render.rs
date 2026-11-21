@@ -8,6 +8,13 @@ use crate::gpu::GpuSample;
 use crate::terminal::{Key, Size};
 use crate::{theme, units};
 
+#[cfg(test)]
+mod gpu_process_tests;
+
+mod gpu_process_panel;
+mod gpu_process_view;
+use gpu_process_panel::{GpuProcessPanel, draw_gpu_process_panel};
+
 const MIN_HISTORY: usize = 240;
 
 const OPTIONS_GENERAL: &[&str] = &[
@@ -105,6 +112,10 @@ const OPTIONS_PROC: &[&str] = &[
     "proc_gradient",
     "proc_per_core",
     "proc_mem_bytes",
+    "gpu_proc_sorting",
+    "gpu_proc_filter",
+    "gpu_proc_reversed",
+    "gpu_proc_tree",
     "keep_dead_proc_usage",
     "proc_cpu_graphs",
     "proc_filter_kernel",
@@ -156,6 +167,8 @@ pub struct AppState {
     disk_scrollbar: Option<DiskScrollbar>,
     dragging_disk_scrollbar: bool,
     gpu_histories: Vec<GpuHistory>,
+    gpu_process_panel: GpuProcessPanel,
+    gpu_process_focus: bool,
     pub selected_process: usize,
     pub process_selected: bool,
     pub process_offset: usize,
@@ -210,6 +223,7 @@ struct ProcessHitbox {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProcessControlAction {
+    GpuProcesses,
     Filter,
     DeleteFilter,
     Pause,
@@ -395,6 +409,8 @@ impl AppState {
             disk_scrollbar: None,
             dragging_disk_scrollbar: false,
             gpu_histories: Vec::new(),
+            gpu_process_panel: GpuProcessPanel::default(),
+            gpu_process_focus: false,
             selected_process: 0,
             process_selected: false,
             process_offset: 0,
@@ -440,6 +456,8 @@ impl AppState {
     }
 
     pub fn update(&mut self, mut sample: Sample) {
+        let gpu_available_before = self.gpu_processes_available();
+        let selected_option = self.current_option();
         let history_limit = self.history_limit;
         let push = |history: &mut VecDeque<f64>, value| push_history(history, value, history_limit);
         if self.config.process_tree && !self.process_tree_active {
@@ -597,9 +615,15 @@ impl AppState {
                 push(&mut history.power, ratio(gpu.power_mw, gpu.power_limit_mw));
             }
         }
-        let previous_start_times: HashMap<u32, u128> = self
-            .sample
-            .processes
+        let previous_processes = if self.config.pause_processes
+            && !self.gpu_process_panel.paused
+            && self.gpu_processes_available()
+        {
+            &self.gpu_process_panel.processes
+        } else {
+            &self.sample.processes
+        };
+        let previous_start_times: HashMap<u32, u128> = previous_processes
             .iter()
             .chain(self.detailed_process.iter())
             .filter_map(|process| process.start_time.map(|start| (process.pid, start)))
@@ -616,9 +640,11 @@ impl AppState {
             })
             .map(|process| process.pid)
             .collect();
-        if self
-            .selected_pid()
-            .is_some_and(|pid| reused_pids.contains(&pid))
+        if self.process_selected
+            && self
+                .visible_pids
+                .get(self.selected_process)
+                .is_some_and(|pid| reused_pids.contains(pid))
         {
             self.process_selected = false;
         }
@@ -635,6 +661,23 @@ impl AppState {
             self.detailed_pid = None;
             self.detailed_process = None;
             self.last_selected_process = None;
+        }
+        if crate::process_gpu::available(&sample.gpus) {
+            self.gpu_process_panel.update(
+                &sample.processes,
+                &self.config,
+                sample.cpu.cores.len().max(1),
+            );
+        } else {
+            self.gpu_process_panel = GpuProcessPanel::default();
+            self.gpu_process_focus = false;
+            if self
+                .editing_option
+                .is_some_and(|option| option.starts_with("gpu_proc_"))
+            {
+                self.editing_option = None;
+                self.options_buffer.clear();
+            }
         }
         if self.config.pause_processes {
             let current_pids: HashSet<u32> =
@@ -653,6 +696,7 @@ impl AppState {
                     if !keep_usage {
                         process.cpu = 0.0;
                         process.memory = 0;
+                        process.gpu = Default::default();
                     }
                 }
             }
@@ -700,7 +744,10 @@ impl AppState {
             None => self.detailed_process = None,
         }
         if let Some(pid) = self.detailed_pid
-            && let Some(process) = sample.processes.iter().find(|process| process.pid == pid)
+            && let Some(process) = self
+                .detailed_process
+                .as_ref()
+                .filter(|process| process.pid == pid && !matches!(process.state, 'X' | 'x'))
         {
             let detailed_cpu = if self.config.process_per_core {
                 process.cpu
@@ -719,6 +766,17 @@ impl AppState {
             sample.network.uploaded = sample.network.uploaded.saturating_sub(*upload_offset);
         }
         self.sample = sample;
+        if gpu_available_before != self.gpu_processes_available() {
+            let index = selected_option
+                .and_then(|selected| {
+                    self.option_keys(self.options_category)
+                        .iter()
+                        .position(|option| *option == selected)
+                })
+                .unwrap_or(0);
+            self.options_page = index / self.options_per_page();
+            self.options_selected = index % self.options_per_page();
+        }
         let pending_operation = match self.overlay {
             Overlay::Signal { pid, .. } | Overlay::SignalChoose { pid, .. } => {
                 Some((pid, Operation::Signal))
@@ -808,11 +866,30 @@ impl AppState {
         self.needs_redraw = true;
     }
 
-    pub fn detailed_pid(&self) -> Option<u32> {
-        self.detailed_pid
+    fn gpu_processes_available(&self) -> bool {
+        crate::process_gpu::available(&self.sample.gpus)
+    }
+
+    fn gpu_processes_visible(&self) -> bool {
+        self.config.gpu_processes_shown() && self.gpu_processes_available()
+    }
+
+    pub fn detailed_pids(&self) -> [Option<u32>; 2] {
+        [
+            self.detailed_pid,
+            self.gpu_processes_visible()
+                .then(|| {
+                    self.gpu_process_panel
+                        .detail
+                        .as_ref()
+                        .map(|process| process.pid)
+                })
+                .flatten(),
+        ]
     }
 
     fn clear_mouse_regions(&mut self) {
+        self.gpu_process_panel.clear_regions();
         self.cpu_area = None;
         self.memory_area = None;
         self.network_area = None;
@@ -837,6 +914,9 @@ impl AppState {
         #[cfg(windows)]
         if key == Key::Resize {
             self.needs_redraw = true;
+            return false;
+        }
+        if self.overlay == Overlay::None && self.gpu_process_edit_key(key) {
             return false;
         }
         if self.filter_editing {
@@ -1181,6 +1261,14 @@ impl AppState {
             }
             return false;
         }
+        if matches!(key, Key::Tab | Key::BackTab) && self.gpu_processes_visible() {
+            self.gpu_process_focus = !self.gpu_process_focus || !self.config.shown[3];
+            self.needs_redraw = true;
+            return false;
+        }
+        if self.gpu_process_key(key) {
+            return false;
+        }
         match key {
             Key::Char('q') => return true,
             Key::Escape | Key::Char('m') => self.activate_cpu_control(CpuControlAction::Menu),
@@ -1215,9 +1303,7 @@ impl AppState {
                 }
             }
             Key::Char('p') => self.activate_cpu_control(CpuControlAction::Preset),
-            Key::Char('P') => {
-                self.config.cycle_preset(false);
-            }
+            Key::Char('P') => self.cycle_preset(false),
             Key::Char('+') | Key::Char('=')
                 if self.config.process_tree && self.process_selected =>
             {
@@ -1276,6 +1362,9 @@ impl AppState {
             Key::Char('F') => self.activate_process_control(ProcessControlAction::Follow),
             Key::Char('c') => self.activate_process_control(ProcessControlAction::PerCore),
             Key::Char('%') => self.config.flip_value("proc_mem_bytes"),
+            Key::Char('v' | 'V') => {
+                self.activate_process_control(ProcessControlAction::GpuProcesses)
+            }
             Key::Char('/') | Key::Char('f') => {
                 self.activate_process_control(ProcessControlAction::Filter)
             }
@@ -1332,6 +1421,7 @@ impl AppState {
         };
         self.config
             .set_value("proc_sorting", ProcessSort::ALL[next].label());
+        self.collection_requested = true;
     }
 
     fn options_per_page(&self) -> usize {
@@ -1379,7 +1469,7 @@ impl AppState {
         if x < area.x + 30 && y >= area.y + 3 && y < area.y + area.h - 1 {
             let selected = (y - area.y - 3) / 2;
             let option_index = self.options_page * self.options_per_page() + selected;
-            if option_index < OPTION_CATEGORIES[self.options_category].len() {
+            if option_index < self.option_keys(self.options_category).len() {
                 if self.options_selected == selected {
                     if x == area.x + 26 && self.current_option().is_some_and(is_integer_option) {
                         self.activate_option();
@@ -1400,15 +1490,24 @@ impl AppState {
         }
     }
 
+    fn option_keys(&self, category: usize) -> Vec<&'static str> {
+        OPTION_CATEGORIES
+            .get(category)
+            .into_iter()
+            .flat_map(|options| options.iter().copied())
+            .filter(|option| !option.starts_with("gpu_proc_") || self.gpu_processes_available())
+            .collect()
+    }
+
     fn current_option(&self) -> Option<&'static str> {
-        let options = OPTION_CATEGORIES.get(self.options_category)?;
+        let options = self.option_keys(self.options_category);
         options
             .get(self.options_page * self.options_per_page() + self.options_selected)
             .copied()
     }
 
     fn move_option(&mut self, direction: i32) {
-        let options = OPTION_CATEGORIES[self.options_category];
+        let options = self.option_keys(self.options_category);
         if options.is_empty() {
             return;
         }
@@ -1424,7 +1523,7 @@ impl AppState {
     }
 
     fn move_option_page(&mut self, direction: i32) {
-        let options = OPTION_CATEGORIES[self.options_category];
+        let options = self.option_keys(self.options_category);
         let pages = options.len().div_ceil(self.options_per_page()).max(1);
         self.options_page = if direction > 0 {
             (self.options_page + 1) % pages
@@ -1448,6 +1547,9 @@ impl AppState {
         let Some(option) = self.current_option() else {
             return;
         };
+        if matches!(option, "shown_boxes" | "gpu_proc_sorting") {
+            self.collection_requested = true;
+        }
         if self.config.bool_value(option).is_some() {
             self.config.flip_value(option);
             return;
@@ -1502,7 +1604,7 @@ impl AppState {
             && if option == "shown_boxes" {
                 let boxes: Vec<&str> = self.options_buffer.split_whitespace().collect();
                 boxes.iter().all(|name| {
-                    matches!(*name, "cpu" | "mem" | "net" | "proc")
+                    matches!(*name, "cpu" | "mem" | "net" | "proc" | "gpu_proc")
                         || name
                             .strip_prefix("gpu")
                             .and_then(|index| index.parse::<usize>().ok())
@@ -1513,6 +1615,9 @@ impl AppState {
             };
         if valid {
             self.config.set_value(option, self.options_buffer.clone());
+            if matches!(option, "shown_boxes" | "shown_gpus") {
+                self.collection_requested = true;
+            }
             self.editing_option = None;
             self.options_buffer.clear();
         }
@@ -1696,6 +1801,19 @@ impl AppState {
 
     fn activate_process_control(&mut self, action: ProcessControlAction) {
         match action {
+            ProcessControlAction::GpuProcesses => {
+                if !self.gpu_processes_available() {
+                    return;
+                }
+                self.config.toggle_box("gpu_proc");
+                self.config.preset = None;
+                self.gpu_process_focus = self.gpu_processes_visible();
+                if !self.gpu_process_focus {
+                    self.gpu_process_panel.editing_filter = false;
+                    self.gpu_process_panel.dragging = false;
+                }
+                self.collection_requested = true;
+            }
             ProcessControlAction::Filter => {
                 self.filter_editing = true;
                 self.filter_buffer.clone_from(&self.config.process_filter);
@@ -1719,10 +1837,16 @@ impl AppState {
         }
     }
 
+    fn cycle_preset(&mut self, forward: bool) {
+        let gpu_processes = self.config.gpu_processes_shown();
+        self.config.cycle_preset(forward);
+        self.collection_requested |= gpu_processes != self.config.gpu_processes_shown();
+    }
+
     fn activate_cpu_control(&mut self, action: CpuControlAction) {
         match action {
             CpuControlAction::Menu => self.overlay = Overlay::Main { selected: 0 },
-            CpuControlAction::Preset => self.config.cycle_preset(true),
+            CpuControlAction::Preset => self.cycle_preset(true),
             CpuControlAction::DecreaseUpdate => {
                 self.config.set_value(
                     "update_ms",
@@ -1759,15 +1883,35 @@ impl AppState {
         self.sample
             .processes
             .iter()
+            .chain(self.gpu_process_panel.processes.iter())
             .any(|process| process.pid == pid && !matches!(process.state, 'X' | 'x'))
     }
 
     fn selected_live_pid(&self) -> Option<u32> {
-        self.selected_pid()
-            .filter(|pid| self.process_is_alive(*pid))
+        self.selected_live_process().map(|process| process.pid)
+    }
+
+    fn selected_live_process(&self) -> Option<&ProcessSample> {
+        let pid = self.selected_pid()?;
+        let processes = if self.gpu_process_focus && self.gpu_processes_visible() {
+            &self.gpu_process_panel.processes
+        } else {
+            &self.sample.processes
+        };
+        processes
+            .iter()
+            .find(|process| process.pid == pid && !matches!(process.state, 'X' | 'x'))
     }
 
     fn selected_pid(&self) -> Option<u32> {
+        if self.gpu_process_focus && self.gpu_processes_visible() {
+            return self.gpu_process_panel.selected_pid().or_else(|| {
+                self.gpu_process_panel
+                    .detail
+                    .as_ref()
+                    .map(|process| process.pid)
+            });
+        }
         self.process_selected
             .then(|| self.visible_pids.get(self.selected_process).copied())
             .flatten()
@@ -1851,12 +1995,7 @@ impl AppState {
     }
 
     fn open_renice(&mut self) {
-        if let Some(process) = self.selected_live_pid().and_then(|pid| {
-            self.sample
-                .processes
-                .iter()
-                .find(|process| process.pid == pid)
-        }) {
+        if let Some(process) = self.selected_live_process() {
             let pid = process.pid;
             let value = process.nice.clamp(-20, 19);
             self.renice_buffer.clear();
@@ -1874,6 +2013,7 @@ impl AppState {
     }
 
     fn toggle_process_details(&mut self) {
+        let previous = self.detailed_pid;
         if self.process_selected
             && let Some(pid) = self.visible_pids.get(self.selected_process).copied()
         {
@@ -1905,15 +2045,19 @@ impl AppState {
             }
             self.detailed_pid = None;
         }
+        if self.detailed_pid != previous {
+            self.collection_requested = true;
+        }
     }
 
     fn handle_mouse(&mut self, button: u16, x: usize, y: usize, pressed: bool) -> bool {
-        if self.last_size.is_none() {
-            return false;
-        }
         if !pressed {
+            self.gpu_process_panel.dragging = false;
             self.dragging_process_scrollbar = false;
             self.dragging_disk_scrollbar = false;
+            return false;
+        }
+        if self.last_size.is_none() {
             return false;
         }
         if self.dragging_disk_scrollbar && button & 32 != 0 {
@@ -1925,6 +2069,12 @@ impl AppState {
             self.select_from_process_scrollbar(y);
             self.needs_redraw = true;
             return false;
+        }
+        if self.gpu_process_mouse(button, x, y, pressed) {
+            return false;
+        }
+        if self.process_area.is_some_and(|area| area.contains(x, y)) {
+            self.gpu_process_focus = false;
         }
         if button == 0
             && let Some(scrollbar) = self.process_scrollbar
@@ -2157,7 +2307,7 @@ impl Renderer {
         // Pagination is presentation state; resizing must retain the selected
         // setting, including while the terminal cannot display the options.
         if let Some(index) = selected_option.and_then(|selected| {
-            OPTION_CATEGORIES[app.options_category]
+            app.option_keys(app.options_category)
                 .iter()
                 .position(|option| *option == selected)
         }) {
@@ -2166,6 +2316,7 @@ impl Renderer {
             app.options_selected = index % per_page;
         }
         if too_small_for_layout {
+            app.gpu_process_panel.dragging = false;
             app.dragging_process_scrollbar = false;
             app.dragging_disk_scrollbar = false;
             return too_small(size, needed);
@@ -2193,13 +2344,27 @@ impl Renderer {
         let width = canvas.width;
         let height = canvas.height;
         let shown_gpus = shown_gpu_panels(&app.config, &app.sample.gpus);
-        if !app.config.shown.iter().any(|shown| *shown) && shown_gpus.is_empty() {
+        let gpu_process_visible = app.gpu_processes_visible();
+        if !gpu_process_visible {
+            app.gpu_process_focus = false;
+            app.gpu_process_panel.editing_filter = false;
+            app.gpu_process_panel.dragging = false;
+        } else if !app.config.shown[3] {
+            app.gpu_process_focus = true;
+        }
+        if !app.config.shown.iter().any(|shown| *shown)
+            && shown_gpus.is_empty()
+            && !gpu_process_visible
+        {
             draw_no_boxes(&mut canvas);
         }
         let inline_gpus = inline_gpu_panels(&app.config, &app.sample.gpus, &shown_gpus);
-        let lower_visible = app.config.shown[1] || app.config.shown[2] || app.config.shown[3];
+        let lower_visible = app.config.shown[1]
+            || app.config.shown[2]
+            || app.config.shown[3]
+            || gpu_process_visible;
         // Reserve every panel's minimum before assigning percentage-based heights.
-        let lower_minimum = lower_panel_minimum(&app.config);
+        let lower_minimum = lower_panel_minimum(&app.config) + usize::from(gpu_process_visible) * 8;
         let gpu_minimum: usize = shown_gpus
             .iter()
             .map(|index| gpu_height_offset(&app.sample.gpus[*index]) + 4)
@@ -2270,6 +2435,28 @@ impl Renderer {
             draw_gpu(&mut canvas, Rect::new(0, gpu_y, width, gpu_h), app, index);
             app.draw_times_us[4] = app.draw_times_us[4].saturating_add(elapsed_us(started));
             gpu_y += gpu_h;
+        }
+        if gpu_process_visible {
+            canvas.graph_symbol = panel_graph_symbol(&app.config, "graph_symbol_proc");
+            let available = vertical_end.saturating_sub(gpu_y + lower_panel_minimum(&app.config));
+            let processes = app.gpu_process_panel.listed_processes(&app.config);
+            let panel_h = if lower_panel_minimum(&app.config) == 0 {
+                available
+            } else {
+                processes.height_within(
+                    (height / 4).max(8).min(available),
+                    app.gpu_process_panel.detail.is_some(),
+                )
+            };
+            let started = Instant::now();
+            draw_gpu_process_panel(
+                &mut canvas,
+                Rect::new(0, gpu_y, width, panel_h),
+                app,
+                processes,
+            );
+            app.draw_times_us[4] = app.draw_times_us[4].saturating_add(elapsed_us(started));
+            gpu_y += panel_h;
         }
         let lower_y = gpu_y;
         let gpu_total_height = lower_y.saturating_sub(if cpu_bottom { 0 } else { cpu_h });
@@ -2450,6 +2637,10 @@ pub fn minimum_size(config: &Config, gpus: &[GpuSample]) -> Size {
     if !shown_gpus.is_empty() {
         width = width.max(41);
     }
+    let gpu_process_visible = config.gpu_processes_shown() && crate::process_gpu::available(gpus);
+    if gpu_process_visible {
+        width = width.max(44);
+    }
 
     let mut height = if cpu {
         8 + inline_gpu_panels(config, gpus, &shown_gpus).len()
@@ -2457,6 +2648,7 @@ pub fn minimum_size(config: &Config, gpus: &[GpuSample]) -> Size {
         0
     };
     height += lower_panel_minimum(config);
+    height += usize::from(gpu_process_visible) * 8;
     height += shown_gpus
         .iter()
         .map(|index| gpu_height_offset(&gpus[*index]) + 4)
@@ -5631,12 +5823,103 @@ fn tree_filter_with_descendants<'a>(
         .collect()
 }
 
+struct ProcessDetailContext<'a> {
+    config: &'a Config,
+    sample: &'a Sample,
+    cpu_history: &'a VecDeque<f64>,
+    memory_history: &'a VecDeque<f64>,
+    has_selection: bool,
+    selected_pid: Option<u32>,
+    followed: Option<u32>,
+    title: &'a str,
+    hitboxes: &'a mut Vec<ProcessControlHitbox>,
+}
+
 fn draw_process_details(
     canvas: &mut Canvas,
     area: Rect,
-    app: &mut AppState,
     process: &ProcessSample,
+    context: ProcessDetailContext<'_>,
 ) {
+    let ProcessDetailContext {
+        config,
+        sample,
+        cpu_history,
+        memory_history,
+        has_selection,
+        selected_pid,
+        followed,
+        title,
+        hitboxes,
+    } = context;
+    let selected_matches = !has_selection || selected_pid.is_none_or(|pid| pid == process.pid);
+    let detail_offset = if area.h >= 14 { 8 } else { 4 };
+    if detail_offset == 4 {
+        canvas.title(
+            area.x + 2,
+            area.y,
+            &clip_text(
+                &format!("{} {}", process.pid, process.name),
+                area.w.saturating_sub(14),
+            ),
+            theme::PROC_BOX,
+        );
+        let hide_x = area.x + area.w.saturating_sub(10);
+        canvas.control_title_state(
+            hide_x,
+            area.y,
+            "hide ↵",
+            &[5],
+            true,
+            selected_matches,
+            theme::PROC_BOX,
+        );
+        if selected_matches {
+            hitboxes.push(ProcessControlHitbox {
+                y: area.y,
+                start: hide_x + 1,
+                end: hide_x + 7,
+                action: ProcessControlAction::Info,
+            });
+        }
+        let gpu = process
+            .gpu
+            .utilization
+            .map(|value| format!("{value}%"))
+            .unwrap_or_else(|| "—".into());
+        let memory = process
+            .gpu
+            .bytes
+            .map(|value| units::bytes_short(value, config.base_10_sizes))
+            .unwrap_or_else(|| "—".into());
+        let rows = [
+            format!(
+                "GPU: {gpu}  GPUMem: {memory}  CPU: {:.1}%  RAM: {}",
+                process.cpu,
+                units::bytes_short(process.memory, config.base_10_sizes)
+            ),
+            format!(
+                "{}  User: {}  Elapsed: {}",
+                process_state(process.state),
+                process.user,
+                units::duration(process.elapsed_seconds)
+            ),
+            sanitize_control(&process.command),
+        ];
+        for (offset, row) in rows.iter().enumerate() {
+            canvas.text(
+                area.x + 2,
+                area.y + offset + 1,
+                &clip_text(row, area.w - 4),
+                theme::MAIN,
+            );
+        }
+        canvas.fill(area.x + 1, area.y + 4, area.w - 2, '─', theme::BOX);
+        canvas.put(area.x, area.y + 4, '├', theme::PROC_BOX);
+        canvas.put(area.x + area.w - 1, area.y + 4, '┤', theme::PROC_BOX);
+        canvas.title(area.x + 2, area.y + 4, title, theme::PROC_BOX);
+        return;
+    }
     let graph_width = (area.w / 3).max(area.w.saturating_sub(121));
     let divider = area.x + graph_width;
     let details_x = divider + 1;
@@ -5670,12 +5953,12 @@ fn draw_process_details(
     }
     canvas.put(area.x, area.y + 8, '├', theme::PROC_BOX);
     canvas.put(area.x + area.w - 1, area.y + 8, '┤', theme::PROC_BOX);
-    canvas.title(area.x + 2, area.y + 8, "⁴proc", theme::PROC_BOX);
+    canvas.title(area.x + 2, area.y + 8, title, theme::PROC_BOX);
 
     draw_graph_options(
         canvas,
         Rect::new(area.x + 1, area.y + 1, graph_width.saturating_sub(1), 7),
-        &app.detailed_cpu_history,
+        cpu_history,
         100.0,
         theme::CPU,
         false,
@@ -5699,7 +5982,7 @@ fn draw_process_details(
     }
 
     let alive = process.state != 'X' && process.state != 'x';
-    let controls_enabled = alive && !app.process_selected;
+    let controls_enabled = alive && !has_selection;
     let mut control_x = details_x + 1;
     let mut controls = Vec::new();
     if area.w > 55 {
@@ -5714,8 +5997,7 @@ fn draw_process_details(
         controls.push(("Follow", vec![0], ProcessControlAction::Follow));
     }
     for (label, hotkeys, action) in controls {
-        let active =
-            action == ProcessControlAction::Follow && app.followed_pid == Some(process.pid);
+        let active = action == ProcessControlAction::Follow && followed == Some(process.pid);
         canvas.control_title_state(
             control_x,
             area.y,
@@ -5726,7 +6008,7 @@ fn draw_process_details(
             theme::PROC_BOX,
         );
         if controls_enabled {
-            app.process_control_hitboxes.push(ProcessControlHitbox {
+            hitboxes.push(ProcessControlHitbox {
                 y: area.y,
                 start: control_x + 1,
                 end: control_x + 1 + units::display_width(label),
@@ -5738,9 +6020,6 @@ fn draw_process_details(
             break;
         }
     }
-    let selected_matches = !app.process_selected
-        || app.visible_pids.is_empty()
-        || app.visible_pids.get(app.selected_process).copied() == Some(process.pid);
     let hide_x = area.x + area.w.saturating_sub(10);
     canvas.control_title_state(
         hide_x,
@@ -5752,7 +6031,7 @@ fn draw_process_details(
         theme::PROC_BOX,
     );
     if selected_matches {
-        app.process_control_hitboxes.push(ProcessControlHitbox {
+        hitboxes.push(ProcessControlHitbox {
             y: area.y,
             start: hide_x + 1,
             end: hide_x + 7,
@@ -5760,8 +6039,7 @@ fn draw_process_details(
         });
     }
 
-    let parent = app
-        .sample
+    let parent = sample
         .processes
         .iter()
         .find(|parent| parent.pid == process.parent)
@@ -5772,11 +6050,11 @@ fn draw_process_details(
         ("Elapsed:", units::duration(process.elapsed_seconds)),
         (
             "IO/R:",
-            units::bytes(process.read_bytes, app.config.base_10_sizes),
+            units::bytes(process.read_bytes, config.base_10_sizes),
         ),
         (
             "IO/W:",
-            units::bytes(process.write_bytes, app.config.base_10_sizes),
+            units::bytes(process.write_bytes, config.base_10_sizes),
         ),
         ("Parent:", parent),
         ("User:", process.user.clone()),
@@ -5798,7 +6076,40 @@ fn draw_process_details(
         canvas.text(x, area.y + 2, &center_text(value, item_width), value_style);
     }
 
-    let memory_percent = ratio(process.memory, app.sample.memory.total);
+    let memory_percent = ratio(process.memory, sample.memory.total);
+    if crate::process_gpu::available(&sample.gpus) {
+        let gpu_memory = match process.gpu.bytes {
+            Some(bytes) => units::bytes(bytes, config.base_10_sizes),
+            None => "—".into(),
+        };
+        let gpu_usage = process
+            .gpu
+            .utilization
+            .map(|value| format!("{value}%"))
+            .unwrap_or_else(|| "—".into());
+        let mut gpu_detail = format!("GPU: {gpu_usage} {gpu_memory}");
+        for device in &process.gpu.devices {
+            let value = device
+                .bytes
+                .map(|bytes| units::bytes(bytes, config.base_10_sizes))
+                .unwrap_or_else(|| "—".into());
+            gpu_detail.push_str(&format!(
+                " | GPU{} {}: {} {value}",
+                device.index,
+                sanitize_control(&device.name),
+                device
+                    .utilization
+                    .map(|value| format!("{value}%"))
+                    .unwrap_or_else(|| "—".into()),
+            ));
+        }
+        canvas.text(
+            details_x + 1,
+            area.y + 3,
+            &units::truncate(&gpu_detail, details_width.saturating_sub(2)),
+            theme::MAIN,
+        );
+    }
     let mut memory_percent_text = format!("{memory_percent:.2}");
     memory_percent_text.truncate(4);
     if memory_percent_text.ends_with('.') {
@@ -5809,12 +6120,11 @@ fn draw_process_details(
     let memory_graph_width = details_width / 3;
     let memory_x = details_x + details_width / 3 - memory_text.len() - 1;
     canvas.text_bold(memory_x, area.y + 4, &memory_text, theme::TITLE);
-    let memory_maximum = app
-        .detailed_memory_history
+    let memory_maximum = memory_history
         .iter()
         .copied()
         .fold(process.memory as f64 * 2.0, f64::max)
-        .min(app.sample.memory.total as f64)
+        .min(sample.memory.total as f64)
         .max(1.0);
     draw_graph(
         canvas,
@@ -5824,14 +6134,14 @@ fn draw_process_details(
             memory_graph_width,
             1,
         ),
-        &app.detailed_memory_history,
+        memory_history,
         memory_maximum,
         theme::Style::ProcMisc,
     );
     canvas.text_bold(
         details_x + 2 * details_width / 3,
         area.y + 4,
-        &units::bytes(process.memory, app.config.base_10_sizes),
+        &units::bytes(process.memory, config.base_10_sizes),
         theme::TITLE,
     );
 
@@ -5855,6 +6165,137 @@ fn draw_process_details(
     }
 }
 
+struct ProcessHeader<'a> {
+    filter_offset: usize,
+    filter: &'a str,
+    editing: bool,
+    sorting: ProcessSort,
+    tree: bool,
+    reversed: bool,
+    per_core: bool,
+    paused: bool,
+}
+
+fn draw_process_header(
+    canvas: &mut Canvas,
+    area: Rect,
+    y: usize,
+    header: ProcessHeader<'_>,
+    hitboxes: &mut Vec<ProcessControlHitbox>,
+) {
+    let filter_x = area.x + header.filter_offset;
+    let sorting = header.sorting.label();
+    let sort_len = units::display_width(sorting);
+    let sort_x = area.x + area.w.saturating_sub(sort_len + 8);
+    let sort = format!("← {sorting} →");
+    canvas.control_title(sort_x, y, &sort, &[0, sort_len + 3], true, theme::PROC_BOX);
+    hitboxes.extend([
+        ProcessControlHitbox {
+            y,
+            start: sort_x + 1,
+            end: sort_x + 3,
+            action: ProcessControlAction::SortPrevious,
+        },
+        ProcessControlHitbox {
+            y,
+            start: sort_x + sort_len + 3,
+            end: sort_x + sort_len + 5,
+            action: ProcessControlAction::SortNext,
+        },
+    ]);
+    let mut controls_left = sort_x;
+    for (label, action, hotkey, active, offset, minimum) in [
+        ("tree", ProcessControlAction::Tree, 3, header.tree, 6, 35),
+        (
+            "reverse",
+            ProcessControlAction::Reverse,
+            0,
+            header.reversed,
+            15,
+            45,
+        ),
+        (
+            "per-core",
+            ProcessControlAction::PerCore,
+            4,
+            header.per_core,
+            25,
+            55,
+        ),
+        (
+            "pause",
+            ProcessControlAction::Pause,
+            2,
+            header.paused,
+            32,
+            60,
+        ),
+    ] {
+        if area
+            .w
+            .saturating_sub(header.filter_offset.saturating_sub(9))
+            <= minimum + sort_len
+        {
+            continue;
+        }
+        let x = sort_x.saturating_sub(offset);
+        canvas.control_title(x, y, label, &[hotkey], active, theme::PROC_BOX);
+        hitboxes.push(ProcessControlHitbox {
+            y,
+            start: x + 1,
+            end: x + 1 + label.len(),
+            action,
+        });
+        controls_left = x;
+    }
+    let maximum_filter = controls_left.saturating_sub(filter_x + 8);
+    let filter = sanitize_control(header.filter);
+    let filter_text = units::column_slice(
+        &filter,
+        units::display_width(&filter).saturating_sub(maximum_filter),
+        maximum_filter,
+    );
+    let active = header.editing || !filter.is_empty();
+    canvas.put(filter_x, y, '┐', theme::PROC_BOX);
+    if active {
+        canvas.put_bold(filter_x + 1, y, 'f', theme::HI);
+        canvas.put_bold(filter_x + 2, y, ' ', theme::TITLE);
+        canvas.text_bold(filter_x + 3, y, &filter_text, theme::TITLE);
+    } else {
+        canvas.put(filter_x + 1, y, 'f', theme::HI);
+        canvas.text(filter_x + 2, y, "ilter", theme::TITLE);
+    }
+    let length = if active {
+        2 + units::display_width(&filter_text)
+    } else {
+        6
+    };
+    let mut end = filter_x + 1 + length;
+    if header.editing {
+        canvas.put_underline(end, y, ' ', theme::TITLE);
+        canvas.put_bold(end + 1, y, ' ', theme::HI);
+        canvas.put_bold(end + 2, y, '↵', theme::HI);
+        end += 3;
+    } else if !filter.is_empty() {
+        canvas.put_bold(end, y, ' ', theme::HI);
+        canvas.text_bold(end + 1, y, "del", theme::HI);
+        hitboxes.push(ProcessControlHitbox {
+            y,
+            start: end + 1,
+            end: end + 4,
+            action: ProcessControlAction::DeleteFilter,
+        });
+        end += 4;
+    }
+    canvas.put(end, y, '┌', theme::PROC_BOX);
+    hitboxes.push(ProcessControlHitbox {
+        y,
+        start: filter_x + 1,
+        end: filter_x + 1 + length,
+        action: ProcessControlAction::Filter,
+    });
+}
+
 fn draw_processes(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
     let selected_pid_before_reorder = app
         .process_selected
@@ -5874,153 +6315,26 @@ fn draw_processes(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
         theme::PROC_BOX,
         None,
     );
-    let filter_x = area.x + 9;
-    let maximum_filter = area.w.saturating_sub(66).max(6);
-    let raw_filter = if app.filter_editing {
-        app.filter_buffer.as_str()
-    } else {
-        app.config.process_filter.as_str()
-    };
-    let filter_text = if units::display_width(raw_filter) > maximum_filter {
-        let reversed = raw_filter.chars().rev().collect::<String>();
-        clip_text(&reversed, maximum_filter)
-            .chars()
-            .rev()
-            .collect::<String>()
-    } else {
-        raw_filter.to_string()
-    };
-    let active_filter = app.filter_editing || !filter_text.is_empty();
-    canvas.put(filter_x, controls_y, '┐', theme::PROC_BOX);
-    if active_filter {
-        canvas.put_bold(filter_x + 1, controls_y, 'f', theme::HI);
-        canvas.put_bold(filter_x + 2, controls_y, ' ', theme::TITLE);
-        canvas.text_bold(filter_x + 3, controls_y, &filter_text, theme::TITLE);
-    } else {
-        canvas.put(filter_x + 1, controls_y, 'f', theme::HI);
-        canvas.text(filter_x + 2, controls_y, "ilter", theme::TITLE);
-    }
-    let filter_length = if active_filter {
-        2 + units::display_width(&filter_text)
-    } else {
-        6
-    };
-    let mut filter_end = filter_x + 1 + filter_length;
-    if app.filter_editing {
-        canvas.put_underline(filter_end, controls_y, ' ', theme::TITLE);
-        canvas.put_bold(filter_end + 1, controls_y, ' ', theme::HI);
-        canvas.put_bold(filter_end + 2, controls_y, '↵', theme::HI);
-        filter_end += 3;
-    } else if !filter_text.is_empty() {
-        canvas.put_bold(filter_end, controls_y, ' ', theme::HI);
-        canvas.text_bold(filter_end + 1, controls_y, "del", theme::HI);
-        app.process_control_hitboxes.push(ProcessControlHitbox {
-            y: controls_y,
-            start: filter_end + 1,
-            end: filter_end + 4,
-            action: ProcessControlAction::DeleteFilter,
-        });
-        filter_end += 4;
-    }
-    canvas.put(filter_end, controls_y, '┌', theme::PROC_BOX);
-    app.process_control_hitboxes.push(ProcessControlHitbox {
-        y: controls_y,
-        start: filter_x + 1,
-        end: filter_x + 1 + filter_length,
-        action: ProcessControlAction::Filter,
-    });
-    let sorting = app.config.process_sort.label();
-    let sort_len = units::display_width(sorting);
-    let sort = format!("← {sorting} →");
-    let sort_x = area.x + area.w.saturating_sub(sort_len + 8);
-    canvas.control_title(
-        sort_x,
+    draw_process_header(
+        canvas,
+        area,
         controls_y,
-        &sort,
-        &[0, sort.chars().count() - 1],
-        true,
-        theme::PROC_BOX,
+        ProcessHeader {
+            filter_offset: 9,
+            filter: if app.filter_editing {
+                &app.filter_buffer
+            } else {
+                &app.config.process_filter
+            },
+            editing: app.filter_editing,
+            sorting: app.config.process_sort,
+            tree: app.config.process_tree,
+            reversed: app.config.process_reversed,
+            per_core: app.config.process_per_core,
+            paused: app.config.pause_processes,
+        },
+        &mut app.process_control_hitboxes,
     );
-    app.process_control_hitboxes.push(ProcessControlHitbox {
-        y: controls_y,
-        start: sort_x + 1,
-        end: sort_x + 3,
-        action: ProcessControlAction::SortPrevious,
-    });
-    app.process_control_hitboxes.push(ProcessControlHitbox {
-        y: controls_y,
-        start: sort_x + sort_len + 3,
-        end: sort_x + sort_len + 5,
-        action: ProcessControlAction::SortNext,
-    });
-    if area.w > 35 + sort_len {
-        let x = sort_x.saturating_sub(6);
-        canvas.control_title(
-            x,
-            controls_y,
-            "tree",
-            &[3],
-            app.config.process_tree,
-            theme::PROC_BOX,
-        );
-        app.process_control_hitboxes.push(ProcessControlHitbox {
-            y: controls_y,
-            start: x + 1,
-            end: x + 5,
-            action: ProcessControlAction::Tree,
-        });
-    }
-    if area.w > 45 + sort_len {
-        let x = sort_x.saturating_sub(15);
-        canvas.control_title(
-            x,
-            controls_y,
-            "reverse",
-            &[0],
-            app.config.process_reversed,
-            theme::PROC_BOX,
-        );
-        app.process_control_hitboxes.push(ProcessControlHitbox {
-            y: controls_y,
-            start: x + 1,
-            end: x + 8,
-            action: ProcessControlAction::Reverse,
-        });
-    }
-    if area.w > 55 + sort_len {
-        let x = sort_x.saturating_sub(25);
-        canvas.control_title(
-            x,
-            controls_y,
-            "per-core",
-            &[4],
-            app.config.process_per_core,
-            theme::PROC_BOX,
-        );
-        app.process_control_hitboxes.push(ProcessControlHitbox {
-            y: controls_y,
-            start: x + 1,
-            end: x + 9,
-            action: ProcessControlAction::PerCore,
-        });
-    }
-    if area.w > 60 + sort_len {
-        let x = sort_x.saturating_sub(32);
-        canvas.control_title(
-            x,
-            controls_y,
-            "pause",
-            &[2],
-            app.config.pause_processes,
-            theme::PROC_BOX,
-        );
-        app.process_control_hitboxes.push(ProcessControlHitbox {
-            y: controls_y,
-            start: x + 1,
-            end: x + 6,
-            action: ProcessControlAction::Pause,
-        });
-    }
     let filter = if app.filter_editing {
         app.filter_buffer.as_str()
     } else {
@@ -6131,9 +6445,8 @@ fn draw_processes(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
     if area.h >= 14
         && let Some(pid) = app.detailed_pid
     {
-        let process = app
-            .sample
-            .processes
+        let processes = &app.sample.processes;
+        let process = processes
             .iter()
             .find(|process| process.pid == pid)
             .cloned()
@@ -6145,12 +6458,44 @@ fn draw_processes(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
             });
         if let Some(process) = process {
             app.detailed_process = Some(process.clone());
-            draw_process_details(canvas, area, app, &process);
+            draw_process_details(
+                canvas,
+                area,
+                &process,
+                ProcessDetailContext {
+                    config: &app.config,
+                    sample: &app.sample,
+                    cpu_history: &app.detailed_cpu_history,
+                    memory_history: &app.detailed_memory_history,
+                    has_selection: app.process_selected,
+                    selected_pid: app.visible_pids.get(app.selected_process).copied(),
+                    followed: app.followed_pid,
+                    title: "⁴proc",
+                    hitboxes: &mut app.process_control_hitboxes,
+                },
+            );
             header_y = area.y + 9;
         } else {
             app.detailed_pid = None;
             app.detailed_process = None;
         }
+    }
+    let gpu_processes_available = app.gpu_processes_available();
+    if gpu_processes_available {
+        canvas.control_footer(
+            area.x + 13,
+            area.bottom() - 1,
+            "gpu View",
+            &[4],
+            app.gpu_processes_visible(),
+            theme::PROC_BOX,
+        );
+        app.process_control_hitboxes.push(ProcessControlHitbox {
+            y: area.bottom() - 1,
+            start: area.x + 14,
+            end: area.x + 22,
+            action: ProcessControlAction::GpuProcesses,
+        });
     }
     if listed.is_empty() {
         canvas.text(
@@ -6579,7 +6924,7 @@ fn draw_processes(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
         },
     );
     canvas.put(button_x + 11, bottom, '└', theme::PROC_BOX);
-    button_x += 12;
+    button_x += 12 + usize::from(gpu_processes_available) * 10;
     let mut buttons = vec![("info ↵", Some(ProcessControlAction::Info), vec![5], true)];
     if area.w > 60 {
         buttons.push((
@@ -6610,6 +6955,21 @@ fn draw_processes(canvas: &mut Canvas, area: Rect, app: &mut AppState) {
         ));
     }
     for (button, action, hotkeys, active) in buttons {
+        let count_width = format!(
+            "{}/{}",
+            if app.process_selected {
+                app.selected_process + 1
+            } else {
+                0
+            },
+            listed.len()
+        )
+        .len()
+            + 3;
+        if button_x + units::display_width(button) + 2 > area.x + area.w.saturating_sub(count_width)
+        {
+            continue;
+        }
         canvas.control_footer_state(
             button_x,
             bottom,
@@ -6917,7 +7277,7 @@ fn draw_main_menu(canvas: &mut Canvas, app: &mut AppState, selected: u8) {
     }
 }
 
-const HELP_ROWS: usize = 46;
+const HELP_ROWS: usize = 48;
 
 fn help_geometry(width: usize, height: usize) -> Rect {
     let panel_width = 78.min(width.saturating_sub(2));
@@ -6976,7 +7336,12 @@ fn draw_help(canvas: &mut Canvas, page: usize) {
         ("r", "Reverse sorting order in processes box."),
         ("e", "Toggle processes tree view."),
         ("E", "Collapse/expand all processes in tree view."),
-        ("%", "Toggles memory display mode in processes box."),
+        ("%", "Toggle host RAM between bytes and percent."),
+        (
+            "v / V",
+            "Toggle GPU processes panel; click gpu View button.",
+        ),
+        ("Tab", "Switch keyboard focus between process panels."),
         (
             "Selected +, -",
             "Expand/collapse the selected process in tree view.",
@@ -7086,6 +7451,17 @@ fn option_choices(option: &str) -> Option<&'static [&'static str]> {
             "cpu direct",
             "cpu lazy",
         ]),
+        "gpu_proc_sorting" => Some(&[
+            "pid",
+            "name",
+            "command",
+            "threads",
+            "user",
+            "memory",
+            "gpu memory",
+            "gpu usage",
+            "cpu direct",
+        ]),
         "base_10_bitrate" => Some(&["Auto", "True", "False"]),
         _ => None,
     }
@@ -7170,7 +7546,7 @@ fn draw_options(
     page: usize,
     selected: usize,
 ) {
-    let options = OPTION_CATEGORIES[category.min(OPTION_CATEGORIES.len() - 1)];
+    let options = app.option_keys(category.min(OPTION_CATEGORIES.len() - 1));
     let area = options_geometry(canvas.width, canvas.height);
     draw_banner(canvas, area.y - 7);
     canvas.shadow(area);
@@ -7445,6 +7821,7 @@ fn option_description(option: &str) -> &'static [&'static str] {
             "",
             "Available values are \"cpu mem net proc\".",
             "Or \"gpu0\" through \"gpu5\" for GPU boxes.",
+            "Use \"gpu_proc\" for GPU processes.",
             "Separate values with whitespace.",
             "",
             "Toggle between presets with key \"p\".",
@@ -7990,8 +8367,7 @@ fn option_description(option: &str) -> &'static [&'static str] {
             "",
             "Possible values:",
             "\"pid\", \"program\", \"arguments\", \"threads\",",
-            "\"user\", \"memory\", \"cpu lazy\" and",
-            "\"cpu direct\".",
+            "\"user\", \"memory\", \"cpu lazy\" and \"cpu direct\".",
             "",
             "\"cpu lazy\" updates top process over time.",
             "\"cpu direct\" updates top process",
@@ -8043,6 +8419,24 @@ fn option_description(option: &str) -> &'static [&'static str] {
             "",
             "If true and process is multithreaded",
             "cpu usage can reach over 100%.",
+        ],
+        "gpu_proc_sorting" => &[
+            "Sorting for the separate GPU process panel.",
+            "",
+            "GPU memory, GPU usage, CPU, RAM, or identity.",
+            "Shortcut: Left/Right while the panel has focus.",
+        ],
+        "gpu_proc_filter" => &[
+            "Text filter for the GPU process panel.",
+            "",
+            "Shortcut: f or / while the panel has focus.",
+            "Independent from the regular process filter.",
+        ],
+        "gpu_proc_reversed" => &["Reverse sorting in the GPU process panel."],
+        "gpu_proc_tree" => &[
+            "Show GPU processes as a tree.",
+            "",
+            "Keeps their ancestors for context.",
         ],
         "proc_mem_bytes" => &[
             "Show memory as bytes in process list.",
@@ -8663,6 +9057,8 @@ fn compare_process(a: &&ProcessSample, b: &&ProcessSample, sort: ProcessSort) ->
             .partial_cmp(&a.cumulative_cpu)
             .unwrap_or(Ordering::Equal),
         ProcessSort::Memory => b.memory.cmp(&a.memory),
+        ProcessSort::GpuMemory => b.gpu.bytes.cmp(&a.gpu.bytes),
+        ProcessSort::GpuUsage => b.gpu.utilization.cmp(&a.gpu.utilization),
         ProcessSort::Pid => b.pid.cmp(&a.pid),
         ProcessSort::Name => a
             .name
@@ -8711,6 +9107,8 @@ struct ProcessResources {
     cpu: f64,
     cumulative_cpu: f64,
     memory: u64,
+    gpu: Option<u64>,
+    gpu_utilization: Option<u32>,
     threads: u32,
 }
 
@@ -8788,6 +9186,8 @@ fn aggregate_tree_resources(
                     cpu: process.cpu,
                     cumulative_cpu: process.cumulative_cpu,
                     memory: process.memory,
+                    gpu: process.gpu.bytes,
+                    gpu_utilization: process.gpu.utilization,
                     threads: process.threads,
                 };
                 if let Some(group) = children.get(&current) {
@@ -8802,6 +9202,14 @@ fn aggregate_tree_resources(
                             resources.cpu += child.cpu;
                             resources.cumulative_cpu += child.cumulative_cpu;
                             resources.memory = resources.memory.saturating_add(child.memory);
+                            resources.gpu = resources
+                                .gpu
+                                .zip(child.gpu)
+                                .and_then(|(parent, child)| parent.checked_add(child));
+                            resources.gpu_utilization = resources
+                                .gpu_utilization
+                                .zip(child.gpu_utilization)
+                                .and_then(|(parent, child)| parent.checked_add(child));
                             resources.threads = resources.threads.saturating_add(child.threads);
                         }
                     }
@@ -8837,6 +9245,8 @@ fn aggregate_tree_resources(
             process.cpu = resources.cpu;
             process.cumulative_cpu = resources.cumulative_cpu;
             process.memory = resources.memory;
+            process.gpu.bytes = resources.gpu;
+            process.gpu.utilization = resources.gpu_utilization;
             process.threads = resources.threads;
         }
     }
@@ -8954,10 +9364,51 @@ fn process_tree_prefix(
 }
 
 fn sort_process_group(group: &mut Vec<&ProcessSample>, sort: ProcessSort, reversed: bool) {
-    group.sort_by(|a, b| compare_process(a, b, sort));
-    if reversed {
-        group.reverse();
+    if !matches!(sort, ProcessSort::GpuMemory | ProcessSort::GpuUsage) {
+        group.sort_by(|a, b| compare_process(a, b, sort));
+        if reversed {
+            group.reverse();
+        }
+        return;
     }
+    group.sort_by(|a, b| {
+        let available = |process: &ProcessSample| match sort {
+            ProcessSort::GpuUsage => process.gpu.utilization.is_some(),
+            _ => process.gpu.bytes.is_some(),
+        };
+        match (available(a), available(b)) {
+            (false, true) => return Ordering::Greater,
+            (true, false) => return Ordering::Less,
+            _ => {}
+        }
+        let order = compare_process(a, b, sort);
+        if reversed { order.reverse() } else { order }
+    });
+}
+
+fn gpu_process_filter(processes: &[ProcessSample], tree: bool) -> HashSet<u32> {
+    let parents: HashMap<u32, u32> = processes
+        .iter()
+        .map(|process| (process.pid, process.parent))
+        .collect();
+    let mut pids = HashSet::new();
+    for process in processes
+        .iter()
+        .filter(|process| !process.gpu.devices.is_empty())
+    {
+        let mut pid = process.pid;
+        while pids.insert(pid) && tree {
+            let Some(parent) = parents
+                .get(&pid)
+                .copied()
+                .filter(|parent| parents.contains_key(parent))
+            else {
+                break;
+            };
+            pid = parent;
+        }
+    }
+    pids
 }
 
 fn draw_graph_background(canvas: &mut Canvas, area: Rect) {
@@ -9594,7 +10045,7 @@ impl Canvas {
         self.put(x, y, left, line_style);
         let mut chars = text.chars();
         let first = chars.next();
-        let numbered = first.is_some_and(|ch| "¹²³⁴⁵⁶⁷⁸⁹⁰".contains(ch));
+        let numbered = first.is_some_and(|ch| "¹²³⁴⁵⁶⁷⁸⁹⁰ᵛ".contains(ch));
         if numbered {
             self.put_bold(x + 1, y, first.unwrap_or_default(), theme::HI);
             self.text_bold(x + 2, y, chars.as_str(), theme::TITLE);
@@ -10230,8 +10681,8 @@ mod tests {
         let (category, index) = OPTION_CATEGORIES
             .iter()
             .enumerate()
-            .find_map(|(category, options)| {
-                options
+            .find_map(|(category, _)| {
+                app.option_keys(category)
                     .iter()
                     .position(|option| *option == name)
                     .map(|index| (category, index))
@@ -10978,12 +11429,12 @@ mod tests {
     }
 
     #[test]
-    fn help_uses_the_exact_reference_height_without_a_trailing_blank_row() {
+    fn help_fits_all_rows_without_a_trailing_blank_row() {
         let mut canvas = Canvas::new(180, 60);
         draw_help(&mut canvas, 0);
-        assert_eq!(canvas.cells[8 * 180 + 50].ch, '╭');
-        assert_eq!(canvas.cells[56 * 180 + 50].ch, '╰');
-        assert!(canvas_row(&canvas, 55).contains("https://github.com/EriksRemess/btop-rust"));
+        assert_eq!(canvas.cells[7 * 180 + 50].ch, '╭');
+        assert_eq!(canvas.cells[57 * 180 + 50].ch, '╰');
+        assert!(canvas_row(&canvas, 56).contains("https://github.com/EriksRemess/btop-rust"));
     }
 
     #[test]

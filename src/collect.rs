@@ -93,6 +93,7 @@ pub struct ProcessSample {
     pub state: char,
     pub threads: u32,
     pub memory: u64,
+    pub gpu: crate::process_gpu::Usage,
     pub cpu: f64,
     pub cumulative_cpu: f64,
     pub nice: i32,
@@ -342,7 +343,7 @@ impl Collector {
     pub fn collect(
         &mut self,
         config: &Config,
-        detailed_pid: Option<u32>,
+        detailed_pids: [Option<u32>; 2],
     ) -> Result<Sample, String> {
         let collection_started = Instant::now();
         let elapsed = self.last_sample.elapsed().as_secs_f64().max(0.001);
@@ -358,17 +359,25 @@ impl Collector {
         let network = self.collect_network(config, elapsed)?;
         collection_times_us[2] = elapsed_us(started);
         let started = Instant::now();
-        let processes = self.collect_processes(
+        let mut processes = self.collect_processes(
             total_delta,
             cpu.cores.len().max(1),
             memory.total,
             config,
-            detailed_pid,
+            detailed_pids,
         )?;
         collection_times_us[3] = elapsed_us(started);
         let process_count = processes.len();
         let started = Instant::now();
-        let gpus = self.gpus.collect(config);
+        let collect_gpu_processes =
+            config.gpu_processes_shown() || detailed_pids.iter().any(Option::is_some);
+        let gpus = self.gpus.collect(config, collect_gpu_processes);
+        crate::process_gpu::attach(&mut processes, &gpus, |pid| {
+            fs::read(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| parse_process_stat(pid, &stat))
+                .map(|process| u128::from(process.start_ticks))
+        });
         collection_times_us[4] = elapsed_us(started);
         collection_times_us[5] = elapsed_us(collection_started);
         Ok(Sample {
@@ -621,13 +630,13 @@ impl Collector {
         cores: usize,
         total_memory: u64,
         config: &Config,
-        detailed_pid: Option<u32>,
+        detailed_pids: [Option<u32>; 2],
     ) -> Result<Vec<ProcessSample>, String> {
         #[cfg(windows)]
-        return windows::collect_processes(self, total_delta, cores, config, detailed_pid);
+        return windows::collect_processes(self, total_delta, cores, config, detailed_pids);
         if cfg!(target_os = "macos") {
             #[cfg(target_os = "macos")]
-            return macos::collect_processes(self, total_delta, cores, config, detailed_pid);
+            return macos::collect_processes(self, total_delta, cores, config, detailed_pids);
         }
         self.collect_processes_at(
             Path::new("/proc"),
@@ -635,7 +644,7 @@ impl Collector {
             cores,
             total_memory,
             config,
-            detailed_pid,
+            detailed_pids,
         )
     }
 
@@ -646,7 +655,7 @@ impl Collector {
         cores: usize,
         total_memory: u64,
         config: &Config,
-        detailed_pid: Option<u32>,
+        detailed_pids: [Option<u32>; 2],
     ) -> Result<Vec<ProcessSample>, String> {
         let entries = fs::read_dir(root)
             .map_err(|e| format!("could not enumerate {}: {e}", root.display()))?;
@@ -697,7 +706,7 @@ impl Collector {
                     .ok()
             });
             let stat_memory = raw.rss_pages.saturating_mul(page_size);
-            let memory = if detailed_pid == Some(pid)
+            let memory = if detailed_pids.contains(&Some(pid))
                 && config.bool_value("proc_info_smaps").unwrap_or(false)
             {
                 read_smaps_rss(&entry.path().join("smaps")).unwrap_or(stat_memory)
@@ -709,7 +718,7 @@ impl Collector {
             let command = fs::File::open(entry.path().join("cmdline"))
                 .and_then(read_process_command)
                 .unwrap_or_default();
-            let (read_bytes, write_bytes) = if detailed_pid == Some(pid) {
+            let (read_bytes, write_bytes) = if detailed_pids.contains(&Some(pid)) {
                 read_process_io(pid)
             } else {
                 (0, 0)
@@ -731,6 +740,7 @@ impl Collector {
                 state: raw.state,
                 threads: raw.threads,
                 memory,
+                gpu: Default::default(),
                 cpu,
                 cumulative_cpu,
                 nice: raw.nice,
@@ -2176,7 +2186,7 @@ mod tests {
         config.set_value("shown_gpus", "");
         let mut collector = Collector::new(&config).unwrap();
         let processes = collector
-            .collect_processes_at(&cleanup, 100, 1, 1000, &config, None)
+            .collect_processes_at(&cleanup, 100, 1, 1000, &config, [None; 2])
             .unwrap();
         for pid in [2, 3] {
             assert!(
@@ -2215,7 +2225,7 @@ mod tests {
         ] {
             process_fixture(&cleanup, 42, 1, 0, ticks, start);
             let processes = collector
-                .collect_processes_at(&cleanup, 100, 1, 1000, &config, None)
+                .collect_processes_at(&cleanup, 100, 1, 1000, &config, [None; 2])
                 .unwrap();
             assert_eq!(processes[0].cpu, expected, "start={start}, ticks={ticks}");
             assert_eq!(processes[0].start_time, Some(u128::from(start)));
@@ -2253,7 +2263,7 @@ mod tests {
                 fs::remove_file(&status_path).unwrap();
             }
             let processes = collector
-                .collect_processes_at(&cleanup, 100, 1, 1000, &config, None)
+                .collect_processes_at(&cleanup, 100, 1, 1000, &config, [None; 2])
                 .unwrap();
             assert_eq!(processes[0].user, expected, "{status:?}");
         }
@@ -2271,7 +2281,7 @@ mod tests {
         collector
             .previous_disks
             .insert("old-disk".into(), DiskCounters::default());
-        let sample = collector.collect(&config, None).unwrap();
+        let sample = collector.collect(&config, [None; 2]).unwrap();
         assert!(sample.cpu.frequency.is_empty());
         assert!(sample.cpu.temperature.is_none());
         assert!(sample.cpu.core_temperatures.iter().all(Option::is_none));

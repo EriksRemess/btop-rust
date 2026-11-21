@@ -61,6 +61,10 @@ unsafe extern "C" fn codec(device: NvmlDevice, output: *mut c_uint, _: *mut c_ui
 
 fn fixture(available: &AtomicBool) -> Nvml {
     Nvml {
+        #[cfg(target_os = "linux")]
+        process_functions: Default::default(),
+        #[cfg(target_os = "linux")]
+        process_states: vec![Default::default()],
         #[cfg(unix)]
         _library: DynamicLibrary {
             handle: Default::default(),

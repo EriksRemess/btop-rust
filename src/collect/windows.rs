@@ -1199,7 +1199,7 @@ pub(super) fn collect_processes(
     total_delta: u64,
     cores: usize,
     config: &Config,
-    detailed_pid: Option<u32>,
+    detailed_pids: [Option<u32>; 2],
 ) -> Result<Vec<ProcessSample>, String> {
     let snapshot = OwnedHandle::new(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) })
         .ok_or_else(|| {
@@ -1284,7 +1284,7 @@ pub(super) fn collect_processes(
             if priority_class != 0 {
                 nice = priority_class_nice(priority_class);
             }
-            if detailed_pid == Some(pid) {
+            if detailed_pids.contains(&Some(pid)) {
                 let mut counters = IoCounters::default();
                 if unsafe { GetProcessIoCounters(process.0, &mut counters) } != 0 {
                     io = (counters.read_transfer_count, counters.write_transfer_count);
@@ -1320,6 +1320,7 @@ pub(super) fn collect_processes(
             state: '?',
             threads: entry.threads,
             memory,
+            gpu: Default::default(),
             cpu: (cpu * 10.0).round() / 10.0,
             cumulative_cpu: ticks as f64 * 100.0 / elapsed_ticks as f64,
             nice,
@@ -1540,7 +1541,7 @@ mod tests {
         let config = Config::default();
         let mut collector = Collector::new(&config).unwrap();
         std::thread::sleep(Duration::from_millis(1_100));
-        let sample = collector.collect(&config, None).unwrap();
+        let sample = collector.collect(&config, [None; 2]).unwrap();
         assert!(!sample.cpu.cores.is_empty());
         assert!(!sample.cpu.name.is_empty());
         assert!(sample.cpu.load.iter().all(|value| value.is_nan()));

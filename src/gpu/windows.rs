@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Default)]
 pub struct GpuSupport {
+    pub processes: bool,
     pub utilization: bool,
     pub memory_utilization: bool,
     pub gpu_clock: bool,
@@ -37,6 +38,7 @@ pub struct GpuSupport {
 
 #[derive(Debug, Clone)]
 pub struct GpuSample {
+    pub process_usage: Option<crate::process_gpu::Snapshot>,
     pub name: String,
     pub driver_label: Option<String>,
     pub utilization: u32,
@@ -68,6 +70,7 @@ pub struct GpuSample {
 impl Default for GpuSample {
     fn default() -> Self {
         Self {
+            process_usage: None,
             name: String::new(),
             driver_label: None,
             utilization: 0,
@@ -115,7 +118,7 @@ impl GpuCollector {
         }
     }
 
-    pub fn collect(&mut self, config: &Config) -> Vec<GpuSample> {
+    pub fn collect(&mut self, config: &Config, _collect_processes: bool) -> Vec<GpuSample> {
         let shown = config.value("shown_gpus").unwrap_or("nvidia");
         if shown != self.shown {
             *self = Self::new(config);

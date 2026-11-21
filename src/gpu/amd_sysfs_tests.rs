@@ -39,7 +39,7 @@ impl Fixture {
     }
 
     fn sample(&mut self) -> GpuSample {
-        self.collector.collect(&self.config).remove(0)
+        self.collector.collect(&self.config, false).remove(0)
     }
 }
 

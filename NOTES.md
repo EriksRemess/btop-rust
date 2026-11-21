@@ -24,6 +24,23 @@ Linux data comes from procfs, sysfs, perf events, and dynamically loaded GPU
 interfaces. Desktop entries and icons are Linux installation artifacts and are
 not installed on macOS.
 
+Per-process GPU telemetry currently supports NVIDIA through optional NVML process
+queries. Graphics and compute entries are merged by PID and GPU instance;
+duplicate reports are counted once. The process column sums reported NVIDIA
+devices only, and remains unavailable when a device query is incomplete or a
+memory value is unavailable. Device totals can include allocations not
+attributable to a process. PID start times are rechecked after GPU collection.
+GPU utilization uses the latest per-process SM sample from the past second;
+idle processes show zero, unsupported queries remain unavailable. Utilization
+is summed across reported NVIDIA devices and can exceed 100% with multiple GPUs.
+An initial process-query probe enables the feature even when the GPU is idle.
+Failed probes retry every ten seconds; after support is established, process
+collection runs only when the panel is requested or process details need it.
+Transient sample failures remain unavailable readings without hiding the feature.
+Without a supported backend, the process toggle, panel, options, and GPU detail
+row are hidden; saved GPU process settings are preserved. AMD/Intel per-process
+data is not yet implemented, so this feature is also hidden on Windows and macOS.
+
 ### macOS
 
 The general macOS collectors use Mach, libproc, sysctl, getifaddrs,
